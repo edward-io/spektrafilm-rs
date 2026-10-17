@@ -114,7 +114,13 @@ fn catalog_geometry_overrides_camera_orientation_without_applying_it_twice() {
         (loaded.pixels.width, loaded.pixels.height),
         (expected.width, expected.height)
     );
-    assert_eq!(loaded.pixels.data, expected.data);
+    // Equivalent bilinear paths can round differently when samples are f64.
+    for (i, (&actual, &expected)) in loaded.pixels.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (actual as f64 - expected as f64).abs() <= 8. * f64::EPSILON,
+            "component {i}: {actual} vs {expected}"
+        );
+    }
     std::fs::remove_file(normal_path).unwrap();
     std::fs::remove_file(rotated_path).unwrap();
 }
