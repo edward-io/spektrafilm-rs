@@ -94,7 +94,7 @@ fn scan_spectral_via_lut(
     normalization: f64,
     cat: &[[f64; 3]; 3],
     xyz_to_rgb: &[[f64; 3]; 3],
-    _backend: &dyn ComputeBackend,
+    backend: &dyn ComputeBackend,
     data_min: [f64; 3],
     data_max: [f64; 3],
     steps: usize,
@@ -116,15 +116,21 @@ fn scan_spectral_via_lut(
         scale / (data_max[1] - data_min[1]),
         scale / (data_max[2] - data_min[2]),
     ];
+    let interpolated = backend.pchip3d(density_cmy, &prepared, data_min, data_max);
     let mut out = density_cmy.clone();
     out.data
         .par_chunks_exact_mut(3)
         .zip(density_cmy.data.par_chunks_exact(3))
-        .for_each(|(dst, src)| {
+        .enumerate()
+        .for_each(|(index, (dst, src))| {
             let r = (src[0] as f64 - data_min[0]) * inv[0];
             let g = (src[1] as f64 - data_min[1]) * inv[1];
             let b = (src[2] as f64 - data_min[2]) * inv[2];
-            let log_xyz = pchip_interp(&prepared, r, g, b);
+            let log_xyz = if let Some(interpolated) = &interpolated {
+                std::array::from_fn(|c| interpolated.data[index * 3 + c] as f64)
+            } else {
+                pchip_interp(&prepared, r, g, b)
+            };
             // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
             // `_density_to_rgb` AFTER the LUT call. bw_correction and
             // glare run after this returns (RGB space).
@@ -178,7 +184,6 @@ pub fn scan(
         .collect();
     let base_density: Vec<f64> = profile.data.base_density.clone();
 
-    let illuminant_f32 = select_illuminant(&profile.info.viewing_illuminant);
     // Use the full-precision f64 illuminant — the f32 → f64 promotion of
     // the f32 constants drops ~7 digits per sample and accumulates ~5e-6
     // of drift in the scan stage after the 81-wavelength reduction.
@@ -356,36 +361,18 @@ pub fn scan(
             spektrafilm_model::diffusion::apply_unsharp_mask(&rgb, usm_sigma, usm_amount, backend);
     }
 
-    // CCTF encoding + clip.
-    //
-    // Python's `_apply_cctf_encoding_and_clip` calls
-    // `colour.RGB_to_RGB(rgb, output_cs, output_cs, apply_cctf_encoding=True)`,
-    // which — even when src == dst — runs `vecmul(M, rgb)` with
-    // `M = matrix_RGB_to_RGB(src, dst, 'CAT02')`. With same src/dst
-    // M should be identity but in f64 it has off-diagonals around 1e-5
-    // (because colour-science's sRGB matrix is 4-decimal-rounded so the
-    // inverse round-trip isn't exact). This nudges every RGB pixel by
-    // ~1e-5 before encoding. We replicate it so the scan-stage output
-    // matches Python bit-for-bit.
-    let zero = from_f64(0.0);
-    let one = from_f64(1.0);
+    // The runtime returns unclipped physics. File writers own quantization.
     if params.io.output_cctf_encoding {
         let m = rgb_to_rgb_identity_matrix(&params.io.output_color_space);
+        let curve = spektrafilm_math::transfer::get(&params.io.output_color_space)
+            .expect("validated output")
+            .transfer;
         rgb.data.par_chunks_exact_mut(3).for_each(|px| {
-            let r = px[0] as f64;
-            let g = px[1] as f64;
-            let b = px[2] as f64;
-            let r2 = m[0][0] * r + m[0][1] * g + m[0][2] * b;
-            let g2 = m[1][0] * r + m[1][1] * g + m[1][2] * b;
-            let b2 = m[2][0] * r + m[2][1] * g + m[2][2] * b;
-            px[0] = spektrafilm_math::precision::srgb_encode(from_f64(r2).clamp(zero, one));
-            px[1] = spektrafilm_math::precision::srgb_encode(from_f64(g2).clamp(zero, one));
-            px[2] = spektrafilm_math::precision::srgb_encode(from_f64(b2).clamp(zero, one));
+            let v = [px[0] as f64, px[1] as f64, px[2] as f64];
+            for c in 0..3 {
+                px[c] = from_f64(curve.encode(m[c][0] * v[0] + m[c][1] * v[1] + m[c][2] * v[2]));
+            }
         });
-    } else {
-        rgb.data
-            .par_iter_mut()
-            .for_each(|v| *v = (*v).clamp(zero, one));
     }
 
     rgb
@@ -399,13 +386,7 @@ pub fn scan(
 /// identity in f64.
 fn rgb_to_rgb_identity_matrix(name: &str) -> [[f64; 3]; 3] {
     let xyz_to_rgb = output_colorspace_from_xyz_f64(name);
-    let rgb_to_xyz = match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ_F64,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ_F64,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ_F64,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ_F64,
-        _ => colorspace::SRGB_TO_XYZ_F64,
-    };
+    let rgb_to_xyz = spectral::colorspace_to_xyz_f64(name);
     let mut m = [[0.0f64; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -428,30 +409,11 @@ pub fn process(
     scan(density_cmy, profile, params, backend, color_ref, gamut)
 }
 
-fn select_illuminant(name: &str) -> &'static [f32] {
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50,
-        "D55" => &spectral::ILLUMINANT_D55,
-        "D65" => &spectral::ILLUMINANT_D65,
-        _ => &spectral::ILLUMINANT_D50,
-    }
-}
-
 pub fn select_illuminant_f64(name: &str) -> &'static [f64] {
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50_F64,
-        "D55" => &spectral::ILLUMINANT_D55_F64,
-        "D65" => &spectral::ILLUMINANT_D65_F64,
-        _ => &spectral::ILLUMINANT_D50_F64,
-    }
+    spektrafilm_math::illuminants::get(name).expect("validated illuminant")
 }
-
 fn output_colorspace_from_xyz_f64(name: &str) -> [[f64; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::XYZ_TO_SRGB_F64,
-        "ProPhoto RGB" => colorspace::XYZ_TO_PROPHOTO_F64,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::XYZ_TO_REC2020_F64,
-        "ACES2065-1" => colorspace::XYZ_TO_ACES_F64,
-        _ => colorspace::XYZ_TO_SRGB_F64,
-    }
+    spektrafilm_math::transfer::get(name)
+        .expect("validated output")
+        .from_xyz
 }

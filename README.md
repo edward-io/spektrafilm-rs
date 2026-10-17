@@ -2,152 +2,215 @@
 
 ![banner](docs/card.jpg)
 
-A Rust port of [andreavolpato/spektrafilm](https://github.com/andreavolpato/spektrafilm) — a spectral simulator for analogue colour film and the print-and-scan chain.
+A spectral simulator for analogue film and the print-and-scan chain, with a
+native Rust GUI and CLI. This repository,
+[edward-io/spektrafilm-rs](https://github.com/edward-io/spektrafilm-rs), is a fork
+of [turbasvin/spektrafilm-rs](https://github.com/turbasvin/spektrafilm-rs), the Rust
+port of [Andrea Volpato's spektrafilm](https://github.com/andreavolpato/spektrafilm).
 
-The same spectral integration the original Python project does (RGB → film dye density → enlarger illuminant → print paper → scanner RGB), reimplemented in Rust with a GPU preview and a parity-faithful CPU export. The point of the port is **bit-identical output to the Python reference** at f64 precision while running in a fraction of the wall time.
+The runtime implements RGB → spectral film exposure → dye density → enlarger
+and print paper → scanner RGB. It provides a native GUI, a batch CLI, calibrated
+LUT exports, full-resolution f32 GPU export and f64 CPU export. The implementation
+is checked against the Python v0.3.4 reference and runs without Python.
+GPU previews use f32; numerical parity is measured with tolerances.
+See the [changelog](#changelog) for changes from the original Rust fork,
+[reference status and limits](docs/upstream-sync.md), and
+[validation checklist](docs/parity-checklist.md) for the supporting evidence.
 
----
+## Build and run
 
-## What it does
+Requires Rust **1.89 or newer**, a C++ toolchain, `pkg-config`, and GLib
+development headers and static archives. On macOS, install the build
+dependencies with `brew install glib pkg-config`. Lensfun itself is built into
+the executable; LibRaw is an optional runtime dependency.
 
-- **Spectral pipeline.** Hanatos2025 RGB→raw spectral upsampling, full 81-wavelength film/print/scanner spectral integration, density-curve interpolation, halation, DIR couplers, grain (bit-exact numpy `MT19937` port), glare, output CCTF encoding.
-- **Live interactive preview** on the GPU (wgpu / Metal on macOS) — slider drags update at 60 fps on a 6 MP working image.
-- **Reference-quality export** on the CPU at f64 — verified bit-identical to the Python reference for the bare chain (max diff 1/255 from 8-bit quantisation, mean 0.00004).
-- **Decoupled preview + export.** GUI uses f32 GPU for iteration, then shells out to the f64 CPU binary for the final write. The export runs in a worker thread with a cancel button and proper child-process lifecycle.
-- **Profiles bundled.** 30+ film and paper profiles in `data/profiles/` — Kodak Gold/Portra/Ektar, Fuji Velvia/Provia, Kodak Endura papers, Fuji Crystal Archive papers.
+```sh
+git clone git@github.com:edward-io/spektrafilm-rs.git
+cd spektrafilm-rs
 
-## Build
-
-Requires Rust stable (≥ 1.80) and the standard system toolchain.
-
-```bash
-git clone <this-repo> && cd spektrafilm-rs
-
-# GUI (wgpu/Metal preview, eframe)
 cargo build --release -p spektrafilm-gui
+cargo build --release -p spektrafilm-cli --bin spektrafilm
+cargo build --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64
 
-# f32 CLI — fast batch processor, defaults to GPU backend
-cargo build --release -p spektrafilm-cli
-
-# f32 CLI with experimental native CUDA backend option
-cargo build --release -p spektrafilm-cli --features spektrafilm-gpu/cuda-backend
-
-# f64 CLI — reference precision (CPU only; WGSL has no f64)
-cargo build --release --features precision-f64 -p spektrafilm-cli
-cp target/release/spektrafilm target/release/spektrafilm-f64
-
-# Helper used by the GUI's Export button — bit-identical RAW decode
-cargo build --release -p spektrafilm-cli --bin decode_raw_gui
+./target/release/spektrafilm-gui
+# Or open an image on launch:
+./target/release/spektrafilm-gui /path/to/image.ARW
 ```
 
-The GUI auto-detects the f64 binary via `$SPEKTRAFILM_F64_CLI`, then `spektrafilm-f64` on `PATH`, then next to its own executable, then `target/release/spektrafilm-f64`.
+These commands place the binaries in `target/release/` and run from the
+repository root, using its `data/` directory. If you build with a custom
+`--target-dir`, use its `release/` directory instead. When moving the GUI
+elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
+`--data-dir`.
 
-Windows builds use the WGSL/wgpu backend by default. The CPU fallback path avoids requiring a system OpenBLAS install on Windows, while macOS and Unix-like targets still use native BLAS providers.
+## Changelog
 
-WGSL is the default GPU backend and can be selected explicitly with `SPEKTRAFILM_BACKEND=wgpu`. An experimental native CUDA backend can be built with `--features spektrafilm-gpu/cuda-backend` and selected with `SPEKTRAFILM_BACKEND=cuda`. It uses CUDA 12 driver/NVRTC bindings through dynamic loading, so the NVIDIA driver and NVRTC runtime DLLs must be available. Set `SPEKTRAFILM_CUDA_DEVICE=1` (or another zero-based index) to pick a non-default CUDA device. Both GPU paths have a resident preview implementation: front pass, highlight boost, camera diffusion, camera lens blur, halation, DIR couplers, grain, density curves, enlarger diffusion, print/scan spectral reductions, glare, output gamut compression, scanner lens blur, unsharp, and one readback.
+### Unreleased
 
-## Usage
+Changes from the original Rust fork's v0.1.2 baseline,
+[turbasvin/spektrafilm-rs at `9dd59b0`](https://github.com/turbasvin/spektrafilm-rs/commit/9dd59b0380194b93686aaa230a8bb9680aa270a4):
 
-### GUI
+- **LUTs and tools:** calibrated CUBE, 3DL, Lumix and Hald export; multi-stage
+  bundles, TOML/JSON specs, OCIO and QA reports; profile measurements and
+  calibration strips.
+- **Color and settings:** expanded named color spaces, transfer functions and
+  gamut mapping; independent saving-space conversion; restored crop, spectral,
+  filter and other previously ignored runtime controls.
+- **Grain and GPU:** physical three-sublayer grain with dye-cloud blur and
+  microstructure; wgpu implementations of layered grain, spatial filters,
+  diffusion and color transforms; full-resolution GPU export.
+- **RAW and lenses:** shared GUI/CLI I/O, rawler 0.8 with Sony ILCE-7M5 support,
+  optional LibRaw with Auto fallback, built-in Lensfun, automatic database
+  download/cache, corrected RGB vignetting handling and clearer load errors.
+- **GUI and previews:** project/default persistence, Python GUI state import,
+  rotation, layer/comparison controls and paper animation; cached previews with
+  adjustable resolution, smaller interactive frames and background workers.
+- **Reference validation:** Python v0.3.4 fixtures, f32/f64 checks and GPU
+  accuracy audits, with measured numerical tolerances and documented remaining
+  differences.
 
-```bash
-./target/release/spektrafilm-gui [optional/path/to/image.orf]
-```
+## GUI and RAW development
 
-- **Open…** — load a TIFF, PNG, or camera RAW (DNG/CR2/CR3/NEF/ARW/ORF/RW2/etc., decoded via [`rawler`](https://github.com/dnglab/dnglab)).
-- **Sliders** — exposure, film format, halation, DIR couplers, grain, glare, scanner, enlarger, output. All live-updating against the GPU preview.
-- **Profiles** — film stock and print paper combo boxes; picking a film auto-selects its paired paper (`target_print` in the profile).
-- **Zoom** — scroll wheel or trackpad pinch over the preview (cursor-anchored), click-drag to pan, double-click to reset.
-- **Export…** — re-runs the pipeline at f64 precision on the CPU and writes a PNG/TIFF/JPEG. Status bar shows elapsed time; **Cancel** kills the child cleanly. Closing the GUI mid-export also kills the child (no orphans).
-- **Save…** — write the f32 GPU preview directly (instant, less precise).
+Open or drop JPEG, PNG, TIFF, EXR or camera RAW files. RAW support includes the
+Sony ILCE-7M5 through rawler 0.8. Auto uses an installed LibRaw when available,
+then falls back to rawler. LibRaw is optional; configuration and camera regression
+instructions are in the [support notes](docs/upstream-sync.md). Lensfun is built in,
+so lens correction needs no separate Lensfun installation or library-path setting.
+Its database is found automatically; when none is installed, the loading worker
+downloads the official compatible database once and caches it in your user data
+directory. The folder picker is an optional override.
 
-### CLI
+The GUI exposes film/paper, exposure, optical effects, layered grain, color,
+crop/resize, RAW development and output controls. Project files preserve these
+settings; Python GUI state JSON can be imported. Loading and rendering run in
+background workers, with progress and errors in the bottom status bar.
+Set **Preview long edge (px)** in the right sidebar to change preview size.
+This is independent of the simplified-effect preview mode: the default is 2048
+pixels on the long edge, dropping to at most 640 while dragging a control.
+Scaled inputs are cached, and releasing the control refines the preview.
+Auto preview can be disabled for manual rendering. RAW decoder, white-balance
+and lens settings take effect with **Reload RAW with these settings**. Lens
+correction uses **Database: automatic** by default; its first download requires
+internet access, and subsequent loads use the cached database offline.
 
-```bash
-# f32 GPU (fast)
-./target/release/spektrafilm process input.ORF -o out.png \
-    --film kodak_gold_200 --paper kodak_portra_endura --data-dir data
+**Save preview** writes the bounded preview. **Export** renders the original at
+full resolution on the GPU; disable GPU export under File export for the f64
+CPU path. Both support cancellation (a GPU dispatch finishes before cancelling).
+The LUT export panel supports individual files, stage bundles and diagnostic
+reports; Build from bundle spec supports multi-paper/ZIP delivery. Place
+`spektrafilm-f64` next to the GUI or set `SPEKTRAFILM_F64_CLI` for CPU/LUT export.
+Project/default files use the platform's application configuration directory.
+PNG/JPEG quantize and clip; float TIFF/EXR preserve
+negative values and highlights above 1. Preview and saving color spaces are
+independent; output files are converted to the saving space before encoding.
 
-# f32 native CUDA, when built with spektrafilm-gpu/cuda-backend
-SPEKTRAFILM_BACKEND=cuda \
-    ./target/release/spektrafilm process input.ORF -o out.png \
-    --film kodak_gold_200 --paper kodak_portra_endura --data-dir data
+## CLI
 
-# f64 CPU (reference)
-SPEKTRAFILM_BACKEND=cpu \
-    ./target/release/spektrafilm-f64 process input.ORF -o out.png \
-    --film kodak_gold_200 --paper kodak_portra_endura --data-dir data
+```sh
+# Reference precision, CPU
+SPEKTRAFILM_BACKEND=cpu ./target/release/spektrafilm-f64 process input.ARW \
+  --film kodak_portra_400 --paper kodak_portra_endura -o output.tif \
+  --bit-depth 32 --data-dir data
 
-# Override any params via JSON (matches RuntimeParams struct)
-... --params my_params.json
+# Runtime parameters are JSON; --scan-film bypasses paper printing
+./target/release/spektrafilm process input.png --film kodak_gold_200 \
+  --params settings.json -o output.png
 
-# List available film + paper profiles
 ./target/release/spektrafilm list-profiles --data-dir data
+./target/release/spektrafilm list-color-spaces
 ```
 
-## Parity
+RAW controls: `--raw-decoder auto|libraw|rawler`, `--white-balance
+as_shot|daylight|tungsten|custom`, `--temperature`, `--tint`, `--lens-correction`,
+and `--lens-database`. `--saving-color-space` and `--saving-cctf-encoding`
+control the saved color transport independently of processing. JPEG quality
+and TIFF/EXR bit depth are configurable.
 
-Verified against the upstream Python `spektrafilm` v0.3.2 reference on the bare-chain (no stochastic FX):
+## LUTs
 
-| Stage | Max diff | Mean diff | Identical pixels |
-|---|---|---|---|
-| `log_raw` (post-Hanatos + log10) | **8.9 × 10⁻¹⁵** (one f64 ULP) | 3.4 × 10⁻¹⁶ | — |
-| Film density CMY | **1.1 × 10⁻¹⁵** | 1.7 × 10⁻¹⁶ | — |
-| Print density CMY | **3.1 × 10⁻¹⁵** | 3.0 × 10⁻¹⁶ | — |
-| Final PNG (8-bit) | **1 / 255** | 0.00004 / 255 | **99.9962 %** |
+```sh
+# A calibrated, deterministic log-to-display CUBE
+./target/release/spektrafilm-f64 export-lut --film kodak_portra_400 \
+  --paper kodak_portra_endura --input-space vlog --output-space srgb \
+  --size 33 -o portra.cube --data-dir data
 
-With grain on, the binomial sampler's rejection step is sensitive to upstream ULP shifts and the rendered grain texture diverges per pixel — this is by design (matches numpy's behaviour) and produces the same average tone with a different grain pattern.
+# Expose film/print boundaries and optional collapsed combinations
+./target/release/spektrafilm-f64 export-lut --film kodak_portra_400 \
+  --paper kodak_portra_endura --input-space vlog --output-space srgb \
+  --topology 4lut --include-combinations --size 33 -o portra-bundle
 
-The LUT path (`use_enlarger_lut` + `use_scanner_lut`, the typical export config) uses a bit-exact port of Python's PCHIP 3D interpolation (`crates/spektrafilm-math/src/pchip3d.rs` ↔ `spektrafilm/utils/fast_interp_lut.py`). Parity numbers above hold for both the LUT and non-LUT paths.
-
-## Performance
-
-f64 CPU export on a 16 MP Olympus ORF (kodak_gold_200 → kodak_portra_endura, full FX):
-
-| | Wall time | Notes |
-|---|---|---|
-| Python reference (numpy + numba) | 22 s | LUT enabled, default config |
-| **spektrafilm-rs (f64 CPU)** | **14 s** | **35 % faster than Python** |
-
-What gets it there:
-
-- **PCHIP LUTs** for the spectral integrations (enlarger + scanner) — same approximation Python uses, same accuracy budget.
-- **`vForce vvpow`** for `10^x` on the spectral chain — Accelerate's SIMD pow, bit-identical to libm `pow(10, x)`.
-- **Accelerate BLAS dgemm** for the spectral reductions — a single `cblas_dgemm` per contraction, parallelised internally by Accelerate. (It is not safe to call concurrently from multiple threads, so the matmul is never split across rayon.)
-- **Parallelised hot per-pixel loops** in the printing and scanning post-stages.
-
-GPU preview path uses wgpu compute shaders (`crates/spektrafilm-shaders/wgsl/`). All shaders are f32 (WGSL has no f64); the GPU path drives the live preview while the export reaches for f64 CPU. End-to-end preview render: ~250 ms at 6 MP, ~700 ms at 16 MP on Apple Silicon.
-
-## Layout
-
-```
-crates/
-  spektrafilm-math/    f64 reference math (spectral, interp, PCHIP, RNG, vForce bindings)
-  spektrafilm-model/   stochastic + physical models (grain, halation, DIR couplers, glare)
-  spektrafilm-core/    pipeline orchestration, profiles, stage definitions
-  spektrafilm-gpu/     ComputeBackend trait + CPU (rayon + BLAS) and wgpu backends
-  spektrafilm-shaders/ WGSL / Metal / CUDA compute shaders
-  spektrafilm-cli/     `spektrafilm` (process, list-profiles, gen-lut) + `decode_raw_gui`
-  spektrafilm-gui/     egui/eframe preview (wgpu renderer, Metal-backed on macOS)
-data/
-  profiles/            film + paper JSON profiles (spectral sensitivities, density curves, etc.)
-  luts/                Hanatos2025 spectral basis + standard observer CMFs (.npy)
-  filters/             neutral-print enlarger filter database
-scripts/parity/        Python ↔ Rust comparison harness (spektra_compare.py, etc.)
-tests/                 reference outputs + integration test fixtures
-docs/upstream-sync.md  porting status of upstream 0.3.4 colour features + backlog
+# Python-compatible BundleSpec fields in TOML or JSON
+./target/release/spektrafilm-f64 build-luts --from bundle.toml --resolution 65 -o bundles
 ```
 
-## Credits
+Supported formats: `--format cube|3dl|lumix|hald_png`. Lumix requires V-Log and
+17/33/65 samples per axis; Hald requires a square resolution such as 16 or 64.
+Bundles support 1/2/3/4-stage topologies, multiple papers, ZIP, wire metadata,
+optional OCIO, and native scientific QA reports (`--qa` on bundle export).
+Spatial effects, grain, glare and automatic exposure are disabled for baking.
 
-Original Python implementation by Andrea Volpato — [andreavolpato/spektrafilm](https://github.com/andreavolpato/spektrafilm). All spectral data, film/paper profiles, and pipeline architecture come from there. This port owes its existence to Andrea and its work.
+Example `bundle.toml`:
 
-The spectral-upsampling LUT (`hanatos2025_*`) is named after [Johannes Hanatos](https://github.com/hanatos), author of [vkdt](https://github.com/hanatos/vkdt), who provided the upstream Python project with the LUT files and sample code that drive the RGB → spectrum step.
+```toml
+film_profile = "kodak_portra_400"
+print_profiles = ["kodak_portra_endura"]
+input_color_space = "vlog"
+output_color_space = "srgb"
+name = "portra"
+topology = "4lut"
+resolution = 33
+container = "zip"
+qa = true
+ocio_config = true
+include_combinations = true
+```
 
-PCHIP 3D LUT, MT19937 binomial sampler, and CIE 1931 observer constants are ported from numpy / scipy / scikit-image / colour-science.
+## Profile measurements and calibration
 
-Claude code for being this awesome.
+```sh
+./target/release/spektrafilm-f64 measure-profile kodak_portra_400 \
+  --output measurements.json --plot-dir profile-plots
+./target/release/spektrafilm-f64 calibration-strip input.png \
+  --film kodak_portra_400 --paper kodak_portra_endura \
+  --kind negative_exposure --values=-2,-1,0,1,2 -o exposure-strip.png
+```
 
-## License
+Measurement output includes gamma, local exposure slopes and toe fits. Calibration
+supports exposure, print exposure, grain particle area, DIR amount and glare,
+with crop/rotation, labeled SVG previews and JSON sidecars. Run either command
+with `--help` for its controls.
 
-GPL-3.0, matching the upstream Python project. See [LICENSE](LICENSE) for the full text.
+## Backends and tests
+
+`SPEKTRAFILM_BACKEND=cpu|wgpu` selects the compute backend. macOS uses Metal
+through wgpu by default. An experimental CUDA backend is available with
+`--features spektrafilm-gpu/cuda-backend` and `SPEKTRAFILM_BACKEND=cuda`.
+The physical three-sublayer grain model runs inside the resident wgpu chain.
+Unsupported resident-GPU operations use staged processing. The f64 CPU path is
+the reference export path. Validation focuses on Apple Silicon / Metal; CUDA
+has been compile-checked but has not been validated at runtime on this machine.
+Grain textures can differ between backends, and rawler/LibRaw use different
+demosaic, crop and color pipelines. See the linked validation notes for limits.
+
+```sh
+cargo test --workspace --features precision-f64
+cargo test --workspace
+```
+
+The math/model/core crates implement the numerical pipeline;
+`spektrafilm-io` provides shared application I/O; CLI and GUI are separate
+frontends. Runtime profiles, spectral LUTs, filters and ICC assets live in
+`data/`. macOS/Windows packaging helpers live in `scripts/`.
+
+## Credits and license
+
+Original Rust port by [turbasvin](https://github.com/turbasvin/spektrafilm-rs).
+This fork extends that implementation.
+
+Original Python implementation, spectral data and film/paper profiles by
+[Andrea Volpato](https://github.com/andreavolpato/spektrafilm). The Hanatos2025
+spectral-upsampling basis comes from work by
+[Johannes Hanatos](https://github.com/hanatos). Numerical methods follow the
+reference's NumPy, SciPy, scikit-image and colour-science implementations.
+
+GPL-3.0; see [LICENSE](LICENSE) and bundled data licenses.

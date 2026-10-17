@@ -29,6 +29,31 @@ impl ImageBuf {
         }
     }
 
+    /// Rotate clockwise in quarter turns without changing samples or color.
+    pub fn rotated_quarter_turns(&self, turns: u8) -> Self {
+        let turns = turns % 4;
+        if turns == 0 {
+            return self.clone();
+        }
+        let (w, h) = if turns % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        let mut out = Self::new(w, h);
+        out.par_rows_mut().enumerate().for_each(|(y, row)| {
+            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                let (sx, sy) = match turns {
+                    1 => (y as u32, self.height - 1 - x as u32),
+                    2 => (self.width - 1 - x as u32, self.height - 1 - y as u32),
+                    _ => (self.width - 1 - y as u32, x as u32),
+                };
+                pixel.copy_from_slice(&self.get(sx, sy));
+            }
+        });
+        out
+    }
+
     pub fn pixel_count(&self) -> usize {
         (self.width as usize) * (self.height as usize)
     }
@@ -173,6 +198,24 @@ mod tests {
         assert_eq!(
             img.get(1, 0),
             [from_f64(4.0), from_f64(20.0), from_f64(6.0)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    #[test]
+    fn quarter_turns_preserve_rectangular_samples() {
+        let image = ImageBuf::from_data(3, 2, (0..18).map(|v| v as Scalar).collect());
+        let cw = image.rotated_quarter_turns(1);
+        assert_eq!((cw.width, cw.height), (2, 3));
+        assert_eq!(cw.get(0, 0), image.get(0, 1));
+        assert_eq!(cw.get(1, 2), image.get(2, 0));
+        assert_eq!(cw.rotated_quarter_turns(3).data, image.data);
+        assert_eq!(
+            image.rotated_quarter_turns(2).rotated_quarter_turns(2).data,
+            image.data
         );
     }
 }

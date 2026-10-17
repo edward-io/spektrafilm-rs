@@ -1,0 +1,421 @@
+{
+  "samples": 50000,
+  "interpolation": "trilinear",
+  "max_absolute_error": 0.08667671318234438,
+  "mean_absolute_error": 0.004282662196053863,
+  "rms_error": 0.007615164934336045,
+  "scientific": {
+    "cases": [
+      {
+        "name": "off_grid_identity",
+        "category": "LUT fidelity",
+        "summary": {
+          "targets": {
+            "max_dE2000": 2.0,
+            "p99_dE2000": 1.0
+          },
+          "tetrahedral_dE2000": {
+            "max": 17.8569875006112,
+            "mean": 0.43274605775227426,
+            "p50": 0.2755098465443516,
+            "p95": 1.3081305740423257,
+            "p99": 2.5966467402947115
+          },
+          "tetrahedral_dITP": {
+            "max": 9.788217053058817,
+            "mean": 0.4475517166809853,
+            "p50": 0.32250304606719793,
+            "p95": 1.2318561677738318,
+            "p99": 2.3913123211661738
+          },
+          "trilinear_dE2000": {
+            "max": 17.194916435679154,
+            "mean": 0.5444431376195924,
+            "p50": 0.33631700820713367,
+            "p95": 1.7496344546220706,
+            "p99": 2.9071761335307365
+          },
+          "trilinear_dITP": {
+            "max": 9.012679197885047,
+            "mean": 0.569868906467536,
+            "p50": 0.386431734787336,
+            "p95": 1.690692339955627,
+            "p99": 2.8376808480380484
+          }
+        },
+        "passed": false,
+        "figure": "qa/off-grid.svg"
+      },
+      {
+        "name": "monotonicity",
+        "category": "LUT fidelity",
+        "summary": {
+          "violations": 2327,
+          "worst_negative_diff": -0.15938876600000002
+        },
+        "passed": false,
+        "figure": "qa/monotonicity.svg"
+      },
+      {
+        "name": "jacobian_condition",
+        "category": "LUT fidelity",
+        "summary": {
+          "max": 9.193284165044334,
+          "mean": 3.123567756497784,
+          "p50": 3.094768254213051,
+          "p95": 5.245789103597198,
+          "p99": 6.1438579807334435
+        },
+        "passed": null,
+        "figure": "qa/conditioning.svg"
+      },
+      {
+        "name": "total_variation",
+        "category": "LUT fidelity",
+        "summary": {
+          "axial_fft_highband_ratio": [
+            0.08585612992297711,
+            0.07702058785968484,
+            0.08483284310397896
+          ],
+          "tv": 0.08483694666558528,
+          "tv_b": 0.029239904302119334,
+          "tv_g": 0.028474722606473442,
+          "tv_r": 0.027122319756992495
+        },
+        "passed": null,
+        "figure": "qa/variation.svg"
+      },
+      {
+        "name": "characteristic_curve",
+        "category": "Model diagnostic",
+        "summary": {
+          "max_channel_density_spread": 0.12139459480470616,
+          "pin_densities": [
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0
+          ],
+          "pin_input_codes": [
+            0.49115338253065555,
+            0.40749941303289344,
+            0.34815604646593223,
+            0.295028426584207,
+            0.25412155703258343
+          ],
+          "system_gamma_at_mid": 1.8414968460720276
+        },
+        "passed": null,
+        "figure": "qa/characteristic.svg"
+      },
+      {
+        "name": "dynamic_range_usage",
+        "category": "Model diagnostic",
+        "summary": {
+          "active_range_stops": 5.994140625,
+          "encoded_range_stops": 15.984375,
+          "midgray_offset_stops": -0.10589147310925918,
+          "midgray_output_y": 0.16726150315661986,
+          "shoulder_collapsed_stops": 5.15625,
+          "toe_collapsed_stops": 3.99609375
+        },
+        "passed": null,
+        "figure": "qa/dynamic-range.svg"
+      },
+      {
+        "name": "planckian_sweep",
+        "category": "Model diagnostic",
+        "summary": {
+          "cct_range_k": "2700-10000",
+          "max_bend_angle_deg": 11.362164556140257,
+          "output_xy": [
+            [
+              0.44346071676575355,
+              0.4230351293864911
+            ],
+            [
+              0.40112287095772314,
+              0.4030441584674607
+            ],
+            [
+              0.37227476785925645,
+              0.38159013549325843
+            ],
+            [
+              0.354330062252218,
+              0.3670459224271027
+            ],
+            [
+              0.3367543499817721,
+              0.34971091330082404
+            ],
+            [
+              0.32532913739053126,
+              0.33872869746384454
+            ],
+            [
+              0.31999276252943154,
+              0.33494650168144385
+            ],
+            [
+              0.31546610721044693,
+              0.33146739183376833
+            ],
+            [
+              0.3115463978021187,
+              0.3282487464557096
+            ],
+            [
+              0.3080181557487794,
+              0.32535486189336726
+            ],
+            [
+              0.3051508013083853,
+              0.32320609066602113
+            ],
+            [
+              0.30280037832708584,
+              0.3216063574968949
+            ],
+            [
+              0.3008502399775186,
+              0.32040893091023337
+            ],
+            [
+              0.29921428444657727,
+              0.3195097359980698
+            ],
+            [
+              0.29782806796884165,
+              0.31883389419228986
+            ],
+            [
+              0.2963149095900863,
+              0.31814830074830913
+            ]
+          ],
+          "reference_max_bend_angle_deg": 30.0,
+          "temperatures": [
+            2700.0,
+            3186.6666666666665,
+            3673.3333333333335,
+            4160.0,
+            4646.666666666667,
+            5133.333333333334,
+            5620.0,
+            6106.666666666666,
+            6593.333333333334,
+            7080.0,
+            7566.666666666667,
+            8053.333333333333,
+            8540.0,
+            9026.666666666668,
+            9513.333333333332,
+            10000.0
+          ]
+        },
+        "passed": true,
+        "figure": "qa/planckian.svg"
+      },
+      {
+        "name": "output_gamut_compression",
+        "category": "LUT fidelity",
+        "summary": {
+          "compression_algorithm": "cam16ucs",
+          "compression_ratio": 0.44641071285683165,
+          "fold_fraction": 0.3658854166666667,
+          "fold_triangles": 562,
+          "input_hull_volume": 0.06097143244049092,
+          "output_hull_volume": 0.0272183006196617,
+          "rim_max_displacement": 0.2778849685528051,
+          "rim_mean_displacement": 0.11889072261720701,
+          "rim_oog_fraction": 0.13257575757575757,
+          "rim_oog_samples": 140,
+          "rim_samples": 1152
+        },
+        "passed": false,
+        "figure": "qa/output-gamut.svg"
+      },
+      {
+        "name": "hue_twist_oklab",
+        "category": "Model diagnostic",
+        "summary": {
+          "max_hue_rotation_deg": 179.32525525003783,
+          "max_rotation_chroma_0.20_0.35": 129.16983155560007,
+          "max_rotation_chroma_0.35_0.50": 179.32525525003783,
+          "max_rotation_chroma_0.50_0.70": 177.31689231952066,
+          "max_rotation_chroma_0.70_1.00": 171.23308655172744,
+          "samples_filtered_out_of_locus": 3259,
+          "samples_in_locus": 1654
+        },
+        "passed": null,
+        "figure": "qa/hue-twist.svg"
+      },
+      {
+        "name": "spectral_locus_envelope",
+        "category": "Model diagnostic",
+        "summary": {
+          "cube_cells": 4913,
+          "cube_resolution": 17,
+          "inside_output_gamut_fraction": 1.0,
+          "near_locus_fraction": 0.0,
+          "outside_spectral_locus": 0,
+          "valid_cells": 4913
+        },
+        "passed": null,
+        "figure": "qa/spectral-envelope.svg"
+      },
+      {
+        "name": "input_gamut_compression_preview",
+        "category": "Gamut compression",
+        "summary": {
+          "active": true,
+          "algorithm": "xy",
+          "bright_displacement": {
+            "max": 2.5196630989379365,
+            "mean": 0.08119543588582986,
+            "p50": 0.06741066201043619,
+            "p95": 0.12942346635372065,
+            "p99": 0.5172900873959271
+          },
+          "knee_limit": 1.0,
+          "knee_power": 6.0,
+          "knee_threshold": 0.0,
+          "n_oog_bright": 2661,
+          "n_oog_samples": 2677,
+          "oog_fraction": 0.5513903192584964,
+          "reference_illuminant": "D55"
+        },
+        "passed": null,
+        "figure": "qa/input-gamut.svg"
+      },
+      {
+        "name": "input_gamut_compression_smoothness",
+        "category": "Gamut compression",
+        "summary": {
+          "active": true,
+          "algorithm": "xy",
+          "knee_limit": 1.0,
+          "knee_power": 6.0,
+          "knee_threshold": 0.0,
+          "median_step": 0.0024093780612631775,
+          "probe_radius": 0.3,
+          "probe_samples": 720,
+          "reference_illuminant": "D55",
+          "worst_over_median_step": 1.084803901573304,
+          "worst_step": 0.002613702721223418
+        },
+        "passed": null,
+        "figure": "qa/input-gamut-smoothness.svg"
+      },
+      {
+        "name": "noise_sensitivity",
+        "category": "Picture style",
+        "summary": {
+          "L_slice": 0.5646225971435698,
+          "ellipse_display_scale": 1.5,
+          "max_anisotropy": 2256.0627297163437,
+          "max_hue_rotation_deg": 30.75836229127634,
+          "max_sigma1": 2.495949707411922,
+          "n_input_samples": 45,
+          "p50_sigma1": 1.8848714579170351,
+          "p99_anisotropy": 2189.758413432379,
+          "p99_sigma1": 2.473839957138885,
+          "sigma_in_encoded": 0.005,
+          "worst_hue_deg": 90.00006498797833
+        },
+        "passed": null,
+        "figure": "qa/noise.svg"
+      },
+      {
+        "name": "noise_gradient",
+        "category": "Picture style",
+        "summary": {
+          "image_side": 512,
+          "input_in_gamut_fraction": 0.9887161254882812,
+          "mean_abs_output_delta": 0.025113645940195037,
+          "mid_L": 0.5646225971435698,
+          "p99_abs_output_delta": 0.1459800994348437,
+          "rim_scale": 0.96,
+          "sigma_in_encoded": 0.02
+        },
+        "passed": null,
+        "figure": "qa/noise-gradient.svg"
+      },
+      {
+        "name": "output_gamut_edge_stress",
+        "category": "Picture style",
+        "summary": {
+          "DCI-P3_oog_fraction_saturated_row": 0.0,
+          "DCI-P3_oog_fraction_total": 0.00390625,
+          "Rec.2020_oog_fraction_saturated_row": 0.0,
+          "Rec.2020_oog_fraction_total": 0.00390625,
+          "Rec.709_oog_fraction_saturated_row": 0.0,
+          "Rec.709_oog_fraction_total": 0.00390625
+        },
+        "passed": null,
+        "figure": "qa/gamut-edges.svg"
+      },
+      {
+        "name": "rg_plane_slices",
+        "category": "Picture style",
+        "summary": {
+          "adaptation": "CAT16",
+          "blue_pins": [
+            0.0,
+            0.125,
+            0.25,
+            0.375,
+            0.5,
+            0.625,
+            0.75,
+            0.875,
+            1.0
+          ],
+          "cube_resolution": 17,
+          "display": "sRGB",
+          "n_slices": 9
+        },
+        "passed": null,
+        "figure": "qa/slices.svg"
+      }
+    ],
+    "trilinear_de2000": {
+      "max": 17.194916435679154,
+      "p99": 2.9071761335307365,
+      "p95": 1.7496344546220706,
+      "p50": 0.33631700820713367,
+      "mean": 0.5444431376195924
+    },
+    "tetrahedral_de2000": {
+      "max": 17.8569875006112,
+      "p99": 2.5966467402947115,
+      "p95": 1.3081305740423257,
+      "p50": 0.2755098465443516,
+      "mean": 0.43274605775227426
+    },
+    "trilinear_itp": {
+      "max": 9.012679197885047,
+      "p99": 2.8376808480380484,
+      "p95": 1.690692339955627,
+      "p50": 0.386431734787336,
+      "mean": 0.569868906467536
+    },
+    "tetrahedral_itp": {
+      "max": 9.788217053058817,
+      "p99": 2.3913123211661738,
+      "p95": 1.2318561677738318,
+      "p50": 0.32250304606719793,
+      "mean": 0.4475517166809853
+    },
+    "oklab_distance": {
+      "max": 0.046743061100450276,
+      "p99": 0.01736585970481937,
+      "p95": 0.010684307942126808,
+      "p50": 0.002379191708453645,
+      "mean": 0.0035585073990472525
+    }
+  }
+}

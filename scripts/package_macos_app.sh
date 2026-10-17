@@ -87,12 +87,16 @@ Backends:
 
 f64 export:
 - spektrafilm-f64 is bundled inside Spektrafilm.app/Contents/MacOS.
-- The GUI uses it for CPU f64 Export.
+- GPU full-resolution export is the default. Disable it under File export for CPU f64.
+- The f64 CLI also powers native LUT export and bundle diagnostics.
 
 Gatekeeper:
 - This package is ad-hoc signed for local testing. It is not Apple-notarized.
 - If macOS blocks it after download, right-click Spektrafilm.app and choose Open.
 README
+
+cp docs/upstream-sync.md "$DIST_DIR/REFERENCE_STATUS.md"
+cp docs/parity-checklist.md "$DIST_DIR/VALIDATION_CHECKLIST.md"
 
 if command -v codesign >/dev/null 2>&1; then
     codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null

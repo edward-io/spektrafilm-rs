@@ -4,9 +4,8 @@
 //! The compression is baked into the tc_lut once at build time via
 //! remap-resample: `new_lut[xy] = old_lut[compress(xy)]`. The per-pixel
 //! runtime path (RGB → CIE xy → tc → bilinear LUT sample) therefore stays
-//! compression-agnostic. Only the production `"xy"` algorithm (ACES-RGC-style
-//! radial compression toward the visible spectral locus) is ported; the
-//! inspection-only `"oklch"` input variant is not.
+//! compression-agnostic. The production `"xy"` radial compressor and inspection `"oklch"` variant
+//! are both available.
 
 use spektrafilm_math::spectral::{self, CMF_X_F64, CMF_Y_F64, CMF_Z_F64, TcLut};
 
@@ -15,7 +14,7 @@ use crate::gamut_compression::reinhard_knee;
 /// CIE 1931 2° visible spectral locus as a closed xy polygon, sampled at 5 nm
 /// from 380 to 700 nm (65 vertices + the first repeated). Mirrors upstream
 /// `spectral_locus_xy()`; the CMFs are the same colour-science values.
-fn spectral_locus_xy() -> Vec<[f64; 2]> {
+pub fn spectral_locus_xy() -> Vec<[f64; 2]> {
     // Wavelengths 380..=700 step 5 → indices 0..65 of the 380..780 grid.
     const N: usize = 65;
     let mut poly = Vec::with_capacity(N + 1);
@@ -84,6 +83,7 @@ fn compress_xy_radial(
 /// `is_active` reports whether a non-identity remap will be applied.
 pub struct InputGamutCompress {
     active: bool,
+    oklch: bool,
     knee: (f64, f64, f64),
     locus: Vec<[f64; 2]>,
 }
@@ -95,7 +95,7 @@ impl InputGamutCompress {
     pub fn build(algorithm: &str, knee: [f32; 3]) -> Result<Self, String> {
         let active = match algorithm {
             "off" => false,
-            "xy" => true,
+            "xy" | "oklch" => true,
             other => return Err(format!("unknown input gamut algorithm: {other}")),
         };
         let [t, l, p] = knee;
@@ -110,6 +110,7 @@ impl InputGamutCompress {
         }
         Ok(Self {
             active,
+            oklch: algorithm == "oklch",
             knee: (knee[0] as f64, knee[1] as f64, knee[2] as f64),
             locus: if active {
                 spectral_locus_xy()
@@ -121,6 +122,16 @@ impl InputGamutCompress {
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn compress_xy(&self, xy: [f64; 2], reference_white: [f64; 2]) -> [f64; 2] {
+        if !self.active {
+            xy
+        } else if self.oklch {
+            compress_oklch(xy, self.knee, &self.locus)
+        } else {
+            compress_xy_radial(xy, reference_white, self.knee, &self.locus)
+        }
     }
 
     /// Bake the compression into a freshly resampled copy of `lut`. For each
@@ -142,7 +153,11 @@ impl InputGamutCompress {
                 // Step 1: tc cell → CIE xy.
                 let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
                 // Step 2: compress.
-                let cxy = compress_xy_radial([x, y], ref_xy, self.knee, &self.locus);
+                let cxy = if self.oklch {
+                    compress_oklch([x, y], self.knee, &self.locus)
+                } else {
+                    compress_xy_radial([x, y], ref_xy, self.knee, &self.locus)
+                };
                 // Step 3: compressed xy → tc.
                 let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
                 // Step 4: bilinear sample original LUT at (tx, ty) grid coords.
@@ -260,4 +275,66 @@ mod tests {
         let out = spec.remap(&lut, [0.3127, 0.3290]);
         assert_eq!(out.data, lut.data);
     }
+}
+
+fn contains(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    for pair in polygon.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if (a[1] > p[1]) != (b[1] > p[1])
+            && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+fn compress_oklch(xy: [f64; 2], knee: (f64, f64, f64), locus: &[[f64; 2]]) -> [f64; 2] {
+    use crate::gamut_compression::{oklab_to_xyz, xyz_to_oklab};
+    const NL: usize = 64;
+    const NH: usize = 720;
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        use rayon::prelude::*;
+        (0..NL * NH)
+            .into_par_iter()
+            .map(|i| {
+                let l = 0.05 + 0.95 * (i / NH) as f64 / (NL - 1) as f64;
+                let h =
+                    -std::f64::consts::PI + 2. * std::f64::consts::PI * (i % NH) as f64 / NH as f64;
+                let (mut lo, mut hi) = (0., 0.5);
+                for _ in 0..18 {
+                    let mid = (lo + hi) / 2.;
+                    let xyz = oklab_to_xyz([l, mid * h.cos(), mid * h.sin()]);
+                    let sum: f64 = xyz.iter().sum();
+                    if contains([xyz[0] / sum, xyz[1] / sum], locus) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            })
+            .collect()
+    });
+    let y = xy[1].max(1e-9);
+    let lab = xyz_to_oklab([xy[0] / y, 1., (1. - xy[0] - xy[1]) / y]);
+    let h = lab[2].atan2(lab[1]);
+    let c = lab[1].hypot(lab[2]);
+    let li = (lab[0].clamp(0.05, 1.) - 0.05) / 0.95 * (NL - 1) as f64;
+    let l0 = (li.floor() as usize).min(NL - 2);
+    let lf = li - l0 as f64;
+    let hj = (h + std::f64::consts::PI) / (2. * std::f64::consts::PI) * NH as f64;
+    let h0 = (hj.floor() as usize) % NH;
+    let h1 = (h0 + 1) % NH;
+    let hf = hj - hj.floor();
+    let cm = (table[l0 * NH + h0] * (1. - lf) * (1. - hf)
+        + table[l0 * NH + h1] * (1. - lf) * hf
+        + table[(l0 + 1) * NH + h0] * lf * (1. - hf)
+        + table[(l0 + 1) * NH + h1] * lf * hf)
+        .max(1e-9);
+    let nc = reinhard_knee(c / cm, knee.0, knee.1, knee.2) * cm;
+    let xyz = oklab_to_xyz([lab[0], nc * h.cos(), nc * h.sin()]);
+    let sum: f64 = xyz.iter().sum();
+    [xyz[0] / sum, xyz[1] / sum]
 }

@@ -448,80 +448,10 @@ pub fn compute_core_matrix(sensitivity: &[[f64; 3]], illuminant: &[f64]) -> [[f6
 /// precision, so composing the higher-precision Rust matrices would diverge by
 /// ~1e-4 from upstream's actual `RGB_to_RGB`. Even sRGB→sRGB is not exactly the
 /// identity for the same reason.
-const M_CS_SRGB: [[f64; 3]; 3] = [
-    [
-        0.99999173999999968,
-        -3.2584989817507904e-16,
-        2.3159999999960313e-05,
-    ],
-    [
-        2.167000000015163e-05,
-        1.0000403200000001,
-        -7.9399999999762392e-06,
-    ],
-    [3.7999999999427381e-07, 1.1920000000026354e-05, 1.00000355],
-];
-const M_CS_PROPHOTO: [[f64; 3]; 3] = [
-    [
-        2.036491724209688,
-        -0.73759065250943212,
-        -0.29925986889011419,
-    ],
-    [
-        -0.2257179790832855,
-        1.2231765312786034,
-        0.0027252247674664941,
-    ],
-    [
-        -0.010545128632237159,
-        -0.13487984972504941,
-        1.1452101524691205,
-    ],
-];
-const M_CS_REC2020: [[f64; 3]; 3] = [
-    [
-        1.6603034854214438,
-        -0.58757014253161699,
-        -0.072890060215056104,
-    ],
-    [
-        -0.12437559530838622,
-        1.1328344814319584,
-        -0.0083597371874014337,
-    ],
-    [
-        -0.018112279959916489,
-        -0.10058360850721247,
-        1.118770326157098,
-    ],
-];
-const M_CS_ACES2065_1: [[f64; 3]; 3] = [
-    [
-        2.5216494298433045,
-        -1.1368885542222591,
-        -0.38491759319444518,
-    ],
-    [
-        -0.27521355124402608,
-        1.3697051510263252,
-        -0.094392450776519921,
-    ],
-    [
-        -0.015925010090464285,
-        -0.14780636811079964,
-        1.1638058159424312,
-    ],
-];
-
 /// Input colour space → linear sRGB (colour's `RGB_to_RGB` with CAT02). The
 /// space names and the ProPhoto default mirror `colorspace_to_xyz_f64`.
 pub fn input_cs_to_srgb(color_space: &str) -> [[f64; 3]; 3] {
-    match color_space {
-        "sRGB" => M_CS_SRGB,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => M_CS_REC2020,
-        "ACES2065-1" => M_CS_ACES2065_1,
-        _ => M_CS_PROPHOTO,
-    }
+    spektrafilm_math::transfer::rgb_matrix(color_space, "sRGB")
 }
 
 /// Full per-pixel matrix `core · M_cs` mapping input-colour-space RGB to raw.

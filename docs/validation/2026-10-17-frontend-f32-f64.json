@@ -1,0 +1,328 @@
+{
+  "reference": "independent CPU f64 frontend",
+  "actual": "GUI precision f32 / wgpu frontend",
+  "stimulus": "HDR ramps, checkerboards, color ramps and edge impulses",
+  "gate": 0.001,
+  "cases": [
+    {
+      "case": "default",
+      "max_absolute": 5.975388697961048e-05,
+      "p99": 2.5119777202043382e-05,
+      "rms": 1.0409756012979741e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00034748604152399164
+    },
+    {
+      "case": "no_spatial",
+      "max_absolute": 3.735637679491699e-05,
+      "p99": 2.4219996377732307e-05,
+      "rms": 9.816577212609345e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00033643188735273035
+    },
+    {
+      "case": "no_unsharp",
+      "max_absolute": 3.5610873278135724e-05,
+      "p99": 2.4107175951102454e-05,
+      "rms": 9.917770371194654e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003382400296155275
+    },
+    {
+      "case": "no_halation",
+      "max_absolute": 0.0001804516121632349,
+      "p99": 7.53393637856048e-05,
+      "rms": 1.7177611713176896e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003609336945314221
+    },
+    {
+      "case": "no_couplers",
+      "max_absolute": 2.6283822020189973e-05,
+      "p99": 2.2098622567900953e-05,
+      "rms": 8.847666123909667e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00010568389337665547
+    },
+    {
+      "case": "highlight_boost",
+      "max_absolute": 6.0602516150094765e-05,
+      "p99": 2.514526504553194e-05,
+      "rms": 1.0415200458110155e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003473592588111413
+    },
+    {
+      "case": "dir_diffusion",
+      "max_absolute": 0.0001766880194918885,
+      "p99": 5.923326290080188e-05,
+      "rms": 1.7365122949177986e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003250338057492877
+    },
+    {
+      "case": "deterministic_glare_0.7",
+      "max_absolute": 3.334052626541295e-05,
+      "p99": 2.4444554081751724e-05,
+      "rms": 9.909921343499139e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00011009292872866754
+    },
+    {
+      "case": "deterministic_glare_3",
+      "max_absolute": 3.334052626541295e-05,
+      "p99": 2.4444554081751724e-05,
+      "rms": 9.909921343499139e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00011009292872866754
+    },
+    {
+      "case": "deterministic_glare_32",
+      "max_absolute": 3.334052626541295e-05,
+      "p99": 2.4444554081751724e-05,
+      "rms": 9.909921343499139e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00011009292872866754
+    },
+    {
+      "case": "camera_black_pro_mist",
+      "max_absolute": 5.135123429931415e-05,
+      "p99": 2.357705115387076e-05,
+      "rms": 9.665497708971294e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00016036987158590438
+    },
+    {
+      "case": "enlarger_black_pro_mist",
+      "max_absolute": 3.565908569288373e-05,
+      "p99": 2.3712132700953727e-05,
+      "rms": 9.330451877899291e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003240749024083757
+    },
+    {
+      "case": "camera_pro_mist",
+      "max_absolute": 4.033432442301921e-05,
+      "p99": 2.246166732679744e-05,
+      "rms": 9.553520912554084e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00010313021209708528
+    },
+    {
+      "case": "enlarger_pro_mist",
+      "max_absolute": 2.573077793521783e-05,
+      "p99": 2.2630359846967902e-05,
+      "rms": 8.448103454841149e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0002752222971589023
+    },
+    {
+      "case": "camera_glimmerglass",
+      "max_absolute": 4.271078257817029e-05,
+      "p99": 2.331905747132045e-05,
+      "rms": 9.889594509394979e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003050654835352022
+    },
+    {
+      "case": "enlarger_glimmerglass",
+      "max_absolute": 5.649165467971201e-05,
+      "p99": 3.0095698164542186e-05,
+      "rms": 1.0569312252152987e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0007457367841489053
+    },
+    {
+      "case": "camera_cinebloom",
+      "max_absolute": 3.554440390124425e-05,
+      "p99": 2.238137985304034e-05,
+      "rms": 9.601138780039986e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00011030108755514743
+    },
+    {
+      "case": "enlarger_cinebloom",
+      "max_absolute": 2.5712888572004822e-05,
+      "p99": 2.234878128468008e-05,
+      "rms": 8.129340076232663e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0002452553943864448
+    },
+    {
+      "case": "lens_unsharp",
+      "max_absolute": 5.970819270795236e-05,
+      "p99": 2.423662819529437e-05,
+      "rms": 1.025159617754802e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0003444650136818666
+    },
+    {
+      "case": "wide_lens_unsharp",
+      "max_absolute": 0.00010019329181976816,
+      "p99": 2.9846273656941148e-05,
+      "rms": 1.1462235230106072e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00026989168922940735
+    },
+    {
+      "case": "filter_advanced_controls",
+      "max_absolute": 5.636396028814439e-05,
+      "p99": 2.2163067628397925e-05,
+      "rms": 9.851285215928016e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00032713375882848
+    },
+    {
+      "case": "both_diffusion_stages",
+      "max_absolute": 4.14576869503247e-05,
+      "p99": 2.371306600898459e-05,
+      "rms": 9.647072308643959e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00021875672684390173
+    },
+    {
+      "case": "encoded_input_linear_output",
+      "max_absolute": 1.0525071396316754e-05,
+      "p99": 5.971999499132508e-06,
+      "rms": 1.4746081399228395e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 6.704498282990976e-05
+    },
+    {
+      "case": "staged_color_diffusion",
+      "max_absolute": 7.205468209814381e-06,
+      "p99": 4.208787576222203e-06,
+      "rms": 1.309629021317182e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 3.9138753430063256e-05
+    },
+    {
+      "case": "encoded_input_diffusion",
+      "max_absolute": 0.0003198397415979659,
+      "p99": 8.006945691611903e-05,
+      "rms": 2.197264776942812e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0008339689816791384
+    },
+    {
+      "case": "gamut_off",
+      "max_absolute": 0.00016871491250947113,
+      "p99": 2.998664020068216e-05,
+      "rms": 1.292384665718408e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0010050041241864674
+    },
+    {
+      "case": "gamut_aces_rgc",
+      "max_absolute": 3.662716918817477e-05,
+      "p99": 2.503773816556642e-05,
+      "rms": 1.0121919392514128e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0001329433624631919
+    },
+    {
+      "case": "gamut_oklch",
+      "max_absolute": 7.216737984694355e-05,
+      "p99": 2.689187863253866e-05,
+      "rms": 1.0851271909362745e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0007969333733194282
+    },
+    {
+      "case": "gamut_oklrab",
+      "max_absolute": 7.426479668773411e-05,
+      "p99": 2.6842432551352417e-05,
+      "rms": 1.0852297968844731e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.0007966681328164258
+    },
+    {
+      "case": "gamut_jzazbz",
+      "max_absolute": 0.0005849540974316725,
+      "p99": 0.000208233695948303,
+      "rms": 5.361983541178646e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.002172800883330013
+    },
+    {
+      "case": "output_Display P3",
+      "max_absolute": 8.127706052352135e-06,
+      "p99": 4.4275803376042605e-06,
+      "rms": 1.4046221853203688e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 5.03656754446986e-05
+    },
+    {
+      "case": "output_ProPhoto RGB",
+      "max_absolute": 0.00010194813720298956,
+      "p99": 6.69324929781082e-05,
+      "rms": 1.6336417944744308e-05,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 0.00028835653360481786
+    },
+    {
+      "case": "output_ACEScg",
+      "max_absolute": 5.377057263111773e-06,
+      "p99": 3.4640759949705612e-06,
+      "rms": 1.046186896356371e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 3.0075845348960607e-05
+    },
+    {
+      "case": "spectral_lut_3_enlarger",
+      "max_absolute": 4.410865008352971e-06,
+      "p99": 3.2460318697763415e-06,
+      "rms": 1.0036452187149828e-06,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 5.028571805315067e-05
+    },
+    {
+      "case": "spectral_lut_3_scanner",
+      "max_absolute": 9.392600585078625e-07,
+      "p99": 5.372279841237003e-07,
+      "rms": 1.8143336861867828e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 7.463975686929652e-06
+    },
+    {
+      "case": "spectral_lut_17_enlarger",
+      "max_absolute": 4.4757219546109894e-06,
+      "p99": 3.3557550425461464e-06,
+      "rms": 9.90129282937295e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 4.442481303254624e-05
+    },
+    {
+      "case": "spectral_lut_17_scanner",
+      "max_absolute": 1.0085534716819389e-06,
+      "p99": 5.378985655168921e-07,
+      "rms": 1.8692759936096594e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 9.511471028808706e-06
+    },
+    {
+      "case": "spectral_lut_33_enlarger",
+      "max_absolute": 4.2236573592757676e-06,
+      "p99": 3.3596703596377992e-06,
+      "rms": 9.92958776877536e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 4.4823476765245956e-05
+    },
+    {
+      "case": "spectral_lut_33_scanner",
+      "max_absolute": 1.02552464822242e-06,
+      "p99": 5.367020465257829e-07,
+      "rms": 1.854293761469994e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 9.024025098103106e-06
+    },
+    {
+      "case": "spectral_luts_diffusion",
+      "max_absolute": 5.370565167028829e-06,
+      "p99": 1.2236104537240852e-06,
+      "rms": 3.5403247069414097e-07,
+      "over_0_1_percent": 0,
+      "relative_p99_above_0_01": 1.1472317385678745e-05
+    }
+  ]
+}

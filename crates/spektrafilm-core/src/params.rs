@@ -193,11 +193,14 @@ pub struct GrainParams {
     // f64 to preserve Python JSON precision through the Poisson/Binomial
     // RNG pipeline — the f32 truncation of these values shifts the
     // Poisson lambda by ~5e-8 and produces a different RNG stream.
-    #[serde(default = "default_02_f64")]
+    #[serde(default = "default_02_f64", alias = "particle_area_um2")]
     pub agx_particle_area_um2: f64,
-    #[serde(default = "default_particle_scale_f64")]
+    #[serde(default = "default_particle_scale_f64", alias = "particle_scale")]
     pub agx_particle_scale: [f64; 3],
-    #[serde(default = "default_particle_scale_layers_f64")]
+    #[serde(
+        default = "default_particle_scale_layers_f64",
+        alias = "particle_scale_layers"
+    )]
     pub agx_particle_scale_layers: [f64; 3],
     #[serde(default = "default_density_min_f64")]
     pub density_min: [f64; 3],
@@ -433,6 +436,8 @@ impl Default for GlareParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilmRenderingParams {
+    #[serde(default = "default_channel_order")]
+    pub channel_order: [usize; 3],
     #[serde(default = "default_one")]
     pub density_curve_gamma: f32,
     /// Development time (minutes) for B&W development-time families —
@@ -454,6 +459,7 @@ pub struct FilmRenderingParams {
 impl Default for FilmRenderingParams {
     fn default() -> Self {
         Self {
+            channel_order: [0, 1, 2],
             density_curve_gamma: 1.0,
             development_time: None,
             grain: GrainParams::default(),
@@ -466,6 +472,8 @@ impl Default for FilmRenderingParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrintRenderingParams {
+    #[serde(default = "default_channel_order")]
+    pub channel_order: [usize; 3],
     #[serde(default = "default_one")]
     pub density_curve_gamma: f32,
     /// Development time (minutes) for B&W print stocks (e.g. kodak_2302) —
@@ -481,6 +489,7 @@ pub struct PrintRenderingParams {
 impl Default for PrintRenderingParams {
     fn default() -> Self {
         Self {
+            channel_order: [0, 1, 2],
             density_curve_gamma: 1.0,
             development_time: None,
             glare: GlareParams::default(),
@@ -581,6 +590,8 @@ impl Default for IoParams {
 /// `algorithm = "off"` passes input chromaticities through unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputGamutCompressParams {
+    #[serde(default = "default_true")]
+    pub active: bool,
     #[serde(default = "default_xy")]
     pub algorithm: String,
     #[serde(default = "default_gamut_knee")]
@@ -590,6 +601,7 @@ pub struct InputGamutCompressParams {
 impl Default for InputGamutCompressParams {
     fn default() -> Self {
         Self {
+            active: true,
             algorithm: "xy".into(),
             knee: [0.0, 1.0, 6.0],
         }
@@ -635,6 +647,10 @@ fn default_gamut_lightness() -> Option<[f32; 3]> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsParams {
+    /// Apply stock presets when digesting runtime params. Native GUI applies
+    /// them on selection, then disables this so subsequent edits survive.
+    #[serde(default = "default_true")]
+    pub apply_stock_specifics: bool,
     #[serde(default = "default_hanatos")]
     pub rgb_to_raw_method: String,
     #[serde(default = "default_true")]
@@ -668,6 +684,7 @@ pub struct SettingsParams {
 impl Default for SettingsParams {
     fn default() -> Self {
         Self {
+            apply_stock_specifics: true,
             rgb_to_raw_method: "hanatos2025".into(),
             apply_hanatos2025_adaptation_window: true,
             apply_hanatos2025_adaptation_surface: false,
@@ -688,6 +705,10 @@ impl Default for SettingsParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeParams {
     #[serde(default)]
+    pub debug: DebugParams,
+    #[serde(default)]
+    pub taps: TapsParams,
+    #[serde(default)]
     pub camera: CameraParams,
     #[serde(default)]
     pub enlarger: EnlargerParams,
@@ -706,6 +727,8 @@ pub struct RuntimeParams {
 impl Default for RuntimeParams {
     fn default() -> Self {
         Self {
+            debug: DebugParams::default(),
+            taps: TapsParams::default(),
             camera: CameraParams::default(),
             enlarger: EnlargerParams::default(),
             scanner: ScannerParams::default(),
@@ -760,21 +783,7 @@ fn default_001() -> f32 {
 fn default_unsharp() -> [f32; 2] {
     [0.7, 0.7]
 }
-fn default_02() -> f32 {
-    0.2
-}
-fn default_particle_scale() -> [f32; 3] {
-    [0.8, 1.0, 2.0]
-}
-fn default_particle_scale_layers() -> [f32; 3] {
-    [2.5, 1.0, 0.5]
-}
-fn default_density_min() -> [f32; 3] {
-    [0.07, 0.08, 0.12]
-}
-fn default_uniformity() -> [f32; 3] {
-    [0.97, 0.97, 0.99]
-}
+
 fn default_065() -> f32 {
     0.65
 }
@@ -784,51 +793,18 @@ fn default_micro_structure() -> [f32; 2] {
 fn default_1i() -> u32 {
     1
 }
-fn default_scatter_core() -> [f32; 3] {
-    [2.2, 2.0, 1.6]
-}
-fn default_scatter_tail() -> [f32; 3] {
-    [9.3, 9.7, 9.1]
-}
-fn default_scatter_tail_weight() -> [f32; 3] {
-    [0.78, 0.65, 0.67]
-}
+
 fn default_03() -> f32 {
     0.3
 }
 fn default_4() -> f32 {
     4.0
 }
-fn default_halation_strength() -> [f32; 3] {
-    [0.05, 0.015, 0.0]
-}
-fn default_halation_sigma() -> [f32; 3] {
-    [65.0, 65.0, 65.0]
-}
+
 fn default_3i() -> u32 {
     3
 }
-fn default_gamma_same() -> [f32; 3] {
-    [0.341, 0.324, 0.273]
-}
-fn default_gamma_r_gb() -> [f32; 2] {
-    [0.355, 0.305]
-}
-fn default_gamma_g_rb() -> [f32; 2] {
-    [0.154, 0.358]
-}
-fn default_gamma_b_rg() -> [f32; 2] {
-    [0.171, 0.225]
-}
-fn default_20() -> f32 {
-    20.0
-}
-fn default_200() -> f32 {
-    200.0
-}
-fn default_006() -> f32 {
-    0.06
-}
+
 fn default_003() -> f32 {
     0.03
 }
@@ -855,4 +831,27 @@ fn default_17() -> u32 {
 }
 fn default_640() -> u32 {
     640
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugParams {
+    #[serde(default)]
+    pub deactivate_spatial_effects: bool,
+    #[serde(default)]
+    pub deactivate_stochastic_effects: bool,
+    #[serde(default)]
+    pub print_timings: bool,
+    #[serde(default)]
+    pub lut_mode: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TapsParams {
+    #[serde(default)]
+    pub inject: Option<String>,
+    #[serde(default)]
+    pub collect: Option<String>,
+}
+
+fn default_channel_order() -> [usize; 3] {
+    [0, 1, 2]
 }

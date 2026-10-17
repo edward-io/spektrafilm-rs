@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/spektrafilm-core",
+    "crates/spektrafilm-io",
     "crates/spektrafilm-gpu",
     "crates/spektrafilm-math",
     "crates/spektrafilm-model",
@@ -13,9 +14,11 @@ members = [
 version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
+rawler = "0.8"
+spektrafilm-io = { path = "crates/spektrafilm-io" }
 spektrafilm-core = { path = "crates/spektrafilm-core" }
 spektrafilm-gpu = { path = "crates/spektrafilm-gpu" }
 spektrafilm-math = { path = "crates/spektrafilm-math" }

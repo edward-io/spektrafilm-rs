@@ -73,7 +73,9 @@ fn print_spectral_via_lut(
     // regardless to match Python's f64 LUT type.
     let lut_f64: Vec<f64> = lut_image.data.iter().map(|&v| v as f64).collect();
     let prepared = prepare_pchip_3d(lut_f64, steps);
-    apply_pchip_lut(cmy_film, &prepared, data_min, data_max)
+    backend
+        .pchip3d(cmy_film, &prepared, data_min, data_max)
+        .unwrap_or_else(|| apply_pchip_lut(cmy_film, &prepared, data_min, data_max))
 }
 
 /// Apply a prepared PCHIP LUT to every pixel. Mirrors Python's

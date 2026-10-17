@@ -9,8 +9,9 @@
 //   1 = oklch      (OkLab chroma reduction)
 //   2 = oklrab     (OkLab coords, table indexed by Ottosson Lr lightness)
 //   3 = cam16ucs   (full CIECAM16 + Luo 2006 UCS)
+//   4 = jzazbz     (Safdar 2017 perceptual coordinates)
 //
-// f32 throughout — preview-only path; exports run the CPU f64 compressor.
+// f32 throughout; resident previews and full-resolution GPU exports share it.
 
 struct Params {
     n_pixels: u32,
@@ -24,6 +25,9 @@ struct Params {
     lightness: vec4<f32>,
     // x=l_white (perceptual white), y=l_min, z=l_max (table L-axis bounds).
     lspace: vec4<f32>,
+    rgb_to_xyz: array<vec4<f32>,3>,
+    xyz_to_rgb: array<vec4<f32>,3>,
+    cam: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -31,14 +35,6 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> img: array<f32>;  // [H*W*3]
 
 const PI: f32 = 3.141592653589793;
-
-// sRGB linear RGB ↔ XYZ (colour-science's rounded sRGB matrices, D65).
-const RGB2XYZ_R0 = vec3<f32>(0.4124, 0.3576, 0.1805);
-const RGB2XYZ_R1 = vec3<f32>(0.2126, 0.7152, 0.0722);
-const RGB2XYZ_R2 = vec3<f32>(0.0193, 0.1192, 0.9505);
-const XYZ2RGB_R0 = vec3<f32>(3.2406, -1.5372, -0.4986);
-const XYZ2RGB_R1 = vec3<f32>(-0.9689, 1.8758, 0.0415);
-const XYZ2RGB_R2 = vec3<f32>(0.0557, -0.204, 1.057);
 
 // OkLab (Ottosson) matrices.
 const M1_R0 = vec3<f32>(0.8189330101, 0.3618667424, -0.1288597137);
@@ -61,11 +57,11 @@ const CAM16_M16_R2 = vec3<f32>(-0.002079, 0.048952, 0.953127);
 const CAM16_M16I_R0 = vec3<f32>(1.8620678551, -1.0112546305, 0.1491867754);
 const CAM16_M16I_R1 = vec3<f32>(0.3875265432, 0.6214474419, -0.0089739852);
 const CAM16_M16I_R2 = vec3<f32>(-0.0158414988, -0.0341229380, 1.0499644369);
-const CAM16_D_RGB = vec3<f32>(1.0228770275, 0.9852074783, 0.9285450587);
+
 const CAM16_F_L: f32 = 0.6839903846;
 const CAM16_N_BB: f32 = 1.0003040046;
 const CAM16_CZ: f32 = 0.69 * 1.9272135955; // c * z
-const CAM16_A_W: f32 = 37.1690753022;
+
 // (50000/13) * N_c * N_cb with N_c = 1, N_cb = N_BB.
 const CAM16_ECC: f32 = 3846.1538461538 * 1.0003040046;
 // (1.64 - 0.29^n)^0.73 and F_L^0.25 — const-folded at shader compile.
@@ -142,13 +138,13 @@ fn cam16_padc_inverse(rgb: vec3<f32>) -> vec3<f32> {
 // XYZ (Y=1) → CAM16-UCS (Jp, ap, bp).
 fn xyz_to_cam16ucs(xyz: vec3<f32>) -> vec3<f32> {
     let rgb = mv(CAM16_M16_R0, CAM16_M16_R1, CAM16_M16_R2, xyz * 100.0);
-    let p = cam16_padc_forward(rgb * CAM16_D_RGB);
+    let p = cam16_padc_forward(rgb * params.cam.xyz);
     let a = p.x - 12.0 * p.y / 11.0 + p.z / 11.0;
     let b = (p.x + p.y - 2.0 * p.z) / 9.0;
     let h = atan2_deg(b, a);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
     let a_resp = (2.0 * p.x + p.y + p.z / 20.0 - 0.305) * CAM16_N_BB;
-    let jj = 100.0 * pow(a_resp / CAM16_A_W, CAM16_CZ);
+    let jj = 100.0 * pow(a_resp / params.cam.w, CAM16_CZ);
     let denom = p.x + p.y + 21.0 * p.z / 20.0;
     var t = 0.0;
     if denom != 0.0 {
@@ -173,7 +169,7 @@ fn cam16ucs_to_xyz(jab: vec3<f32>) -> vec3<f32> {
     let j_prime = max(jj, 1.1920929e-7);
     let t = pow(cc / (sqrt(j_prime / 100.0) * CAM16_CC_F), 1.0 / 0.9);
     let e_t = 0.25 * (cos(2.0 + radians(h)) + 3.8);
-    let a_resp = CAM16_A_W * pow(jj / 100.0, 1.0 / CAM16_CZ);
+    let a_resp = params.cam.w * pow(jj / 100.0, 1.0 / CAM16_CZ);
     var p1 = 0.0;
     if t != 0.0 {
         p1 = CAM16_ECC * e_t / t;
@@ -213,7 +209,7 @@ fn cam16ucs_to_xyz(jab: vec3<f32>) -> vec3<f32> {
     let ra = (460.0 * p2 + 451.0 * a + 288.0 * b) / 1403.0;
     let ga = (460.0 * p2 - 891.0 * a - 261.0 * b) / 1403.0;
     let ba = (460.0 * p2 - 220.0 * a - 6300.0 * b) / 1403.0;
-    let rgb = cam16_padc_inverse(vec3<f32>(ra, ga, ba)) / CAM16_D_RGB;
+    let rgb = cam16_padc_inverse(vec3<f32>(ra, ga, ba)) / params.cam.xyz;
     return mv(CAM16_M16I_R0, CAM16_M16I_R1, CAM16_M16I_R2, rgb) / 100.0;
 }
 
@@ -262,11 +258,40 @@ fn compress_aces_rgc(rgb: vec3<f32>) -> vec3<f32> {
     return ach * (1.0 - dc);
 }
 
+
+fn jz_pq(v: f32) -> f32 {
+    let n=pow(max(v/10000.0,0.0),0.1593017578125);
+    return pow((0.8359375+18.8515625*n)/(1.0+18.6875*n),134.034375);
+}
+fn jz_unpq(v: f32) -> f32 {
+    let n=pow(max(v,0.0),1.0/134.034375);
+    return 10000.0*pow(max(n-0.8359375,0.0)/(18.8515625-18.6875*n),1.0/0.1593017578125);
+}
+fn xyz_to_jzazbz(xyz: vec3<f32>) -> vec3<f32> {
+    let v=xyz*100.0;
+    let adjusted=vec3<f32>(1.15*v.x-0.15*v.z,0.66*v.y+0.34*v.x,v.z);
+    let lms=mv(vec3<f32>(0.41478972,0.579999,0.014648),vec3<f32>(-0.20151,1.120649,0.0531008),vec3<f32>(-0.0166008,0.2648,0.6684799),adjusted);
+    let p=vec3<f32>(jz_pq(lms.x),jz_pq(lms.y),jz_pq(lms.z));
+    let iz=0.5*(p.x+p.y);
+    return vec3<f32>(0.44*iz/(1.0-0.56*iz)-1.6295499532821565e-11,
+        dot(vec3<f32>(3.524,-4.066708,0.542708),p),dot(vec3<f32>(0.199076,1.096799,-1.295875),p));
+}
+fn jzazbz_to_xyz(jab: vec3<f32>) -> vec3<f32> {
+    let j=jab.x+1.6295499532821565e-11; let iz=j/(0.44+0.56*j);
+    let p=mv(vec3<f32>(1.0,0.1386050432715393,0.05804731615611882),vec3<f32>(1.0,-0.13860504327153927,-0.05804731615611891),vec3<f32>(1.0,-0.09601924202631895,-0.811891896056039),vec3<f32>(iz,jab.y,jab.z));
+    let lms=vec3<f32>(jz_unpq(p.x),jz_unpq(p.y),jz_unpq(p.z));
+    let v=mv(vec3<f32>(1.9242264357876069,-1.0047923125953657,0.037651404030617994),vec3<f32>(0.35031676209499907,0.7264811939316552,-0.06538442294808501),vec3<f32>(-0.09098281098284752,-0.3127282905230739,1.5227665613052603),lms);
+    let x=(v.x+0.15*v.z)/1.15; let y=(v.y-0.34*x)/0.66;
+    return vec3<f32>(x,y,v.z)/100.0;
+}
+
 fn compress_perceptual(rgb: vec3<f32>) -> vec3<f32> {
-    let xyz = mv(RGB2XYZ_R0, RGB2XYZ_R1, RGB2XYZ_R2, rgb);
+    let xyz = mv(params.rgb_to_xyz[0].xyz, params.rgb_to_xyz[1].xyz, params.rgb_to_xyz[2].xyz, rgb);
     var lab: vec3<f32>;
     if params.mode == 3u {
         lab = xyz_to_cam16ucs(xyz);
+    } else if params.mode == 4u {
+        lab = xyz_to_jzazbz(xyz);
     } else {
         lab = xyz_to_oklab(xyz);
     }
@@ -297,10 +322,12 @@ fn compress_perceptual(rgb: vec3<f32>) -> vec3<f32> {
     var xyz_new: vec3<f32>;
     if params.mode == 3u {
         xyz_new = cam16ucs_to_xyz(lab_new);
+    } else if params.mode == 4u {
+        xyz_new = jzazbz_to_xyz(lab_new);
     } else {
         xyz_new = oklab_to_xyz(lab_new);
     }
-    return mv(XYZ2RGB_R0, XYZ2RGB_R1, XYZ2RGB_R2, xyz_new);
+    return mv(params.xyz_to_rgb[0].xyz, params.xyz_to_rgb[1].xyz, params.xyz_to_rgb[2].xyz, xyz_new);
 }
 
 @compute @workgroup_size(1024)

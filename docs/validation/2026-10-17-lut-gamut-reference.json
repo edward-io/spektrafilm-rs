@@ -1,0 +1,56 @@
+[
+  {
+    "name": "output_gamut_compression",
+    "passed": true,
+    "absolute_differences": {
+      "fold_triangles": 0,
+      "fold_fraction": 0.0,
+      "input_hull_volume": 4.163336342344337e-17,
+      "output_hull_volume": 1.3657817307666242e-09,
+      "compression_ratio": 2.24003552928842e-08,
+      "rim_oog_fraction": 0.0,
+      "rim_oog_samples": 0,
+      "rim_max_displacement": 2.8917828132080103e-09,
+      "rim_mean_displacement": 3.1023904695226534e-09
+    }
+  },
+  {
+    "name": "spectral_locus_envelope",
+    "passed": true,
+    "absolute_differences": {
+      "cube_resolution": 0,
+      "cube_cells": 0,
+      "valid_cells": 0,
+      "inside_output_gamut_fraction": 0.0,
+      "near_locus_fraction": 0.0
+    }
+  },
+  {
+    "name": "input_gamut_compression_preview",
+    "passed": true,
+    "absolute_differences": {
+      "active": 0,
+      "knee_threshold": 0.0,
+      "knee_limit": 0.0,
+      "knee_power": 0.0,
+      "oog_fraction": 0.0,
+      "n_oog_samples": 0,
+      "n_oog_bright": 0
+    }
+  },
+  {
+    "name": "input_gamut_compression_smoothness",
+    "passed": true,
+    "absolute_differences": {
+      "active": 0,
+      "knee_threshold": 0.0,
+      "knee_limit": 0.0,
+      "knee_power": 0.0,
+      "probe_radius": 0.0,
+      "probe_samples": 0,
+      "worst_step": 2.185751579730777e-16,
+      "median_step": 0.0,
+      "worst_over_median_step": 9.059419880941277e-14
+    }
+  }
+]

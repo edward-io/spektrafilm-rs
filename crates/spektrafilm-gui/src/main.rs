@@ -1,10 +1,14 @@
-// Minimal interactive preview for spektrafilm.
+// Native editor for spektrafilm.
 //
 // Loads an image, exposes the most impactful runtime parameters as
 // egui controls, and re-renders the full GPU-resident pipeline whenever
 // a control changes. The output texture is uploaded to egui once per
 // render; the panel scales it to fit.
 
+mod lut_ui;
+mod paper_back;
+mod project;
+mod view;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +24,10 @@ use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{Scalar, from_f32, srgb_decode, to_f32};
+use spektrafilm_math::precision::to_f32;
 
-const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(40);
+const INTERACTIVE_DEBOUNCE: Duration = Duration::from_millis(16);
 const IN_FLIGHT_REPAINT: Duration = Duration::from_millis(16);
 const PREVIEW_TEXTURE_MAX_DIM: usize = 8192;
 
@@ -161,16 +166,7 @@ fn gui_renderer() -> eframe::Renderer {
     match std::env::var("SPEKTRAFILM_GUI_RENDERER") {
         Ok(v) if v.eq_ignore_ascii_case("wgpu") => eframe::Renderer::Wgpu,
         Ok(v) if v.eq_ignore_ascii_case("glow") => eframe::Renderer::Glow,
-        _ => {
-            if cfg!(target_os = "macos") {
-                // Metal-backed CAMetalLayer lets us tag the colorspace as sRGB.
-                eframe::Renderer::Wgpu
-            } else {
-                // Keep the UI compositor away from wgpu/D3D12 by default on
-                // Windows/Linux; CUDA/WGSL compute backends are selected separately.
-                eframe::Renderer::Glow
-            }
-        }
+        _ => eframe::Renderer::Wgpu,
     }
 }
 
@@ -185,6 +181,17 @@ struct ProfileEntry {
 }
 
 struct App {
+    ctx: egui::Context,
+    load_job: Option<LoadJob>,
+    preview_input: Vec<(u32, Arc<ImageBuf>)>,
+    rendered_preview_limit: u32,
+    render_path: String,
+    auto_preview: bool,
+    gpu_export: bool,
+    lut: lut_ui::Settings,
+    render_requested: bool,
+    display: project::DisplayParams,
+    scan_for_print_restore: Option<[bool; 3]>,
     backend: Arc<dyn ComputeBackend>,
     data_dir: PathBuf,
     /// Profiles where `info.support == "film"`.
@@ -199,12 +206,26 @@ struct App {
     film_dev_times: Vec<f64>,
     print_dev_times: Vec<f64>,
     params: RuntimeParams,
+    metadata: spektrafilm_io::Metadata,
+    raw_options: spektrafilm_io::RawOptions,
+    save_options: spektrafilm_io::SaveOptions,
     image_path: Option<PathBuf>,
     image: Option<Arc<ImageBuf>>,
-    /// Last rendered pipeline output (post sRGB encode + clip). Retained
+    /// Last rendered preview in the selected output color space. Retained
     /// so the Save button can write it without re-running the pipeline.
     output_image: Option<ImageBuf>,
     output_tex: Option<egui::TextureHandle>,
+    input_tex: Option<egui::TextureHandle>,
+    source_display_key: Option<(String, bool, bool)>,
+    rotation: u8,
+    canvas: Option<Arc<view::Renderer>>,
+    canvas_input: Option<Arc<view::Image>>,
+    canvas_output: Option<Arc<view::Image>>,
+    canvas_previous: Option<Arc<view::Image>>,
+    canvas_paper: Option<Arc<view::Image>>,
+    paper_tex: Option<egui::TextureHandle>,
+    paper_size: Option<[usize; 2]>,
+    animation: Option<(Instant, bool)>,
     pipeline_cache_key: Option<String>,
     pipeline_cache: Option<Pipeline>,
     last_render_ms: f32,
@@ -243,30 +264,54 @@ struct App {
     /// render from the UI thread is what keeps sliders responsive —
     /// the 250–500 ms pipeline used to block input handling.
     render_job: Option<RenderJob>,
-    /// In-flight f64 export job. `Some` while the subprocess is
-    /// running; the `update()` loop polls the receiver each frame and
+    /// In-flight image or LUT export. The `update()` loop polls the receiver and
     /// surfaces success/failure in `status` when the worker thread
     /// completes. Joined eagerly to release the thread.
     export_job: Option<ExportJob>,
+}
+
+struct LoadJob {
+    path: PathBuf,
+    started: Instant,
+    color_override: Option<(String, bool)>,
+    rotation: u8,
+    view_override: Option<(f32, egui::Vec2)>,
+    rx: mpsc::Receiver<Result<LoadedPreview, String>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct LoadedPreview {
+    loaded: spektrafilm_io::LoadedImage,
+    input: Arc<ImageBuf>,
+    preview: PreviewTextureData,
+    paper: Arc<PreviewTextureData>,
+    source_key: (String, bool, bool),
 }
 
 /// One in-flight preview render. The worker owns a Pipeline + the
 /// ImageBuf clone and, when it finishes, sends back the output buffer
 /// plus the two timings the status bar shows.
 struct RenderJob {
+    discard: bool,
     rx: mpsc::Receiver<Result<RenderResult, String>>,
     handle: Option<JoinHandle<()>>,
 }
 
 struct RenderResult {
     output: ImageBuf,
+    input_preview: Arc<ImageBuf>,
+    preview_limit: u32,
+    path: String,
     preview: PreviewTextureData,
+    source_preview: Option<((String, bool, bool), PreviewTextureData)>,
+    paper: Arc<PreviewTextureData>,
     input_clone_ms: f32,
     scale_ms: f32,
     pipeline_build_ms: f32,
     render_ms: f32,
     preview_ms: f32,
     worker_total_ms: f32,
+    pipeline_cache: (String, Pipeline),
 }
 
 struct PreviewTextureData {
@@ -274,17 +319,14 @@ struct PreviewTextureData {
     rgba: Vec<u8>,
 }
 
-/// One in-flight f64 export. The worker thread owns the child
-/// process and polls `cancel` in its wait loop. On completion the
-/// worker sends `Ok(elapsed_seconds, output_filename)` or `Err(msg)`;
-/// `Err("cancelled")` is also produced when the cancel flag is set.
-/// The join handle is held so we can `join()` after consuming the
-/// message and on `on_exit` to drain the worker before the process dies.
+/// An export worker with cooperative GPU cancellation or cancellable CLI subprocess.
+/// The worker is joined at completion and when the app exits.
 struct ExportJob {
     rx: mpsc::Receiver<Result<(f32, String), String>>,
     handle: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
     started_at: Instant,
+    label: String,
 }
 
 impl App {
@@ -313,7 +355,11 @@ impl App {
             .filter(|t| papers.iter().any(|p| &p.stock == t))
             .unwrap_or_else(|| pick_default_stock(&papers, "fujifilm_crystal_archive_typeii"));
         let mut params = RuntimeParams::default();
+        params.settings.preview_max_size = 2048;
         params.io.scan_film = film_profile.as_ref().is_some_and(|f| f.is_positive());
+        if let Some(film) = &film_profile {
+            spektrafilm_core::pipeline::apply_stock_defaults(film, &mut params);
+        }
         let film_dev_times = film_profile
             .as_ref()
             .map(|f| f.data.development_time.clone())
@@ -321,6 +367,17 @@ impl App {
         let print_dev_times = profile_dev_times(&data_dir, &print_name);
 
         let mut app = Self {
+            ctx: cc.egui_ctx.clone(),
+            load_job: None,
+            preview_input: Vec::new(),
+            rendered_preview_limit: 0,
+            render_path: "Awaiting render".into(),
+            auto_preview: true,
+            gpu_export: true,
+            lut: Default::default(),
+            render_requested: false,
+            display: Default::default(),
+            scan_for_print_restore: None,
             backend,
             data_dir,
             films,
@@ -330,10 +387,24 @@ impl App {
             film_dev_times,
             print_dev_times,
             params,
+            metadata: Default::default(),
+            raw_options: Default::default(),
+            save_options: Default::default(),
             image_path: None,
             image: None,
             output_image: None,
             output_tex: None,
+            input_tex: None,
+            source_display_key: None,
+            rotation: 0,
+            canvas: cc.wgpu_render_state.as_ref().map(view::Renderer::new),
+            canvas_input: None,
+            canvas_output: None,
+            canvas_previous: None,
+            animation: None,
+            canvas_paper: None,
+            paper_tex: None,
+            paper_size: None,
             pipeline_cache_key: None,
             pipeline_cache: None,
             last_render_ms: 0.0,
@@ -353,6 +424,11 @@ impl App {
             metal_colorspace_tagged: false,
             export_job: None,
         };
+        if project::default_path().exists() {
+            if let Err(e) = app.restore_project(&project::default_path(), false) {
+                app.status = format!("Startup defaults: {e:#}");
+            }
+        }
         if let Some(p) = initial_image {
             app.load_image_from_path(&p);
         }
@@ -360,67 +436,233 @@ impl App {
     }
 
     fn load_image_from_path(&mut self, path: &Path) {
-        let t = Instant::now();
-        match load_image(path) {
-            Ok(img) => {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                // PNG (post sRGB-decode) and RAW (linear sRGB after
-                // disabling imagepipe's gamma+basecurve) both deliver
-                // linear sRGB. Tell the pipeline accordingly so it
-                // doesn't double-decode the gamma.
-                if ext == "png" || is_raw_extension(&ext) {
-                    self.params.io.input_color_space = "sRGB".to_string();
-                    self.params.io.input_cctf_decoding = false;
-                }
+        self.load_image_with_state(path, 0, None, None);
+    }
+    fn load_image_with_state(
+        &mut self,
+        path: &Path,
+        rotation: u8,
+        color_override: Option<(String, bool)>,
+        view_override: Option<(f32, egui::Vec2)>,
+    ) {
+        if let Some(render) = &mut self.render_job {
+            render.discard = true;
+        }
+        let display_transform = self.display.display_transform;
+        let preview_color = color_override.clone();
+        let path = path.to_path_buf();
+        let worker_path = path.clone();
+        let options = self.raw_options.clone();
+        let ctx = self.ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("spektrafilm-load".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut loaded = spektrafilm_io::load(&worker_path, &options)
+                        .map_err(|e| format!("{e:#}"))?;
+                    if rotation % 4 != 0 {
+                        loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
+                    }
+                    let input = Arc::new(spektrafilm_core::resize::preview(&loaded.pixels, 2048));
+                    let (color, encoded) =
+                        preview_color.unwrap_or((loaded.color_space.clone(), loaded.encoded));
+                    let mut io = spektrafilm_core::params::IoParams::default();
+                    io.output_color_space = color;
+                    io.output_cctf_encoding = encoded;
+                    let source_key = (
+                        io.output_color_space.clone(),
+                        io.output_cctf_encoding,
+                        display_transform,
+                    );
+                    let preview = make_preview_texture_data(&input, &io, display_transform);
+                    let paper = paper_back::cached(preview.size[0], preview.size[1]);
+                    Ok(LoadedPreview {
+                        loaded,
+                        input,
+                        preview,
+                        paper,
+                        source_key,
+                    })
+                }))
+                .unwrap_or_else(|panic| Err(panic_message(&panic)));
+                ctx.request_repaint();
+                let _ = tx.send(result);
+            });
+        match handle {
+            Ok(handle) => {
+                self.status = format!(
+                    "Loading {}…",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                self.load_job = Some(LoadJob {
+                    path,
+                    started: Instant::now(),
+                    color_override,
+                    rotation,
+                    view_override,
+                    rx,
+                    handle: Some(handle),
+                });
+                self.ctx.request_repaint();
+            }
+            Err(e) => self.status = format!("Load error: could not start decoder: {e}"),
+        }
+    }
+
+    fn poll_load_job(&mut self) {
+        let Some(job) = self.load_job.as_mut() else {
+            return;
+        };
+        let result = match job.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("decoder worker stopped unexpectedly".into())
+            }
+        };
+        let mut job = self.load_job.take().unwrap();
+        if let Some(handle) = job.handle.take() {
+            let _ = handle.join();
+        }
+        match result {
+            Ok(display) => {
+                let LoadedPreview {
+                    loaded,
+                    input,
+                    preview,
+                    paper,
+                    source_key,
+                } = display;
+                self.metadata = loaded.metadata;
+                let (color, encoded) = job
+                    .color_override
+                    .unwrap_or((loaded.color_space, loaded.encoded));
+                self.params.io.input_color_space = color;
+                self.params.io.input_cctf_decoding = encoded;
+                self.rotation = job.rotation;
+                let img = loaded.pixels;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
                     img.width,
                     img.height,
-                    (img.pixel_count() as f64 / 1e6),
-                    t.elapsed().as_secs_f32() * 1000.0
+                    img.pixel_count() as f64 / 1e6,
+                    job.started.elapsed().as_secs_f32() * 1000.
                 );
                 self.image = Some(Arc::new(img));
-                self.image_path = Some(path.to_path_buf());
+                self.image_path = Some(job.path);
+                self.output_image = None;
+                self.output_tex = None;
+                self.input_tex = None;
+                self.canvas_input = None;
+                self.canvas_output = None;
+                self.canvas_previous = None;
+                self.animation = None;
+                self.preview_input.clear();
+                self.preview_input.push((2048, input));
+                self.source_display_key = Some(source_key);
+                if let Some(canvas) = &self.canvas {
+                    self.canvas_input = Some(canvas.upload(&preview));
+                    self.canvas_paper = Some(canvas.upload(&paper));
+                } else {
+                    self.input_tex = Some(make_texture(
+                        &self.ctx,
+                        preview,
+                        self.display.output_interpolation == "nearest",
+                    ));
+                    self.paper_tex = Some(make_texture(
+                        &self.ctx,
+                        PreviewTextureData {
+                            size: paper.size,
+                            rgba: paper.rgba.clone(),
+                        },
+                        false,
+                    ));
+                }
+                self.paper_size = Some(paper.size);
+                self.rendered_preview_limit = 0;
+                let (zoom, pan) = job.view_override.unwrap_or((1., egui::Vec2::ZERO));
+                self.zoom = zoom;
+                self.pan = pan;
+                if let Some(render) = &mut self.render_job {
+                    render.discard = true;
+                }
                 self.dirty = true;
             }
             Err(e) => {
-                self.status = format!("Load error: {e:#}");
+                self.status = format!("Load error: {e}");
+                eprintln!("[spektrafilm] {}", self.status);
             }
         }
     }
 
-    fn preview_pipeline(
-        &mut self,
-        film_name: &str,
-        print_name: &str,
-        params: &RuntimeParams,
-    ) -> Result<(Pipeline, f32), String> {
-        let t = Instant::now();
-        let key = preview_pipeline_cache_key(film_name, print_name, params);
-        if self.pipeline_cache_key.as_deref() == Some(key.as_str())
-            && let Some(pipeline) = self.pipeline_cache.as_ref()
-        {
-            return Ok((pipeline.clone().with_params(params.clone()), t.elapsed().as_secs_f32() * 1000.0));
-        }
-
-        let film = profile::load_profile_by_name(&self.data_dir, film_name)
-            .map_err(|e| format!("film profile '{film_name}': {e}"))?;
-        let effective_print_name = if params.io.scan_film {
-            film_name
-        } else {
-            print_name
+    fn rotate_input(&mut self, turns: u8) {
+        let (Some(image), Some(path)) = (self.image.clone(), self.image_path.clone()) else {
+            return;
         };
-        let print = profile::load_profile_by_name(&self.data_dir, effective_print_name)
-            .map_err(|e| format!("print profile '{effective_print_name}': {e}"))?;
-        let pipeline = Pipeline::new_with_spectral(film, print, params.clone(), &self.data_dir)
-            .map_err(|e| format!("pipeline build: {e}"))?;
-        self.pipeline_cache_key = Some(key);
-        self.pipeline_cache = Some(pipeline.clone());
-        Ok((pipeline, t.elapsed().as_secs_f32() * 1000.0))
+        if self.load_job.is_some() {
+            return;
+        }
+        let rotation = (self.rotation + turns) % 4;
+        let metadata = self.metadata.clone();
+        let color = self.params.io.input_color_space.clone();
+        let encoded = self.params.io.input_cctf_decoding;
+        let display_transform = self.display.display_transform;
+        let ctx = self.ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker_color = color.clone();
+        let handle = std::thread::Builder::new()
+            .name("spektrafilm-rotate".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let pixels = image.rotated_quarter_turns(turns);
+                    let input = Arc::new(spektrafilm_core::resize::preview(&pixels, 2048));
+                    let mut io = spektrafilm_core::params::IoParams::default();
+                    io.output_color_space = worker_color.clone();
+                    io.output_cctf_encoding = encoded;
+                    let source_key = (
+                        io.output_color_space.clone(),
+                        io.output_cctf_encoding,
+                        display_transform,
+                    );
+                    let preview = make_preview_texture_data(&input, &io, display_transform);
+                    let paper = paper_back::cached(preview.size[0], preview.size[1]);
+                    Ok(LoadedPreview {
+                        loaded: spektrafilm_io::LoadedImage {
+                            pixels,
+                            metadata,
+                            color_space: worker_color,
+                            encoded,
+                        },
+                        input,
+                        preview,
+                        paper,
+                        source_key,
+                    })
+                }))
+                .unwrap_or_else(|panic| Err(panic_message(&panic)));
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        match handle {
+            Ok(handle) => {
+                self.load_job = Some(LoadJob {
+                    path,
+                    started: Instant::now(),
+                    color_override: Some((color, encoded)),
+                    rotation,
+                    view_override: None,
+                    rx,
+                    handle: Some(handle),
+                });
+                if let Some(job) = &mut self.render_job {
+                    job.discard = true;
+                }
+                self.status = "Rotating input…".into();
+                self.ctx.request_repaint();
+            }
+            Err(e) => self.status = format!("Rotate: {e}"),
+        }
     }
 
     /// Spawn a render on a worker thread. The UI stays interactive
@@ -440,17 +682,46 @@ impl App {
         let input_clone_ms = t_clone.elapsed().as_secs_f32() * 1000.0;
         let film_name = self.film_name.clone();
         let print_name = self.print_name.clone();
-        let mut params = self.params.clone();
-        let (pipeline_template, pipeline_build_ms) =
-            match self.preview_pipeline(&film_name, &print_name, &params) {
-                Ok(p) => p,
-                Err(msg) => {
-                    eprintln!("[spektrafilm] render error: {msg}");
-                    self.status = format!("Render error: {msg}");
-                    return;
-                }
-            };
+        let params = self.params.clone();
+        let cache_key = preview_pipeline_cache_key(&film_name, &print_name, &params);
+        let pipeline_template = if self.pipeline_cache_key.as_deref() == Some(cache_key.as_str()) {
+            self.pipeline_cache.clone()
+        } else {
+            None
+        };
+        let data_dir = self.data_dir.clone();
+        let configured_limit = if params.settings.preview_max_size == 0 {
+            image.width.max(image.height)
+        } else {
+            params.settings.preview_max_size
+        };
+        let preview_limit = if ctx.is_using_pointer() && self.auto_preview {
+            configured_limit.min(640)
+        } else {
+            configured_limit
+        };
+        let source_key = (
+            params.io.input_color_space.clone(),
+            params.io.input_cctf_decoding,
+            self.display.display_transform,
+        );
+        let prepare_source = self.source_display_key.as_ref() != Some(&source_key);
+        let source_image = self
+            .preview_input
+            .iter()
+            .find(|(limit, _)| *limit == 2048)
+            .map(|(_, i)| i.clone())
+            .unwrap_or_else(|| image.clone());
+        let image = self
+            .preview_input
+            .iter()
+            .find(|(limit, _)| *limit == preview_limit)
+            .map(|(_, image)| image.clone())
+            .unwrap_or(image);
         let backend = self.backend.clone();
+        let display_transform = self.display.display_transform;
+        self.render_requested = false;
+        self.status = format!("Rendering preview (maximum {preview_limit} px)…");
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
         let handle = std::thread::Builder::new()
@@ -461,48 +732,123 @@ impl App {
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t_total = Instant::now();
-                    let working_factor = params.io.upscale_factor;
                     let t_scale = Instant::now();
-                    let scaled_image = if working_factor <= 0.0 || (working_factor - 1.0).abs() < 1e-6 {
-                        None
-                    } else {
-                        Some(rescale_preview_input_fast(image.clone(), working_factor))
+                    // simulate_preview always bounds input size. Preview mode
+                    // independently selects simplified effects.
+                    let image =
+                        if image.width.max(image.height) > preview_limit && preview_limit > 0 {
+                            Arc::new(spektrafilm_core::resize::preview(&image, preview_limit))
+                        } else {
+                            image
+                        };
+                    let scale_ms = t_scale.elapsed().as_secs_f32() * 1000.;
+                    let input_preview = image.clone();
+                    let t_build = Instant::now();
+                    let pipeline = match pipeline_template {
+                        Some(pipeline) => pipeline.with_params(params),
+                        None => {
+                            let film = profile::load_profile_by_name(&data_dir, &film_name)
+                                .map_err(|e| format!("film profile: {e}"))?;
+                            let print = profile::load_profile_by_name(
+                                &data_dir,
+                                if params.io.scan_film {
+                                    &film_name
+                                } else {
+                                    &print_name
+                                },
+                            )
+                            .map_err(|e| format!("print profile: {e}"))?;
+                            Pipeline::new_with_spectral(film, print, params, &data_dir)
+                                .map_err(|e| format!("pipeline build: {e}"))?
+                        }
                     };
-                    let scale_ms = t_scale.elapsed().as_secs_f32() * 1000.0;
-                    params.io.upscale_factor = 1.0;
-                    let pipeline = pipeline_template.with_params(params);
+                    let pipeline_build_ms = t_build.elapsed().as_secs_f32() * 1000.;
                     let t = Instant::now();
-                    let output = match scaled_image {
-                        Some(image) => pipeline.process(image, backend.as_ref()),
-                        None if pipeline.params.io.scan_film && pipeline.film.is_positive() => {
+                    let mut path = if backend.is_gpu() {
+                        "GPU stages"
+                    } else {
+                        "CPU"
+                    }
+                    .to_string();
+                    if backend.is_gpu()
+                        && pipeline.params.film_render.grain.active
+                        && pipeline.params.film_render.grain.sublayers_active
+                        && !backend.supports_layered_grain()
+                    {
+                        path.push_str(" + CPU sublayer grain");
+                    }
+                    let output = match () {
+                        () if pipeline.params.io.crop
+                            || (pipeline.params.io.upscale_factor - 1.).abs() > 1e-6
+                            || (pipeline.params.io.scan_film && pipeline.film.is_positive()) =>
+                        {
                             pipeline.process((*image).clone(), backend.as_ref())
                         }
-                        None => pipeline
-                            .process_resident_borrowed(image.as_ref(), backend.as_ref())
-                            .unwrap_or_else(|| pipeline.process((*image).clone(), backend.as_ref())),
+                        () => {
+                            if let Some(output) =
+                                pipeline.process_resident_borrowed(image.as_ref(), backend.as_ref())
+                            {
+                                path = "GPU resident".into();
+                                output
+                            } else {
+                                pipeline.process((*image).clone(), backend.as_ref())
+                            }
+                        }
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     let t_preview = Instant::now();
-                    let preview = make_preview_texture_data(&output);
+                    let preview =
+                        make_preview_texture_data(&output, &pipeline.params.io, display_transform);
+                    let source_preview = if prepare_source {
+                        let source = if source_image.width.max(source_image.height) > 2048 {
+                            Arc::new(spektrafilm_core::resize::preview(&source_image, 2048))
+                        } else {
+                            source_image
+                        };
+                        let mut source_io = pipeline.params.io.clone();
+                        source_io.output_color_space = source_key.0.clone();
+                        source_io.output_cctf_encoding = source_key.1;
+                        Some((
+                            source_key,
+                            make_preview_texture_data(&source, &source_io, display_transform),
+                        ))
+                    } else {
+                        None
+                    };
+                    let paper = paper_back::cached(
+                        input_preview.width as usize,
+                        input_preview.height as usize,
+                    );
                     let preview_ms = t_preview.elapsed().as_secs_f32() * 1000.0;
                     let worker_total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
+                    eprintln!(
+                        "[spektrafilm] preview {}x{}: resize {:.1} ms, render {:.1} ms, {path}",
+                        output.width, output.height, scale_ms, render_ms
+                    );
                     Ok(RenderResult {
                         output,
+                        input_preview,
+                        preview_limit,
+                        path,
                         preview,
+                        source_preview,
+                        paper,
                         input_clone_ms,
                         scale_ms,
                         pipeline_build_ms,
                         render_ms,
                         preview_ms,
                         worker_total_ms,
+                        pipeline_cache: (cache_key, pipeline),
                     })
                 }))
                 .unwrap_or_else(|panic| Err(panic_message(&panic)));
-                let _ = tx.send(result);
                 ctx_for_worker.request_repaint();
+                let _ = tx.send(result);
             })
             .expect("OS thread spawn");
         self.render_job = Some(RenderJob {
+            discard: false,
             rx,
             handle: Some(handle),
         });
@@ -511,10 +857,24 @@ impl App {
     /// Central-panel preview with mouse-wheel zoom (centred on the
     /// cursor) and click-drag pan. Double-click resets to fit.
     /// `self.zoom = 1.0` means fit-to-panel; values >1 zoom in.
-    fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui, tex: &egui::TextureHandle) {
+    fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
-        let img_size = tex.size_vec2();
-        let fit_scale = (avail.x / img_size.x).min(avail.y / img_size.y).min(1.0);
+        let source_size = self
+            .canvas_input
+            .as_ref()
+            .map(|i| egui::vec2(i.size[0] as f32, i.size[1] as f32))
+            .or_else(|| self.input_tex.as_ref().map(|t| t.size_vec2()));
+        let output_size = self
+            .canvas_output
+            .as_ref()
+            .map(|i| egui::vec2(i.size[0] as f32, i.size[1] as f32))
+            .or_else(|| self.output_tex.as_ref().map(|t| t.size_vec2()));
+        let img_size = source_size.or(output_size).unwrap_or(egui::Vec2::splat(1.));
+        let border = img_size.x.max(img_size.y) * self.display.white_padding;
+        let paper_size = img_size + egui::Vec2::splat(2. * border);
+        let fit_scale = (avail.x / paper_size.x)
+            .min(avail.y / paper_size.y)
+            .min(1.0);
         let scale = fit_scale * self.zoom;
         let drawn_size = img_size * scale;
 
@@ -566,11 +926,117 @@ impl App {
         }
 
         let centre = rect.center() + self.pan;
-        let draw_rect = egui::Rect::from_center_size(centre, drawn_size);
+        let source_rect = egui::Rect::from_center_size(centre, drawn_size);
+        let out_size = output_size.unwrap_or(img_size);
+        let out_scale = (drawn_size.x / out_size.x).min(drawn_size.y / out_size.y);
+        let draw_rect = egui::Rect::from_center_size(centre, out_size * out_scale);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         // Clip to the central panel so panned-off pixels don't leak.
         let painter = ui.painter_at(rect);
-        painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
+        if self.display.show_border && border > 0. {
+            painter.rect_filled(source_rect.expand(border * scale), 0., egui::Color32::WHITE);
+        }
+        if self.display.show_paper_back {
+            if let (Some(canvas), Some(paper)) = (&self.canvas, &self.canvas_paper) {
+                canvas.paint(&painter, source_rect, paper, None, 1., "spline36", None, 1.);
+            } else if let Some(paper) = &self.paper_tex {
+                painter.image(paper.id(), source_rect, uv, egui::Color32::WHITE);
+            }
+        }
+        if self.display.show_input || self.display.compare_split {
+            let source_painter = if self.display.compare_split {
+                painter.with_clip_rect(
+                    egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(
+                            source_rect.left() + source_rect.width() * self.display.split_position,
+                            rect.bottom(),
+                        ),
+                    )
+                    .intersect(rect),
+                )
+            } else {
+                painter.clone()
+            };
+            if let (Some(canvas), Some(input)) = (&self.canvas, &self.canvas_input) {
+                canvas.paint(
+                    &source_painter,
+                    source_rect,
+                    input,
+                    None,
+                    self.display.input_opacity,
+                    &self.display.output_interpolation,
+                    None,
+                    1.,
+                );
+            } else if let Some(source) = &self.input_tex {
+                source_painter.image(
+                    source.id(),
+                    source_rect,
+                    uv,
+                    egui::Color32::from_white_alpha(
+                        (255. * self.display.input_opacity).round() as u8
+                    ),
+                );
+            }
+        }
+        if output_size.is_some() && (self.display.show_output || self.display.compare_split) {
+            let output_painter = if self.display.compare_split {
+                painter.with_clip_rect(
+                    egui::Rect::from_min_max(
+                        egui::pos2(
+                            source_rect.left() + source_rect.width() * self.display.split_position,
+                            rect.top(),
+                        ),
+                        rect.max,
+                    )
+                    .intersect(rect),
+                )
+            } else {
+                painter.clone()
+            };
+            if let (Some(canvas), Some(output)) = (&self.canvas, &self.canvas_output) {
+                let (development, fade) = match self.animation {
+                    Some((start, true)) => (
+                        Some((start.elapsed().as_secs_f32() / 1.6).clamp(0., 1.)),
+                        1.,
+                    ),
+                    Some((start, false)) => {
+                        (None, (start.elapsed().as_secs_f32() / 0.32).clamp(0., 1.))
+                    }
+                    None => (None, 1.),
+                };
+                canvas.paint(
+                    &output_painter,
+                    draw_rect,
+                    output,
+                    self.canvas_previous.as_ref(),
+                    self.display.output_opacity,
+                    &self.display.output_interpolation,
+                    development,
+                    fade,
+                );
+            } else if let Some(tex) = &self.output_tex {
+                output_painter.image(
+                    tex.id(),
+                    draw_rect,
+                    uv,
+                    egui::Color32::from_white_alpha(
+                        (255. * self.display.output_opacity).round() as u8
+                    ),
+                );
+            }
+        }
+        if self.display.compare_split {
+            let x = source_rect.left() + source_rect.width() * self.display.split_position;
+            painter.line_segment(
+                [
+                    egui::pos2(x, draw_rect.top()),
+                    egui::pos2(x, draw_rect.bottom()),
+                ],
+                egui::Stroke::new(1., egui::Color32::WHITE),
+            );
+        }
 
         // Zoom indicator + reset chip in the corner.
         let pct = (self.zoom * fit_scale * 100.0).round() as i32;
@@ -608,16 +1074,92 @@ impl App {
         if let Some(h) = job.handle.take() {
             let _ = h.join();
         }
+        let discard = job.discard;
         self.render_job = None;
+        if discard {
+            self.dirty = true;
+            self.pending_dirty = false;
+            return;
+        }
         match result {
             Ok(r) => {
+                self.pipeline_cache_key = Some(r.pipeline_cache.0);
+                self.pipeline_cache = Some(r.pipeline_cache.1);
+                self.rendered_preview_limit = r.preview_limit;
+                self.preview_input
+                    .retain(|(limit, _)| *limit != r.preview_limit);
+                self.preview_input.push((r.preview_limit, r.input_preview));
+                if self.preview_input.len() > 2 {
+                    self.preview_input.remove(0);
+                }
+                // Keep low-resolution frames flowing while dragging. Drop
+                // obsolete high-resolution refinements and schedule the newest
+                // controls; the source-image discard flag is handled above.
+                if self.pending_dirty && r.preview_limit > 640 {
+                    self.pending_dirty = false;
+                    self.dirty = true;
+                    self.dirty_since = Instant::now().checked_sub(PREVIEW_DEBOUNCE);
+                    ctx.request_repaint();
+                    return;
+                }
+                self.render_path = r.path;
                 self.last_input_clone_ms = r.input_clone_ms;
                 self.last_scale_ms = r.scale_ms;
                 self.last_pipeline_build_ms = r.pipeline_build_ms;
                 self.last_render_ms = r.render_ms;
                 self.last_preview_ms = r.preview_ms;
                 self.last_worker_total_ms = r.worker_total_ms;
-                self.output_tex = Some(make_texture(ctx, r.preview));
+                if let Some(canvas) = &self.canvas {
+                    self.canvas_previous = self
+                        .canvas_output
+                        .take()
+                        .filter(|old| old.size == r.preview.size);
+                    self.animation = if self.display.animate
+                        && r.preview.size[0] * r.preview.size[1] <= 1_500_000
+                        && !ctx.is_using_pointer()
+                    {
+                        Some((Instant::now(), self.canvas_previous.is_none()))
+                    } else {
+                        None
+                    };
+                    if let Some((key, source)) = &r.source_preview {
+                        self.canvas_input = Some(canvas.upload(source));
+                        self.source_display_key = Some(key.clone());
+                    }
+                    self.canvas_output = Some(canvas.upload(&r.preview));
+                }
+                if self.paper_size != Some(r.paper.size) {
+                    if let Some(canvas) = &self.canvas {
+                        self.canvas_paper = Some(canvas.upload(&r.paper));
+                    } else {
+                        self.paper_tex = Some(make_texture(
+                            ctx,
+                            PreviewTextureData {
+                                size: r.paper.size,
+                                rgba: r.paper.rgba.clone(),
+                            },
+                            false,
+                        ));
+                    }
+                    self.paper_size = Some(r.paper.size);
+                }
+                // Upload a single canvas texture; egui textures are only needed
+                // for the explicitly selected legacy Glow compositor.
+                if self.canvas.is_none() {
+                    if let Some((key, source)) = r.source_preview {
+                        self.input_tex = Some(make_texture(
+                            ctx,
+                            source,
+                            self.display.output_interpolation == "nearest",
+                        ));
+                        self.source_display_key = Some(key);
+                    }
+                    self.output_tex = Some(make_texture(
+                        ctx,
+                        r.preview,
+                        self.display.output_interpolation == "nearest",
+                    ));
+                }
                 self.status = format!(
                     "Rendered {} × {} ({:.1} MP)",
                     r.output.width,
@@ -634,6 +1176,10 @@ impl App {
         if self.pending_dirty {
             self.pending_dirty = false;
             self.dirty = true;
+            // The latest edit already waited for the in-flight frame. Do not
+            // add another debounce interval before servicing it.
+            self.dirty_since = Instant::now().checked_sub(PREVIEW_DEBOUNCE);
+            ctx.request_repaint();
         }
     }
 
@@ -657,14 +1203,22 @@ impl App {
             None => "spektrafilm.png".into(),
         };
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "tif", "tiff"])
+            .add_filter("Image", &["png", "jpg", "jpeg", "tif", "tiff", "exr"])
             .set_file_name(&default_name)
             .save_file()
         else {
             return;
         };
         let t = Instant::now();
-        match save_image(&out, &path) {
+        match spektrafilm_io::save_converted(
+            &out,
+            &self.params.io.output_color_space,
+            self.params.io.output_cctf_encoding,
+            &path,
+            &self.current_save_options(),
+            &self.metadata,
+            &self.data_dir,
+        ) {
             Ok(()) => {
                 self.status = format!(
                     "Saved {} in {:.0} ms",
@@ -680,66 +1234,58 @@ impl App {
         }
     }
 
-    /// Export the current frame by subprocessing the f64-built
-    /// `spektrafilm` CLI. The GUI runs the pipeline at f32 on the GPU
-    /// for fast iteration; export re-runs the pipeline at f64 (CPU)
-    /// using the same params and writes a standard PNG/TIFF/JPEG.
-    ///
-    /// The f64 CLI is located via, in order: `$SPEKTRAFILM_F64_CLI`,
-    /// then `spektrafilm-f64` on `PATH`, then `target/release/spektrafilm-f64`
-    /// relative to `CARGO_MANIFEST_DIR`. Build it with
-    /// `cargo build --release --features precision-f64 -p spektrafilm-cli`
-    /// and either rename / symlink it to `spektrafilm-f64` or set the env var.
+    /// Export the original image at full resolution. GPU is the default;
+    /// the precision option selects the bundled f64 CPU CLI instead.
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let Some(input_path) = self.image_path.clone() else {
             self.status = "Load an image before exporting.".into();
             return;
         };
-        let cli_path = match locate_f64_cli() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("Export: {e}");
-                return;
+        let cli_path = if self.gpu_export {
+            None
+        } else {
+            match locate_f64_cli() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.status = format!("Export: {e}");
+                    return;
+                }
             }
         };
         let stem = input_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("spektrafilm");
-        let default_name = format!("{stem}_{}_spektra_f64.png", self.film_name);
+        let default_name = format!("{stem}_{}_spektra.png", self.film_name);
         let Some(out_path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "tif", "tiff", "jpg", "jpeg"])
+            .add_filter("Image", &["png", "tif", "tiff", "jpg", "jpeg", "exr"])
             .set_file_name(&default_name)
             .save_file()
         else {
             return;
         };
 
-        // Spawn the export on a worker thread so the egui event loop
-        // keeps drawing. The cancel flag is shared with the worker so
-        // the Cancel button (and `on_exit`) can kill the child cleanly
-        // instead of letting it orphan after the GUI window closes.
-        //
-        // Enlarger + scanner LUTs are toggled on for the export only.
-        // The GUI preview runs on wgpu (fast at full spectral
-        // integration; LUT round-trip via CPU PCHIP would only slow
-        // it down), but the f64 CPU export gets a 5-10× speedup from
-        // the LUT path — matching Python's typical export config.
         let film = self.film_name.clone();
         let paper = self.print_name.clone();
         let mut params = self.params.clone();
-        params.settings.use_enlarger_lut = true;
-        params.settings.use_scanner_lut = true;
+        params.settings.preview_mode = false;
         let data_dir = self.data_dir.clone();
-        let (tx, rx) = mpsc::channel();
-        let ctx_for_worker = ctx.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_for_worker = Arc::clone(&cancel);
-        let started_at = Instant::now();
-        let handle = std::thread::Builder::new()
-            .name("spektrafilm-export".into())
-            .spawn(move || {
-                let res = run_f64_export(
+        let raw_options = self.raw_options.clone();
+        let rotation = self.rotation;
+        let save_options = self.current_save_options();
+        let metadata = self.metadata.clone();
+        let image = self.image.clone();
+        let backend = self.backend.clone();
+        let label = if cli_path.is_some() {
+            "f64 CPU"
+        } else if backend.is_gpu() {
+            "GPU"
+        } else {
+            "CPU"
+        };
+        self.start_export_job(ctx, label, out_path.clone(), move |cancel| {
+            if let Some(cli_path) = cli_path {
+                return run_f64_export(
                     &cli_path,
                     &input_path,
                     &out_path,
@@ -747,28 +1293,69 @@ impl App {
                     &paper,
                     &params,
                     &data_dir,
-                    &cancel_for_worker,
+                    cancel,
+                    &raw_options,
+                    &save_options,
+                    rotation,
                 );
-                let name = out_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("(file)")
-                    .to_string();
-                let msg = match res {
-                    Ok(()) => Ok((started_at.elapsed().as_secs_f32(), name)),
-                    Err(e) => Err(format!("{e:#}")),
-                };
-                let _ = tx.send(msg);
-                ctx_for_worker.request_repaint();
-            })
-            .expect("OS thread spawn");
-        self.status = "Exporting at f64 (CPU)…".into();
-        self.export_job = Some(ExportJob {
-            rx,
-            handle: Some(handle),
-            cancel,
-            started_at,
+            }
+            run_gpu_export(
+                image.context("source image is still loading")?.as_ref(),
+                &out_path,
+                &film,
+                &paper,
+                &params,
+                &data_dir,
+                backend.as_ref(),
+                cancel,
+                &save_options,
+                &metadata,
+            )
         });
+    }
+
+    fn start_export_job<F>(&mut self, ctx: &egui::Context, label: &str, output: PathBuf, run: F)
+    where
+        F: FnOnce(&AtomicBool) -> Result<()> + Send + 'static,
+    {
+        if self.export_job.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let started_at = Instant::now();
+        let handle = std::thread::Builder::new()
+            .name("spektrafilm-export".into())
+            .spawn(move || {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&worker_cancel)))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("export worker panicked")));
+                let message = result
+                    .map(|_| {
+                        (
+                            started_at.elapsed().as_secs_f32(),
+                            output.display().to_string(),
+                        )
+                    })
+                    .map_err(|e| format!("{e:#}"));
+                ctx.request_repaint();
+                let _ = tx.send(message);
+            });
+        match handle {
+            Ok(handle) => {
+                self.status = format!("Exporting ({label})…");
+                self.export_job = Some(ExportJob {
+                    rx,
+                    handle: Some(handle),
+                    cancel,
+                    started_at,
+                    label: label.into(),
+                });
+            }
+            Err(e) => self.status = format!("Export: could not start worker: {e}"),
+        }
     }
 
     /// Request cancellation of the in-flight export. The worker thread
@@ -800,7 +1387,7 @@ impl App {
                 self.status = if job.cancel.load(Ordering::SeqCst) {
                     format!("Cancelling export… ({secs}s)")
                 } else {
-                    format!("Exporting at f64 (CPU)… ({secs}s)")
+                    format!("Exporting ({})… ({secs}s)", job.label)
                 };
                 ctx.request_repaint_after(Duration::from_secs(1));
                 return;
@@ -814,9 +1401,10 @@ impl App {
         if let Some(h) = job.handle.take() {
             let _ = h.join();
         }
+        let label = job.label.clone();
         self.export_job = None;
         self.status = match msg {
-            Ok((secs, name)) => format!("Exported (f64 CPU) {name} in {secs:.1} s"),
+            Ok((secs, name)) => format!("Exported ({label}) {name} in {secs:.1} s"),
             Err(e) if e.contains("cancelled") => "Export cancelled.".into(),
             Err(e) => format!("Export error: {e}"),
         };
@@ -833,7 +1421,7 @@ impl App {
                     .add_filter(
                         "Image",
                         &[
-                            "png", "tif", "tiff", // standard
+                            "png", "jpg", "jpeg", "tif", "tiff", "exr", // standard
                             "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
                             "rw2", "pef", "srw", "x3f", "iiq", "3fr", "crw", "rwl", "mrw", "mef",
                             "kdc",
@@ -844,10 +1432,14 @@ impl App {
                     self.load_image_from_path(&path);
                 }
             }
-            let save_enabled = self.output_image.is_some();
+            let save_enabled = self.output_image.is_some()
+                && self.load_job.is_none()
+                && self.render_job.is_none()
+                && !self.dirty
+                && !self.pending_dirty;
             if ui
-                .add_enabled(save_enabled, egui::Button::new("Save…"))
-                .on_disabled_hover_text("Render an image first")
+                .add_enabled(save_enabled, egui::Button::new("Save preview…"))
+                .on_disabled_hover_text("Render a preview first")
                 .clicked()
             {
                 self.save_dialog();
@@ -856,19 +1448,17 @@ impl App {
             if export_busy {
                 if ui
                     .button("Cancel")
-                    .on_hover_text("Stop the in-flight f64 CPU export and kill the child process.")
+                    .on_hover_text("Cancel export. An active GPU dispatch finishes before cancellation.")
                     .clicked()
                 {
                     self.cancel_export();
                 }
             } else {
-                let export_enabled = self.image_path.is_some();
+                let export_enabled = self.image_path.is_some() && self.load_job.is_none();
                 if ui
                     .add_enabled(export_enabled, egui::Button::new("Export…"))
                     .on_hover_text(
-                        "Re-run the pipeline at f64 precision (CPU, via the spektrafilm-f64 \
-                         CLI subprocess) and write a PNG/TIFF/JPEG. The live preview stays \
-                         at f32 GPU for speed; export trades time for precision.",
+                        "Render the original image at full resolution using the selected export precision.",
                     )
                     .on_disabled_hover_text("Load an image first")
                     .clicked()
@@ -884,6 +1474,19 @@ impl App {
         }
         ui.add_space(4.0);
 
+        self.project_controls(ui);
+        self.lut_controls(ui, ctx);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.auto_preview, "Auto preview");
+            if ui
+                .add_enabled(self.image.is_some(), egui::Button::new("Render preview"))
+                .clicked()
+            {
+                self.render_requested = true;
+                self.dirty = true;
+                self.dirty_since = None;
+            }
+        });
         // ── Profiles ────────────────────────────────────────────────────
         egui::CollapsingHeader::new("Profiles")
             .default_open(true)
@@ -901,6 +1504,7 @@ impl App {
                         // so switching stocks doesn't leave a wrong (or, for
                         // a paperless slide, a failed) render.
                         self.params.io.scan_film = film.is_positive();
+                        spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
                         self.film_dev_times = film.data.development_time.clone();
                         if let Some(target) = film.info.target_print.as_deref()
                             && self.papers.iter().any(|p| p.stock == target)
@@ -967,6 +1571,17 @@ impl App {
                     self.dirty = true;
                 }
             });
+
+        let mut scan_for_print = self.scan_for_print_restore.is_some();
+        if ui.checkbox(&mut scan_for_print,"Scan for print").on_hover_text("Apply scanner white and black correction and disable paper glare. Turning off restores the previous settings.").changed() {
+            if scan_for_print {
+                self.scan_for_print_restore=Some([self.params.scanner.white_correction,self.params.scanner.black_correction,self.params.print_render.glare.active]);
+                self.params.scanner.white_correction=true;self.params.scanner.black_correction=true;self.params.print_render.glare.active=false;
+            } else if let Some([white,black,glare])=self.scan_for_print_restore.take() {
+                self.params.scanner.white_correction=white;self.params.scanner.black_correction=black;self.params.print_render.glare.active=glare;
+            }
+            self.dirty=true;
+        }
 
         // ── Exposure ────────────────────────────────────────────────────
         egui::CollapsingHeader::new("Exposure")
@@ -1063,6 +1678,76 @@ impl App {
                 changed |= ui
                     .checkbox(&mut h.halation_renormalize, "Renormalize")
                     .changed();
+                egui::CollapsingHeader::new("Physical emulsion parameters").show(ui, |ui| {
+                    for c in 0..3 {
+                        let channel = ["Red", "Green", "Blue"][c];
+                        ui.label(channel);
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut h.scatter_core_um[c])
+                                    .range(0.0..=1000.0)
+                                    .speed(0.1)
+                                    .prefix("Scatter core µm: "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut h.scatter_tail_um[c])
+                                    .range(0.0..=2000.0)
+                                    .speed(0.5)
+                                    .prefix("Scatter tail µm: "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut h.scatter_tail_weight[c])
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .prefix("Tail weight: "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut h.halation_strength[c])
+                                    .range(0.0..=3.0)
+                                    .speed(0.001)
+                                    .prefix("Halation strength: "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut h.halation_first_sigma_um[c])
+                                    .range(0.0..=2000.0)
+                                    .speed(0.5)
+                                    .prefix("First bounce µm: "),
+                            )
+                            .changed();
+                    }
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut h.boost_ev)
+                                .range(0.0..=8.0)
+                                .speed(0.01)
+                                .prefix("Highlight boost EV: "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut h.boost_range)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .prefix("Boost ramp (0–1): "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut h.protect_ev)
+                                .range(0.0..=16.0)
+                                .speed(0.01)
+                                .prefix("Protect EV: "),
+                        )
+                        .changed();
+                });
                 if changed {
                     self.dirty = true;
                 }
@@ -1096,6 +1781,48 @@ impl App {
                             .text("Tail weight"),
                     )
                     .changed();
+                egui::CollapsingHeader::new("Inhibition matrix").show(ui, |ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut d.inhibition_samelayer)
+                                .range(0.0..=4.0)
+                                .speed(0.01)
+                                .prefix("Same-layer scale: "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut d.inhibition_interlayer)
+                                .range(0.0..=4.0)
+                                .speed(0.01)
+                                .prefix("Inter-layer scale: "),
+                        )
+                        .changed();
+                    for c in 0..3 {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut d.gamma_samelayer_rgb[c])
+                                    .range(0.0..=4.0)
+                                    .speed(0.001)
+                                    .prefix(format!("{} self: ", ["Red", "Green", "Blue"][c])),
+                            )
+                            .changed();
+                    }
+                    for (name, values) in [
+                        ("Red → green / blue", &mut d.gamma_interlayer_r_to_gb),
+                        ("Green → red / blue", &mut d.gamma_interlayer_g_to_rb),
+                        ("Blue → red / green", &mut d.gamma_interlayer_b_to_rg),
+                    ] {
+                        ui.label(name);
+                        ui.horizontal(|ui| {
+                            for v in values {
+                                changed |= ui
+                                    .add(egui::DragValue::new(v).range(0.0..=4.0).speed(0.001))
+                                    .changed();
+                            }
+                        });
+                    }
+                });
                 if changed {
                     self.dirty = true;
                 }
@@ -1170,8 +1897,16 @@ impl App {
                     .add(egui::Slider::new(&mut g.blur, 0.0..=3.0).text("Post-blur σ"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut g.n_sub_layers, 1..=4).text("Sub-layers"))
+                    .checkbox(&mut g.sublayers_active, "Physical emulsion layers")
                     .changed();
+                if !g.sublayers_active {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut g.n_sub_layers, 1..=4)
+                                .text("Simple grain layers"),
+                        )
+                        .changed();
+                }
                 if changed {
                     self.dirty = true;
                 }
@@ -1181,7 +1916,11 @@ impl App {
         egui::CollapsingHeader::new("Glare")
             .default_open(false)
             .show(ui, |ui| {
-                let g = &mut self.params.print_render.glare;
+                let g = if self.params.io.scan_film {
+                    &mut self.params.film_render.glare
+                } else {
+                    &mut self.params.print_render.glare
+                };
                 let mut changed = false;
                 changed |= ui.checkbox(&mut g.active, "Active").changed();
                 changed |= ui
@@ -1425,13 +2164,17 @@ impl App {
                     )
                     .changed();
                 changed |= ui
-                    .checkbox(&mut io.output_cctf_encoding, "Output sRGB encoded")
+                    .checkbox(
+                        &mut io.output_cctf_encoding,
+                        "Encode output transfer function",
+                    )
                     .changed();
                 if changed {
                     self.dirty = true;
                 }
             });
 
+        self.parity_controls(ui);
         // ── Metrics ─────────────────────────────────────────────────────
         ui.add_space(10.0);
         ui.separator();
@@ -1449,15 +2192,13 @@ impl App {
             "clone/scale:   {:>6.1} / {:>5.1} ms",
             self.last_input_clone_ms, self.last_scale_ms
         ));
-        ui.monospace(format!(
-            "preview pack:  {:>6.1} ms",
-            self.last_preview_ms
-        ));
+        ui.monospace(format!("preview pack:  {:>6.1} ms", self.last_preview_ms));
         ui.monospace(format!(
             "worker total:  {:>6.1} ms",
             self.last_worker_total_ms
         ));
         ui.monospace(format!("backend: {}", self.backend.name()));
+        ui.label(format!("Execution: {}", self.render_path));
         ui.label(egui::RichText::new(&self.status).small());
     }
 }
@@ -1481,7 +2222,28 @@ impl eframe::App for App {
         }
         let _ = frame;
 
-        if self.dirty && self.image.is_some() {
+        self.poll_load_job();
+        // Refine an interactive 640 px frame after the slider is released.
+        let configured_limit = if self.params.settings.preview_max_size == 0 {
+            self.image
+                .as_ref()
+                .map(|i| i.width.max(i.height))
+                .unwrap_or(0)
+        } else {
+            self.params.settings.preview_max_size
+        };
+        if !ctx.is_using_pointer()
+            && self.render_job.is_none()
+            && self.output_image.is_some()
+            && self.rendered_preview_limit < configured_limit
+        {
+            self.dirty = true;
+        }
+        if self.dirty
+            && (self.auto_preview || self.render_requested)
+            && self.image.is_some()
+            && self.load_job.is_none()
+        {
             let now = Instant::now();
             let dirty_since = *self.dirty_since.get_or_insert(now);
             if self.render_job.is_some() {
@@ -1490,39 +2252,81 @@ impl eframe::App for App {
                 self.dirty_since = None;
             } else {
                 let elapsed = now.saturating_duration_since(dirty_since);
-                if elapsed >= PREVIEW_DEBOUNCE {
+                let debounce = if ctx.is_using_pointer() && self.auto_preview {
+                    INTERACTIVE_DEBOUNCE
+                } else {
+                    PREVIEW_DEBOUNCE
+                };
+                if elapsed >= debounce {
                     self.dispatch_render(ctx);
                     self.dirty = false;
                     self.dirty_since = None;
                 } else {
-                    ctx.request_repaint_after(PREVIEW_DEBOUNCE - elapsed);
+                    ctx.request_repaint_after(debounce - elapsed);
                 }
             }
         }
-        if self.render_job.is_some() {
+        if self.render_job.is_some() || self.load_job.is_some() {
             ctx.request_repaint_after(IN_FLIGHT_REPAINT);
         }
         self.poll_render_job(ctx);
+        if let Some((start, developing)) = self.animation {
+            let duration = if developing { 1.6 } else { 0.32 };
+            if !self.display.animate || start.elapsed().as_secs_f32() >= duration {
+                self.animation = None;
+                self.canvas_previous = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
         self.poll_export_job(ctx);
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.load_job.is_some() || self.render_job.is_some() {
+                    ui.spinner();
+                }
+                if self.status.starts_with("Load error:")
+                    || self.status.starts_with("Render error:")
+                {
+                    ui.colored_label(ui.visuals().error_fg_color, &self.status);
+                } else {
+                    ui.label(&self.status);
+                }
+            });
+        });
         egui::SidePanel::right("controls")
             .resizable(false)
             .exact_width(340.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls_panel(ui, ctx));
             });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Clone the texture handle (cheap — internally `Arc`) so we
-            // can take `&mut self` to mutate `zoom` / `pan` from the
-            // closure without a borrow conflict on `self.output_tex`.
-            let tex = self.output_tex.clone();
-            if let Some(tex) = tex {
-                self.draw_preview_with_zoom(ui, &tex);
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Drop or open an image to start.").size(18.0));
-                });
-            }
-        });
+        let canvas = if self.display.gray_18_canvas {
+            egui::Color32::from_gray(118)
+        } else {
+            ctx.style().visuals.panel_fill
+        };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).fill(canvas))
+            .show(ctx, |ui| {
+                if self.canvas_input.is_some()
+                    || self.input_tex.is_some()
+                    || self.canvas_output.is_some()
+                    || self.output_tex.is_some()
+                {
+                    self.draw_preview_with_zoom(ui);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(if self.image.is_some() {
+                                "Click Render preview to process this image."
+                            } else {
+                                "Drop or open an image to start."
+                            })
+                            .size(18.0),
+                        );
+                    });
+                }
+            });
 
         // Accept drag-and-dropped image files.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1727,23 +2531,24 @@ fn fps_label(ms: f32) -> &'static str {
     }
 }
 
-fn preview_pipeline_cache_key(
-    film_name: &str,
-    print_name: &str,
-    params: &RuntimeParams,
-) -> String {
+fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
     serde_json::json!({
         "film": film_name,
         "print": print_name,
         "film_dev": params.film_render.development_time,
+        "film_gamma":params.film_render.density_curve_gamma,
+        "debug":params.debug,
         "print_dev": params.print_render.development_time,
         "scan_film": params.io.scan_film,
+        "film_channel_order":params.film_render.channel_order,"print_channel_order":params.print_render.channel_order,
         "input_color_space": params.io.input_color_space,
         "input_cctf_decoding": params.io.input_cctf_decoding,
+        "filter_uv": params.camera.filter_uv,"filter_ir": params.camera.filter_ir,
         "input_gamut": params.io.input_gamut_compress,
         "output_color_space": params.io.output_color_space,
         "output_gamut": params.io.output_gamut_compress,
         "settings": {
+            "apply_stock_specifics":params.settings.apply_stock_specifics,
             "rgb_to_raw_method": params.settings.rgb_to_raw_method,
             "apply_hanatos2025_adaptation_window": params.settings.apply_hanatos2025_adaptation_window,
             "apply_hanatos2025_adaptation_surface": params.settings.apply_hanatos2025_adaptation_surface,
@@ -1774,28 +2579,6 @@ fn preview_pipeline_cache_key(
     .to_string()
 }
 
-fn rescale_preview_input_fast(image: Arc<ImageBuf>, factor: f32) -> ImageBuf {
-    if factor <= 0.0 || (factor - 1.0).abs() < 1e-6 {
-        return (*image).clone();
-    }
-    let new_w = (((image.width as f32) * factor).round() as u32).max(1);
-    let new_h = (((image.height as f32) * factor).round() as u32).max(1);
-    if new_w == image.width && new_h == image.height {
-        return (*image).clone();
-    }
-
-    let f32buf: Vec<f32> = image.data.par_iter().map(|&v| to_f32(v)).collect();
-    let src = image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(
-        image.width,
-        image.height,
-        f32buf,
-    )
-    .expect("ImageBuf dims match its data length");
-    let dst = image::imageops::resize(&src, new_w, new_h, image::imageops::FilterType::CatmullRom);
-    let data: Vec<Scalar> = dst.into_raw().into_par_iter().map(from_f32).collect();
-    ImageBuf::from_data(new_w, new_h, data)
-}
-
 fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
     if entries.iter().any(|e| e.stock == preferred) {
         preferred.to_string()
@@ -1807,206 +2590,45 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
     }
 }
 
-fn load_image(path: &Path) -> Result<ImageBuf> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if is_raw_extension(&ext) {
-        return load_raw(path);
-    }
-    // Disable the `image` crate's default 512 MiB allocation cap — a 60 MP
-    // 32-bit float TIFF alone needs ~720 MiB and would otherwise be
-    // rejected with "Memory limit exceeded". Local files are trusted.
-    let mut reader = image::ImageReader::open(path)
-        .with_context(|| format!("opening image: {}", path.display()))?
-        .with_guessed_format()
-        .with_context(|| format!("detecting image format: {}", path.display()))?;
-    reader.no_limits();
-    let img = reader
-        .decode()
-        .with_context(|| format!("decoding image: {}", path.display()))?;
-    let rgb = img.to_rgb32f();
-    let (w, h) = (rgb.width(), rgb.height());
-    let data: Vec<f32> = rgb.into_raw();
-    let scalars: Vec<Scalar> = match ext.as_str() {
-        "png" => data
-            .into_par_iter()
-            .map(|v| srgb_decode(from_f32(v)))
-            .collect(),
-        _ => data.into_par_iter().map(from_f32).collect(),
-    };
-    Ok(ImageBuf::from_data(w, h, scalars))
-}
-
-/// Camera RAW extensions supported via `imagepipe` / `rawloader`. The
-/// underlying decoder handles many proprietary formats; this list is
-/// the dispatch trigger only (we still try the decoder for unknown
-/// extensions).
-fn is_raw_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "dng"
-            | "cr2"
-            | "cr3"
-            | "nef"
-            | "nrw"
-            | "arw"
-            | "srf"
-            | "sr2"
-            | "raf"
-            | "orf"
-            | "rw2"
-            | "pef"
-            | "ptx"
-            | "srw"
-            | "x3f"
-            | "iiq"
-            | "3fr"
-            | "ari"
-            | "bay"
-            | "crw"
-            | "dcr"
-            | "drf"
-            | "erf"
-            | "fff"
-            | "k25"
-            | "kdc"
-            | "mef"
-            | "mos"
-            | "mrw"
-            | "rwl"
-    )
-}
-
-/// Decode a camera RAW file and return a **linear** image in sRGB
-/// primaries. The pipeline runs `rawler` (a modern fork of rawloader
-/// with broader camera coverage — Sony ARW, newer Nikon NEF, recent
-/// DNGs) instead of the older `imagepipe` chain.
-///
-/// `rawler::RawDevelop::default()` already covers rescale → demosaic →
-/// crop → white balance → camera→sRGB matrix. We drop the final
-/// `SRgb` gamma step so we get LINEAR sRGB out (the spektrafilm
-/// pipeline applies its own sRGB encoding at the very end).
-///
-/// Limitations: Lightroom-exported "lossy DNG" (`ljpeg sof.precision 8`)
-/// is not supported by rawler — those files come back as an error,
-/// which we surface in the GUI status bar.
-fn load_raw(path: &Path) -> Result<ImageBuf> {
-    use rawler::{
-        decode_file,
-        imgop::develop::{ProcessingStep, RawDevelop},
-    };
-    let raw = decode_file(path).map_err(|e| anyhow::anyhow!("RAW decode failed: {e:?}"))?;
-    let mut dev = RawDevelop::default();
-    // Drop the sRGB gamma step — we want linear sRGB primaries, the
-    // spektrafilm pipeline applies its own sRGB OETF at the end.
-    dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb));
-    let intermediate = dev
-        .develop_intermediate(&raw)
-        .map_err(|e| anyhow::anyhow!("RAW develop failed: {e:?}"))?;
-    rawler_intermediate_to_image_buf(intermediate)
-}
-
-fn rawler_intermediate_to_image_buf(
-    intermediate: rawler::imgop::develop::Intermediate,
-) -> Result<ImageBuf> {
-    use rawler::imgop::develop::Intermediate;
-
-    let floor = |v: f32| from_f32(v.max(0.0));
-    match intermediate {
-        Intermediate::Monochrome(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|&v| {
-                    let v = floor(v);
-                    [v, v, v]
-                })
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::ThreeColor(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-        Intermediate::FourColor(pixels) => {
-            let scalars: Vec<Scalar> = pixels
-                .data
-                .par_iter()
-                .flat_map_iter(|px| [floor(px[0]), floor(px[1]), floor(px[2])])
-                .collect();
-            Ok(ImageBuf::from_data(
-                pixels.width as u32,
-                pixels.height as u32,
-                scalars,
-            ))
-        }
-    }
-}
-
-/// Write the pipeline's RGB ImageBuf to disk. PNG is 8-bit (matches what
-/// the preview shows); TIFF is 16-bit (more headroom — recommended for
-/// further editing). The pipeline already emits sRGB-encoded values
-/// clamped to [0, 1] when `output_cctf_encoding` is on, which is the
-/// default for the GUI.
-fn save_image(out: &ImageBuf, path: &Path) -> Result<()> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png")
-        .to_lowercase();
-    let w = out.width;
-    let h = out.height;
-    match ext.as_str() {
-        "tif" | "tiff" => {
-            // Pack into 16-bit RGB.
-            let n = (w as usize) * (h as usize) * 3;
-            let mut buf = vec![0u16; n];
-            buf.par_iter_mut()
-                .zip(out.data.par_iter())
-                .for_each(|(dst, &src)| {
-                    *dst = (to_f32(src).clamp(0.0, 1.0) * 65535.0).round() as u16;
-                });
-            let img = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, buf)
-                .context("packing 16-bit TIFF buffer")?;
-            img.save_with_format(path, image::ImageFormat::Tiff)
-                .with_context(|| format!("writing TIFF {}", path.display()))?;
-        }
-        _ => {
-            let n = (w as usize) * (h as usize) * 3;
-            let mut buf = vec![0u8; n];
-            buf.par_iter_mut()
-                .zip(out.data.par_iter())
-                .for_each(|(dst, &src)| {
-                    *dst = (to_f32(src).clamp(0.0, 1.0) * 255.0).round() as u8;
-                });
-            let img = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buf)
-                .context("packing 8-bit PNG buffer")?;
-            img.save_with_format(path, image::ImageFormat::Png)
-                .with_context(|| format!("writing PNG {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Convert the pipeline's post-sRGB-encoded RGB ImageBuf into an RGBA preview.
+/// Convert the selected output color transport to an sRGB RGBA display preview.
 /// The full output remains available for saving, but the interactive texture is
 /// capped so a large RAW does not force a full-size upload into egui every pass.
-fn make_preview_texture_data(out: &ImageBuf) -> PreviewTextureData {
+fn make_preview_texture_data(
+    out: &ImageBuf,
+    io: &spektrafilm_core::params::IoParams,
+    display_transform: bool,
+) -> PreviewTextureData {
+    let converted;
+    let out = if !display_transform || (io.output_color_space == "sRGB" && io.output_cctf_encoding)
+    {
+        out
+    } else {
+        let mut display = out.clone();
+        let curve = spektrafilm_math::transfer::get(&io.output_color_space)
+            .expect("validated output")
+            .transfer;
+        let matrix = spektrafilm_math::transfer::rgb_matrix(&io.output_color_space, "sRGB");
+        for px in display.data.chunks_exact_mut(3) {
+            let linear = std::array::from_fn::<_, 3, _>(|c| {
+                if io.output_cctf_encoding {
+                    curve.decode(px[c] as f64)
+                } else {
+                    px[c] as f64
+                }
+            });
+            for c in 0..3 {
+                px[c] = spektrafilm_math::precision::from_f64(
+                    spektrafilm_math::transfer::Transfer::Srgb.encode(
+                        matrix[c][0] * linear[0]
+                            + matrix[c][1] * linear[1]
+                            + matrix[c][2] * linear[2],
+                    ),
+                );
+            }
+        }
+        converted = display;
+        &converted
+    };
     let src_w = out.width as usize;
     let src_h = out.height as usize;
     let max_src_dim = src_w.max(src_h).max(1);
@@ -2056,14 +2678,21 @@ fn make_preview_texture_data(out: &ImageBuf) -> PreviewTextureData {
     PreviewTextureData { size: [w, h], rgba }
 }
 
-/// Upload a prepared preview texture. The pipeline emits values already
-/// clamped to [0, 1] and sRGB-encoded when `output_cctf_encoding` is on.
-fn make_texture(ctx: &egui::Context, preview: PreviewTextureData) -> egui::TextureHandle {
+/// Upload an sRGB display preview prepared independently of saved image pixels.
+fn make_texture(
+    ctx: &egui::Context,
+    preview: PreviewTextureData,
+    nearest: bool,
+) -> egui::TextureHandle {
     let color_image = egui::ColorImage::from_rgba_unmultiplied(preview.size, &preview.rgba);
     ctx.load_texture(
         "spektrafilm-output",
         color_image,
-        egui::TextureOptions::LINEAR,
+        if nearest {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        },
     )
 }
 
@@ -2170,6 +2799,9 @@ fn run_f64_export(
     params: &spektrafilm_core::params::RuntimeParams,
     data_dir: &Path,
     cancel: &AtomicBool,
+    raw_options: &spektrafilm_io::RawOptions,
+    save_options: &spektrafilm_io::SaveOptions,
+    rotation: u8,
 ) -> Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2192,6 +2824,24 @@ fn run_f64_export(
     // to GPU would silently demote the export back to f32 math.
     cmd.env("SPEKTRAFILM_BACKEND", "cpu")
         .arg("process")
+        .arg("--rotate-quarter-turns")
+        .arg(rotation.to_string())
+        .arg("--bit-depth")
+        .arg(save_options.bit_depth.to_string())
+        .arg("--jpeg-quality")
+        .arg(save_options.jpeg_quality.to_string())
+        .arg("--saving-color-space")
+        .arg(&save_options.color_space)
+        .arg("--saving-cctf-encoding")
+        .arg(save_options.encoded.to_string())
+        .arg("--raw-decoder")
+        .arg(&raw_options.decoder)
+        .arg("--white-balance")
+        .arg(&raw_options.white_balance)
+        .arg("--temperature")
+        .arg(raw_options.temperature.to_string())
+        .arg("--tint")
+        .arg(raw_options.tint.to_string())
         .arg(input)
         .arg("-o")
         .arg(output)
@@ -2209,45 +2859,96 @@ fn run_f64_export(
         cmd.arg("--scan-film");
     }
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", cli_path.display()))?;
-
-    // Poll loop. 100 ms is responsive to a Cancel click without
-    // burning CPU while the export grinds through CPU f64 math.
-    let status = loop {
-        if let Some(s) = child.try_wait().context("waiting for f64 CLI")? {
-            break s;
-        }
-        if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("cancelled");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-
-    // The child has exited; piped buffers are drained safely.
-    let mut stderr_buf = String::new();
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stderr_buf);
+    if raw_options.lens_correction {
+        cmd.arg("--lens-correction");
     }
+    if let Some(path) = &raw_options.lens_database {
+        cmd.arg("--lens-database").arg(path);
+    }
+    run_cli(&mut cmd, cancel)
+}
 
-    if !status.success() {
-        let trimmed = stderr_buf.trim();
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "(signal)".into());
-        anyhow::bail!(
-            "f64 CLI exited {code} — {}",
-            if trimmed.is_empty() {
-                "(no stderr)"
-            } else {
-                trimmed
+/// Full-resolution export shares the same pipeline and saving conversion as the CLI.
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_export(
+    image: &ImageBuf,
+    output: &Path,
+    film_name: &str,
+    paper_name: &str,
+    params: &RuntimeParams,
+    data_dir: &Path,
+    backend: &dyn ComputeBackend,
+    cancel: &AtomicBool,
+    options: &spektrafilm_io::SaveOptions,
+    metadata: &spektrafilm_io::Metadata,
+) -> Result<()> {
+    let film = profile::load_profile_by_name(data_dir, film_name)?;
+    let paper = profile::load_profile_by_name(
+        data_dir,
+        if params.io.scan_film {
+            film_name
+        } else {
+            paper_name
+        },
+    )?;
+    let mut params = params.clone();
+    params.settings.preview_mode = false;
+    let pipeline = Pipeline::new_with_spectral(film, paper, params.clone(), data_dir)
+        .map_err(anyhow::Error::msg)?;
+    if cancel.load(Ordering::SeqCst) {
+        anyhow::bail!("cancelled");
+    }
+    let output_image = pipeline
+        .process_resident_borrowed(image, backend)
+        .unwrap_or_else(|| pipeline.process(image.clone(), backend));
+    if cancel.load(Ordering::SeqCst) {
+        anyhow::bail!("cancelled");
+    }
+    spektrafilm_io::save_converted(
+        &output_image,
+        &params.io.output_color_space,
+        params.io.output_cctf_encoding,
+        output,
+        options,
+        metadata,
+        data_dir,
+    )
+}
+
+/// Drain both child pipes while polling, so verbose jobs cannot block on a full pipe.
+fn run_cli(cmd: &mut std::process::Command, cancel: &AtomicBool) -> Result<()> {
+    use std::io::Read;
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("starting export CLI")?;
+    let mut stderr = child.stderr.take().context("opening export diagnostics")?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if !cancel.load(Ordering::SeqCst) => {
+                std::thread::sleep(Duration::from_millis(100))
             }
-        );
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(anyhow::anyhow!("cancelled"));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(e.into());
+            }
+        }
+    };
+    let stderr = reader.join().unwrap_or_default();
+    let status = result?;
+    if !status.success() {
+        anyhow::bail!("export CLI exited {status}: {}", stderr.trim());
     }
     Ok(())
 }
@@ -2349,4 +3050,598 @@ fn tag_metal_layer_srgb<H: raw_window_handle::HasWindowHandle>(h: &H) -> Result<
         tracing::info!("tagged CAMetalLayer.colorspace = sRGB");
     }
     Ok(())
+}
+
+impl App {
+    fn current_save_options(&self) -> spektrafilm_io::SaveOptions {
+        self.save_options.clone()
+    }
+    fn project_state(&self) -> project::Project {
+        project::Project {
+            version: 1,
+            rotation: self.rotation,
+            auto_preview: self.auto_preview,
+            gpu_export: self.gpu_export,
+            lut: self.lut.clone(),
+            display: self.display.clone(),
+            scan_for_print_restore: self.scan_for_print_restore,
+            film: self.film_name.clone(),
+            paper: self.print_name.clone(),
+            params: self.params.clone(),
+            image: self.image_path.clone(),
+            zoom: self.zoom,
+            pan: [self.pan.x, self.pan.y],
+            raw: self.raw_options.clone(),
+            output: self.current_save_options(),
+        }
+    }
+    fn restore_project(&mut self, path: &Path, load_image: bool) -> Result<()> {
+        let state = project::Project::load(path)?;
+        profile::load_profile_by_name(&self.data_dir, &state.film)?;
+        profile::load_profile_by_name(&self.data_dir, &state.paper)?;
+        self.auto_preview = state.auto_preview;
+        self.gpu_export = state.gpu_export;
+        self.lut = state.lut;
+        self.display = state.display;
+        self.scan_for_print_restore = state.scan_for_print_restore;
+        self.raw_options = state.raw;
+        self.save_options = state.output;
+        if load_image {
+            if let Some(image) = state.image {
+                self.load_image_with_state(
+                    &image,
+                    state.rotation,
+                    Some((
+                        state.params.io.input_color_space.clone(),
+                        state.params.io.input_cctf_decoding,
+                    )),
+                    Some((state.zoom, egui::vec2(state.pan[0], state.pan[1]))),
+                );
+            }
+        }
+        self.params = state.params;
+        if self.params.settings.apply_stock_specifics {
+            let film = profile::load_profile_by_name(&self.data_dir, &state.film)?;
+            spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
+        }
+        self.film_name = state.film;
+        self.print_name = state.paper;
+        self.film_dev_times = profile_dev_times(&self.data_dir, &self.film_name);
+        self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
+        self.zoom = state.zoom;
+        self.pan = egui::vec2(state.pan[0], state.pan[1]);
+        self.pipeline_cache = None;
+        self.pipeline_cache_key = None;
+        self.dirty = true;
+        self.pending_dirty = self.render_job.is_some();
+        Ok(())
+    }
+    fn project_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Save project…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Project", &["json"])
+                    .set_file_name("spektrafilm.json")
+                    .save_file()
+                {
+                    self.status = match self.project_state().save(&path) {
+                        Ok(()) => format!("Saved project {}", path.display()),
+                        Err(e) => format!("Save project: {e:#}"),
+                    };
+                }
+            }
+            if ui.button("Open project…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Project", &["json"])
+                    .pick_file()
+                {
+                    self.status = match self.restore_project(&path, true) {
+                        Ok(()) => format!("Opened project {}", path.display()),
+                        Err(e) => format!("Open project: {e:#}"),
+                    };
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Save defaults").clicked() {
+                let mut state = self.project_state();
+                state.image = None;
+                self.status = match state.save(&project::default_path()) {
+                    Ok(()) => "Saved startup defaults".into(),
+                    Err(e) => format!("Save defaults: {e:#}"),
+                };
+            }
+            if ui.button("Factory defaults").clicked() {
+                let input_color = self.params.io.input_color_space.clone();
+                let input_encoded = self.params.io.input_cctf_decoding;
+                self.params = RuntimeParams::default();
+                if self.image.is_some() {
+                    self.params.io.input_color_space = input_color;
+                    self.params.io.input_cctf_decoding = input_encoded;
+                }
+                self.auto_preview = true;
+                self.params.settings.preview_max_size = 2048;
+                self.gpu_export = true;
+                self.lut = Default::default();
+                self.display = Default::default();
+                self.scan_for_print_restore = None;
+                if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name) {
+                    spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
+                }
+                self.raw_options = Default::default();
+                self.save_options = Default::default();
+                self.pipeline_cache = None;
+                self.pipeline_cache_key = None;
+                self.dirty = true;
+                self.pending_dirty = self.render_job.is_some();
+                match std::fs::remove_file(project::default_path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        self.status = format!("Reset defaults: {e}");
+                    }
+                }
+            }
+        });
+    }
+    fn parity_controls(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Color and processing").show(ui, |ui| {
+            let mut changed = false;
+            let spaces = [
+                "sRGB",
+                "ProPhoto RGB",
+                "ITU-R BT.2020",
+                "ITU-R BT.709",
+                "Adobe RGB (1998)",
+                "Display P3",
+                "DCI-P3",
+                "ACEScg",
+                "ACES2065-1",
+            ];
+            ui.label("Input primaries");
+            egui::ComboBox::from_id_salt("input_primaries")
+                .selected_text(&self.params.io.input_color_space)
+                .show_ui(ui, |ui| {
+                    for name in spaces {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.input_color_space,
+                                name.into(),
+                                name,
+                            )
+                            .changed();
+                    }
+                });
+            changed |= ui
+                .checkbox(
+                    &mut self.params.io.input_cctf_decoding,
+                    "Decode input transfer function",
+                )
+                .changed();
+            ui.label("Output primaries");
+            egui::ComboBox::from_id_salt("output_primaries")
+                .selected_text(&self.params.io.output_color_space)
+                .show_ui(ui, |ui| {
+                    for name in spaces {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.output_color_space,
+                                name.into(),
+                                name,
+                            )
+                            .changed();
+                    }
+                });
+            for (label, order) in [
+                ("Film dye order", &mut self.params.film_render.channel_order),
+                (
+                    "Print dye order",
+                    &mut self.params.print_render.channel_order,
+                ),
+            ] {
+                egui::ComboBox::from_id_salt(label)
+                    .selected_text(format!("{label}: {order:?}"))
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            [0, 1, 2],
+                            [0, 2, 1],
+                            [1, 0, 2],
+                            [1, 2, 0],
+                            [2, 0, 1],
+                            [2, 1, 0],
+                        ] {
+                            changed |= ui
+                                .selectable_value(order, value, format!("{value:?}"))
+                                .changed();
+                        }
+                    });
+            }
+            egui::ComboBox::from_id_salt("enlarger_illuminant")
+                .selected_text(&self.params.enlarger.illuminant)
+                .show_ui(ui, |ui| {
+                    for name in ["TH-KG3", "TH-KG3-L", "D50", "D55", "D65", "BB3200"] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.enlarger.illuminant,
+                                name.into(),
+                                name,
+                            )
+                            .changed();
+                    }
+                });
+            let automatic_before = self.params.settings.neutral_print_filters_from_database;
+            let neutral_changed = ui
+                .checkbox(
+                    &mut self.params.settings.neutral_print_filters_from_database,
+                    "Automatic neutral print filters",
+                )
+                .on_hover_text(
+                    "Use the calibrated preset for the selected film, paper and illuminant.",
+                )
+                .changed();
+            changed |= neutral_changed;
+            if neutral_changed && automatic_before {
+                let db = spektrafilm_core::neutral_filters::NeutralFilters::load(&self.data_dir);
+                if let Some([c, m, y]) = db.lookup(
+                    &self.print_name,
+                    &self.params.enlarger.illuminant,
+                    &self.film_name,
+                ) {
+                    self.params.enlarger.c_filter_neutral = c as f32;
+                    self.params.enlarger.m_filter_neutral = m as f32;
+                    self.params.enlarger.y_filter_neutral = y as f32;
+                }
+            }
+            if !self.params.settings.neutral_print_filters_from_database {
+                for (label, value) in [
+                    ("Neutral cyan", &mut self.params.enlarger.c_filter_neutral),
+                    (
+                        "Neutral magenta",
+                        &mut self.params.enlarger.m_filter_neutral,
+                    ),
+                    ("Neutral yellow", &mut self.params.enlarger.y_filter_neutral),
+                ] {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(value)
+                                .speed(0.1)
+                                .range(0.0..=200.0)
+                                .prefix(format!("{label}: ")),
+                        )
+                        .changed();
+                }
+            }
+            changed |= ui
+                .checkbox(
+                    &mut self.params.settings.use_enlarger_lut,
+                    "Enlarger spectral LUT",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.params.settings.use_scanner_lut,
+                    "Scanner spectral LUT",
+                )
+                .changed();
+            if self.params.settings.use_enlarger_lut || self.params.settings.use_scanner_lut {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.params.settings.lut_resolution, 3..=65)
+                            .text("Spectral LUT resolution"),
+                    )
+                    .changed();
+            }
+            changed |= ui
+                .add_enabled(
+                    self.params.film_render.grain.sublayers_active,
+                    egui::Checkbox::new(
+                        &mut self.params.settings.use_fast_stats,
+                        "Approximate physical-grain statistics",
+                    ),
+                )
+                .changed();
+            ui.label("Output gamut compression");
+            egui::ComboBox::from_id_salt("gamut_algorithm")
+                .selected_text(&self.params.io.output_gamut_compress.algorithm)
+                .show_ui(ui, |ui| {
+                    for name in ["off", "cam16ucs", "oklch", "oklrab", "jzazbz", "aces_rgc"] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.output_gamut_compress.algorithm,
+                                name.into(),
+                                name,
+                            )
+                            .changed();
+                    }
+                });
+            changed |= ui
+                .checkbox(
+                    &mut self.params.io.input_gamut_compress.active,
+                    "Input gamut compression",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.params.io.crop, "Crop before processing")
+                .changed();
+            if self.params.io.crop {
+                for c in 0..2 {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.params.io.crop_center[c], 0.0..=1.0).text(
+                                if c == 0 {
+                                    "Crop center X"
+                                } else {
+                                    "Crop center Y"
+                                },
+                            ),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.params.io.crop_size[c], 0.01..=1.0)
+                                .text(if c == 0 { "Crop width" } else { "Crop height" }),
+                        )
+                        .changed();
+                }
+            }
+            changed |= ui
+                .checkbox(
+                    &mut self.params.film_render.grain.sublayers_active,
+                    "Emulsion sublayer grain",
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.params.film_render.grain.blur_dye_clouds_um,
+                        0.0..=5.0,
+                    )
+                    .text("Dye cloud blur (µm)"),
+                )
+                .changed();
+            for i in 0..3 {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.params.film_render.grain.agx_particle_scale_layers[i],
+                            0.1..=5.0,
+                        )
+                        .text(format!("Layer {} particle scale", i + 1)),
+                    )
+                    .changed();
+            }
+            changed |= ui
+                .checkbox(
+                    &mut self.params.settings.apply_hanatos2025_adaptation_surface,
+                    "Sensitivity adaptation surface",
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.params.settings.spectral_gaussian_blur, 0.0..=10.0)
+                        .text("Spectral blur"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.params.camera.filter_uv[0], 0.0..=1.0)
+                        .text("UV filter amount"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.params.camera.filter_ir[0], 0.0..=1.0)
+                        .text("IR filter amount"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.params.settings.preview_mode,
+                    "Simplified preview mode",
+                )
+                .changed();
+            if changed {
+                self.dirty = true;
+            }
+        });
+        if ui
+            .add(
+                egui::Slider::new(&mut self.params.settings.preview_max_size, 128..=8192)
+                    .text("Preview long edge (px)")
+                    .step_by(128.),
+            )
+            .changed()
+        {
+            self.dirty = true;
+        }
+        ui.label("Preview size affects interactive rendering. Export uses the original image.");
+        egui::CollapsingHeader::new("RAW development").show(ui, |ui| {
+            egui::ComboBox::from_id_salt("raw_decoder")
+                .selected_text(&self.raw_options.decoder)
+                .show_ui(ui, |ui| {
+                    for name in ["auto", "libraw", "rawler"] {
+                        ui.selectable_value(&mut self.raw_options.decoder, name.into(), name);
+                    }
+                });
+            egui::ComboBox::from_id_salt("raw_white_balance")
+                .selected_text(&self.raw_options.white_balance)
+                .show_ui(ui, |ui| {
+                    for name in ["as_shot", "daylight", "tungsten", "custom"] {
+                        ui.selectable_value(&mut self.raw_options.white_balance, name.into(), name);
+                    }
+                });
+            if self.raw_options.white_balance == "custom" {
+                ui.add(
+                    egui::Slider::new(&mut self.raw_options.temperature, 2000.0..=15000.0)
+                        .text("Temperature (K)"),
+                );
+            }
+            ui.add(egui::Slider::new(&mut self.raw_options.tint, 0.1..=3.0).text("Tint"));
+            ui.checkbox(
+                &mut self.raw_options.lens_correction,
+                "Lens correction (Lensfun)",
+            );
+            if self.raw_options.lens_correction {
+                if let Some(path) = &self.raw_options.lens_database {
+                    ui.label(format!("Database override: {}", path.display()));
+                    if ui.button("Use automatic Lensfun database").clicked() {
+                        self.raw_options.lens_database = None;
+                    }
+                } else {
+                    ui.label("Database: automatic. Downloads once if no installed database is found.");
+                }
+                if ui.button("Choose Lensfun database…").on_hover_text("Optional override; no folder selection is needed for automatic setup.").clicked() {
+                    if let Some(path)=rfd::FileDialog::new().pick_folder() {
+                        self.raw_options.lens_database=Some(path);
+                    }
+                }
+            }
+            if ui.button("Reload RAW with these settings").clicked() {
+                if let Some(path) = self.image_path.clone() {
+                    let rotation = self.rotation;
+                    self.load_image_with_state(&path, rotation, None, None);
+                }
+            }
+        });
+        egui::CollapsingHeader::new("Display").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.image.is_some(),egui::Button::new("Rotate ↶")).clicked() { self.rotate_input(3); }
+                if ui.add_enabled(self.image.is_some(),egui::Button::new("Rotate ↷")).clicked() { self.rotate_input(1); }
+            });
+            if ui.checkbox(&mut self.display.display_transform,"Display color transform").changed() { self.dirty=true; }
+            ui.checkbox(&mut self.display.show_border,"White border layer");
+            ui.checkbox(&mut self.display.show_paper_back,"Paper-back layer");
+            ui.checkbox(&mut self.display.show_input,"Input layer");
+            if self.display.show_input { ui.add(egui::Slider::new(&mut self.display.input_opacity,0.0..=1.0).text("Input opacity")); }
+            ui.checkbox(&mut self.display.show_output,"Output layer");
+            if self.display.show_output { ui.add(egui::Slider::new(&mut self.display.output_opacity,0.0..=1.0).text("Output opacity")); }
+            ui.checkbox(&mut self.display.compare_split,"Compare input / output");
+            if self.display.compare_split { ui.add(egui::Slider::new(&mut self.display.split_position,0.0..=1.0).text("Comparison split")); }
+            ui.checkbox(&mut self.display.gray_18_canvas, "18% gray canvas");
+            ui.add(
+                egui::Slider::new(&mut self.display.white_padding, 0.0..=0.2).text("White border"),
+            );
+            ui.checkbox(&mut self.display.animate,"Paper development / crossfade");
+            if ui.add_enabled(self.canvas_output.is_some(),egui::Button::new("Replay paper development")).clicked() {
+                self.canvas_previous=None;self.animation=Some((Instant::now(),true));self.ctx.request_repaint();
+            }
+            egui::ComboBox::from_id_salt("canvas_interpolation").selected_text(&self.display.output_interpolation).show_ui(ui,|ui| {
+                for mode in view::INTERPOLATIONS {
+                    if ui.selectable_value(&mut self.display.output_interpolation,mode.into(),mode).changed() {
+                        if self.canvas.is_none() {self.dirty=true;}
+                    }
+                }
+            });
+            if self.canvas.is_none() {ui.label("Advanced sampling and animation use the wgpu canvas. Restart with SPEKTRAFILM_GUI_RENDERER=wgpu to enable them.");}
+        });
+        egui::CollapsingHeader::new("File export").show(ui, |ui| {
+            ui.checkbox(&mut self.gpu_export, "Use GPU for full-resolution export")
+                .on_hover_text(
+                    "GPU uses f32. Disable for an f64 CPU export using the bundled CLI.",
+                );
+            egui::ComboBox::from_id_salt("saving_color_space")
+                .selected_text(&self.save_options.color_space)
+                .show_ui(ui, |ui| {
+                    for name in [
+                        "sRGB",
+                        "Display P3",
+                        "ProPhoto RGB",
+                        "Adobe RGB (1998)",
+                        "ITU-R BT.2020",
+                        "ACES2065-1",
+                        "ACEScg",
+                    ] {
+                        ui.selectable_value(&mut self.save_options.color_space, name.into(), name);
+                    }
+                });
+            ui.checkbox(
+                &mut self.save_options.encoded,
+                "Encode saving transfer function",
+            );
+            egui::ComboBox::from_id_salt("export_depth")
+                .selected_text(format!("{} bit TIFF", self.save_options.bit_depth))
+                .show_ui(ui, |ui| {
+                    for depth in [8, 16, 32] {
+                        ui.selectable_value(
+                            &mut self.save_options.bit_depth,
+                            depth,
+                            format!("{depth} bit TIFF"),
+                        );
+                    }
+                });
+            ui.add(
+                egui::Slider::new(&mut self.save_options.jpeg_quality, 1..=100)
+                    .text("JPEG quality"),
+            );
+            ui.label("Float TIFF and EXR preserve values outside 0–1.");
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn verbose_child_does_not_block_export() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 10000 ]; do echo diagnostic-line >&2; i=$((i+1)); done");
+        run_cli(&mut cmd, &AtomicBool::new(false)).unwrap();
+    }
+    #[test]
+    fn cancelled_export_reaps_child() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let error = run_cli(&mut cmd, &AtomicBool::new(true)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod gpu_export_tests {
+    use super::*;
+    #[test]
+    fn gpu_export_uses_original_and_honors_working_scale_and_saving_color() {
+        let backend = spektrafilm_gpu::select_backend();
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let image = ImageBuf::from_data(
+            64,
+            32,
+            (0..64 * 32 * 3)
+                .map(|i| spektrafilm_math::precision::from_f64(0.04 + 0.4 * (i % 64) as f64 / 63.))
+                .collect(),
+        );
+        let mut params = RuntimeParams::default();
+        params.settings.preview_max_size = 16;
+        params.debug.deactivate_stochastic_effects = true;
+        let options = spektrafilm_io::SaveOptions {
+            color_space: "Display P3".into(),
+            ..Default::default()
+        };
+        let path =
+            std::env::temp_dir().join(format!("spektrafilm-gpu-export-{}.png", std::process::id()));
+        for (scale, dimensions) in [(1., (64, 32)), (0.5, (32, 16))] {
+            params.io.upscale_factor = scale;
+            run_gpu_export(
+                &image,
+                &path,
+                "kodak_gold_200",
+                "kodak_portra_endura",
+                &params,
+                &data,
+                backend.as_ref(),
+                &AtomicBool::new(false),
+                &options,
+                &Default::default(),
+            )
+            .unwrap();
+            let loaded = spektrafilm_io::load(&path, &Default::default()).unwrap();
+            assert_eq!((loaded.pixels.width, loaded.pixels.height), dimensions);
+            assert_eq!(loaded.color_space, "Display P3");
+            assert!(loaded.encoded);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

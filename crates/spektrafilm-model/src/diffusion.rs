@@ -66,12 +66,37 @@ pub fn apply_halation_um(
     halation_n_bounces: u32,
     halation_bounce_decay: f64,
     halation_renormalize: bool,
-    _backend: &dyn ComputeBackend,
+    backend: &dyn ComputeBackend,
 ) -> ImageBuf {
+    let average = |v: [f64; 3]| (v[0] + v[1] + v[2]) / 3.;
+    let core = scatter_core_um.map(|s| (s * scatter_spatial_scale / pixel_size_um as f64) as f32);
+    let tail = scatter_tail_um.map(|s| (s * scatter_spatial_scale / pixel_size_um as f64) as f32);
+    let sigma =
+        halation_first_sigma_um.map(|s| (s * halation_spatial_scale / pixel_size_um as f64) as f32);
+    let gpu = spektrafilm_gpu::HalationGpuParams {
+        scatter_amount: scatter_amount as f32,
+        scatter_core_px_rgb: core,
+        scatter_tail_px_rgb: tail,
+        scatter_core_px: (average(scatter_core_um) * scatter_spatial_scale / pixel_size_um as f64)
+            as f32,
+        scatter_tail_px: (average(scatter_tail_um) * scatter_spatial_scale / pixel_size_um as f64)
+            as f32,
+        scatter_tail_weight: scatter_tail_weight.map(|v| v as f32),
+        halation_amount: halation_amount as f32,
+        halation_strength_avg: (average(halation_strength) * halation_amount) as f32,
+        halation_a_tot: halation_strength.map(|v| (v * halation_amount) as f32),
+        halation_first_sigma_px: (average(halation_first_sigma_um) * halation_spatial_scale
+            / pixel_size_um as f64) as f32,
+        halation_first_sigma_px_rgb: sigma,
+        halation_n_bounces,
+        halation_bounce_decay: halation_bounce_decay as f32,
+        halation_renormalize,
+    };
+    if let Some(output) = backend.halation(raw, &gpu) {
+        return output;
+    }
     // Per-channel implementation matching Python's `apply_halation_um`.
-    // The `_backend` argument is retained for API compat with the GPU
-    // resident path; on the CPU export path we operate channel-by-
-    // channel using `gaussian_blur_channel` and
+    // The CPU export operates channel-by-channel using `gaussian_blur_channel` and
     // `exponential_filter_channel` so that:
     //   * scatter blur σ is per-channel (Python passes a length-3
     //     `sigma_c_px` array to `fast_gaussian_filter`).
@@ -668,73 +693,6 @@ pub fn boost_highlights(
     out
 }
 
-/// Downsample an image by an integer factor via box (area) averaging.
-fn downsample_area(img: &ImageBuf, d: usize) -> ImageBuf {
-    use rayon::prelude::*;
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let sw = w.div_ceil(d);
-    let sh = h.div_ceil(d);
-    let mut out = vec![ZERO; sw * sh * 3];
-    out.par_chunks_mut(sw * 3)
-        .enumerate()
-        .for_each(|(sy, row)| {
-            for sx in 0..sw {
-                let mut acc = [0.0f64; 3];
-                let mut cnt = 0.0f64;
-                for yy in (sy * d)..((sy + 1) * d).min(h) {
-                    for xx in (sx * d)..((sx + 1) * d).min(w) {
-                        let i = (yy * w + xx) * 3;
-                        acc[0] += img.data[i] as f64;
-                        acc[1] += img.data[i + 1] as f64;
-                        acc[2] += img.data[i + 2] as f64;
-                        cnt += 1.0;
-                    }
-                }
-                for c in 0..3 {
-                    row[sx * 3 + c] = from_f64(acc[c] / cnt);
-                }
-            }
-        });
-    ImageBuf::from_data(sw as u32, sh as u32, out)
-}
-
-/// Bilinear upsample a small interleaved-RGB f64 buffer to `out_w × out_h`,
-/// inverting the `downsample_area` block mapping (sample centre at
-/// `(x + 0.5)/d − 0.5` in small-pixel coords).
-fn upsample_bilinear(
-    small: &[f64],
-    sw: usize,
-    sh: usize,
-    out_w: usize,
-    out_h: usize,
-    d: usize,
-) -> Vec<f64> {
-    use rayon::prelude::*;
-    let sample = |sx: usize, sy: usize, c: usize| small[(sy * sw + sx) * 3 + c];
-    let mut out = vec![0.0f64; out_w * out_h * 3];
-    out.par_chunks_mut(out_w * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let fy = ((y as f64 + 0.5) / d as f64 - 0.5).clamp(0.0, (sh - 1) as f64);
-            let y0 = fy.floor() as usize;
-            let y1 = (y0 + 1).min(sh - 1);
-            let wy = fy - y0 as f64;
-            for x in 0..out_w {
-                let fx = ((x as f64 + 0.5) / d as f64 - 0.5).clamp(0.0, (sw - 1) as f64);
-                let x0 = fx.floor() as usize;
-                let x1 = (x0 + 1).min(sw - 1);
-                let wx = fx - x0 as f64;
-                for c in 0..3 {
-                    let top = sample(x0, y0, c) * (1.0 - wx) + sample(x1, y0, c) * wx;
-                    let bot = sample(x0, y1, c) * (1.0 - wx) + sample(x1, y1, c) * wx;
-                    row[x * 3 + c] = top * (1.0 - wy) + bot * wy;
-                }
-            }
-        });
-    out
-}
-
 /// Max working-resolution σ for the sum-of-Gaussians path; the downsample
 /// factor is `ceil(σ_max / SIGMA_CAP)` so every blur stays at or below it.
 const DIFFUSION_SIGMA_CAP: f64 = 32.0;
@@ -746,7 +704,7 @@ const DIFFUSION_EXP_FIT: [(f64, f64); 3] = [(0.1633, 0.5360), (0.6496, 1.5236), 
 /// Returns parallel vectors of (full-resolution σ in px, per-channel
 /// coefficient); each PSF sub-component exponential contributes 3 Gaussians.
 /// Shared by the CPU-blur and GPU-resident-plan paths.
-fn diffusion_components(
+fn diffusion_exponentials(
     cfg: &FamilyShape,
     df: &DiffusionFilter,
     pixel_size_um: f64,
@@ -763,10 +721,8 @@ fn diffusion_components(
     let mut coeffs: Vec<[f64; 3]> = Vec::new();
     let mut push = |lambda: f64, cc: [f64; 3]| {
         let lpx = to_px(lambda);
-        for (amp, ratio) in DIFFUSION_EXP_FIT {
-            sigmas.push(ratio * lpx);
-            coeffs.push([cc[0] * amp, cc[1] * amp, cc[2] * amp]);
-        }
+        sigmas.push(lpx);
+        coeffs.push(cc);
     };
     for (k, &lam) in core_l.iter().enumerate() {
         let c = cfg.w_c * core_w[k];
@@ -787,6 +743,23 @@ fn diffusion_components(
         );
     }
     (sigmas, coeffs)
+}
+
+fn diffusion_components(
+    cfg: &FamilyShape,
+    df: &DiffusionFilter,
+    pixel_size_um: f64,
+) -> (Vec<f64>, Vec<[f64; 3]>) {
+    let (lambdas, weights) = diffusion_exponentials(cfg, df, pixel_size_um);
+    let mut sigmas = Vec::new();
+    let mut coefficients = Vec::new();
+    for (lambda, weight) in lambdas.into_iter().zip(weights) {
+        for (amplitude, ratio) in DIFFUSION_EXP_FIT {
+            sigmas.push(lambda * ratio);
+            coefficients.push(weight.map(|v| v * amplitude));
+        }
+    }
+    (sigmas, coefficients)
 }
 
 /// Build the GPU-resident diffusion plan (downsample factor, working dims,
@@ -813,7 +786,26 @@ pub fn diffusion_gpu_plan(
     let sigma_max = sigmas_full.iter().cloned().fold(0.0f64, f64::max);
     let d = ((sigma_max / DIFFUSION_SIGMA_CAP).ceil() as usize).max(1);
 
+    let bloom_max_px = bloom_max_lambda_um(&cfg) * df.spatial_scale / pixel_size_um;
+    let radius = ((8. * bloom_max_px).max(5.).ceil() as usize)
+        .min((height.min(width) as usize / 2).saturating_sub(1).max(1));
+    let psf_side = 2 * radius + 1;
+    let (lambdas, weights) = diffusion_exponentials(&cfg, df, pixel_size_um);
+    let radial_psf = lambdas
+        .into_iter()
+        .zip(weights)
+        .map(|(lambda, weight)| {
+            [
+                lambda as f32,
+                weight[0] as f32,
+                weight[1] as f32,
+                weight[2] as f32,
+            ]
+        })
+        .collect();
     Some(spektrafilm_gpu::DiffusionGpuPlan {
+        psf_side: psf_side as u32,
+        radial_psf,
         d: d as u32,
         small_w: (width as usize).div_ceil(d) as u32,
         small_h: (height as usize).div_ceil(d) as u32,
@@ -826,80 +818,18 @@ pub fn diffusion_gpu_plan(
     })
 }
 
-/// GPU-friendly diffusion filter via sum-of-Gaussians, computed at a
-/// downsampled working resolution so the blur kernels stay small.
-///
-/// Each PSF sub-component exponential is approximated by the same
-/// 3-Gaussian fit `exponential_filter_channel` uses, making the per-channel
-/// kernel a weighted sum of Gaussian blurs. Because the halo/bloom are
-/// low-frequency, the whole scattered field `K_s * img` is computed on an
-/// image downsampled by `d = ceil(σ_max / 32)` (so every blur σ ≤ ~32 px →
-/// bounded FIR kernels and tiny buffers), then bilinearly upsampled and
-/// mixed `(1−p_s)·img + p_s·upsample(K_s*img_small)`. Visually matches the
-/// exact-FFT CPU path for the dominant glow; the only loss is a slight
-/// softening of the (small-weight) sharp core inside the scattered
-/// fraction when `d > 1`. Used for the live GPU preview; CPU export keeps
-/// the exact FFT path.
+/// Apply the exact PSF on a supporting GPU backend. Unsupported adapters use
+/// the same CPU FFT reference rather than silently substituting a different PSF.
 pub fn apply_diffusion_filter_blur(
     image: &ImageBuf,
     df: &DiffusionFilter,
     pixel_size_um: f64,
     backend: &dyn ComputeBackend,
 ) -> ImageBuf {
-    use rayon::prelude::*;
-    if df.strength <= 0.0 || df.spatial_scale <= 0.0 {
-        return image.clone();
+    if let Some(plan) = diffusion_gpu_plan(df, pixel_size_um, image.width, image.height) {
+        if let Some(output) = backend.diffusion_filter(image, &plan) {
+            return output;
+        }
     }
-    let Some(base) = family_shape(df.family) else {
-        return image.clone();
-    };
-    let p_s = strength_to_scatter(df.strength, base.total_gain);
-    if p_s <= 0.0 {
-        return image.clone();
-    }
-    let cfg = resolve_family_cfg(base, df);
-    let (sigmas_full, coeffs) = diffusion_components(&cfg, df, pixel_size_um);
-
-    // Downsample factor so the largest σ at working resolution ≤ the cap.
-    let sigma_max = sigmas_full.iter().cloned().fold(0.0f64, f64::max);
-    let d = ((sigma_max / DIFFUSION_SIGMA_CAP).ceil() as usize).max(1);
-
-    let work = if d > 1 {
-        downsample_area(image, d)
-    } else {
-        image.clone()
-    };
-    let sigmas_work: Vec<f32> = sigmas_full.iter().map(|&s| (s / d as f64) as f32).collect();
-    let blurs = backend.gaussian_blur_multi(&work, &sigmas_work);
-
-    // Accumulate the scattered field at working resolution.
-    let nwork = work.data.len();
-    let mut acc = vec![0.0f64; nwork];
-    for (blur, cf) in blurs.iter().zip(coeffs.iter()) {
-        acc.par_chunks_mut(3)
-            .zip(blur.data.par_chunks(3))
-            .for_each(|(a, b)| {
-                a[0] += cf[0] * (b[0] as f64);
-                a[1] += cf[1] * (b[1] as f64);
-                a[2] += cf[2] * (b[2] as f64);
-            });
-    }
-
-    let w = image.width as usize;
-    let h = image.height as usize;
-    let scattered = if d > 1 {
-        upsample_bilinear(&acc, work.width as usize, work.height as usize, w, h, d)
-    } else {
-        acc
-    };
-
-    let mut out = image.clone();
-    out.data
-        .par_iter_mut()
-        .zip(image.data.par_iter())
-        .zip(scattered.par_iter())
-        .for_each(|((o, &orig), &s)| {
-            *o = from_f64((1.0 - p_s) * (orig as f64) + p_s * s);
-        });
-    out
+    apply_diffusion_filter_um(image, df, pixel_size_um)
 }

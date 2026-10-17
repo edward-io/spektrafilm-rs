@@ -1,0 +1,7 @@
+Lensfun 0.3.4
+Copyright (C) 2007-2023 Andrew Zabolotny and Lensfun contributors.
+Library: GNU LGPL 3.0.
+https://github.com/lensfun/lensfun/releases/tag/v0.3.4
+Source is included in crates/spektrafilm-io/vendor/lensfun-0.3.4.
+
+The default build links Lensfun and available static GLib dependencies into the executable. GLib is LGPL-2.1-or-later; gettext/libintl is LGPL-2.1-or-later; PCRE2 is BSD-3-Clause. The dependency versions and build paths come from pkg-config. Their source and licenses are provided by the corresponding development packages (https://gitlab.gnome.org/GNOME/glib, https://www.gnu.org/software/gettext/, https://github.com/PCRE2Project/pcre2). The local executable is rebuilt and relinked through Cargo; these are build-time dependencies, not runtime Lensfun installation requirements.

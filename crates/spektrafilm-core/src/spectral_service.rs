@@ -387,3 +387,101 @@ fn eval_erf4_bandpass(params: &[f64]) -> Vec<[f64; 3]> {
 fn erf(x: f64) -> f64 {
     libm::erf(x)
 }
+
+impl SpectraLut {
+    /// scipy.ndimage.gaussian_filter on the wavelength axis (float32 output,
+    /// radius round(4*sigma), half-sample symmetric boundary).
+    pub fn blur_wavelengths(&mut self, sigma: f64) {
+        if sigma <= 0. {
+            return;
+        }
+        let radius = (4. * sigma + 0.5) as isize;
+        let mut kernel: Vec<f64> = (-radius..=radius)
+            .map(|i| (-0.5 * (i as f64 / sigma).powi(2)).exp())
+            .collect();
+        let total: f64 = kernel.iter().sum();
+        for v in &mut kernel {
+            *v /= total;
+        }
+        let n = self.n_wavelengths;
+        for row in self.data.chunks_exact_mut(n) {
+            let input = row.to_vec();
+            for k in 0..n {
+                row[k] = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| {
+                        let mut j = (k as isize + i as isize - radius).rem_euclid(2 * n as isize);
+                        if j >= n as isize {
+                            j = 2 * n as isize - 1 - j;
+                        }
+                        *w * input[j as usize] as f64
+                    })
+                    .sum::<f64>() as f32;
+            }
+        }
+    }
+}
+
+pub fn apply_camera_bandpass(sens: &mut [[f64; 3]], illu: &[f64], uv: [f32; 3], ir: [f32; 3]) {
+    if uv[0] <= 0. && ir[0] <= 0. {
+        return;
+    }
+    let filter: Vec<f64> = (0..sens.len())
+        .map(|i| {
+            let wl = 380. + 5. * i as f64;
+            let edge = |p: [f32; 3], sign: f64| {
+                let a = (p[0] as f64).clamp(0., 1.);
+                1. - a + a * 0.5 * (1. + libm::erf((wl - p[1] as f64) / (sign * p[2] as f64)))
+            };
+            edge(uv, 1.) * edge(ir, -1.)
+        })
+        .collect();
+    for c in 0..3 {
+        let num: f64 = sens
+            .iter()
+            .enumerate()
+            .map(|(i, s)| s[c] * filter[i] * illu[i])
+            .sum();
+        let den: f64 = sens.iter().enumerate().map(|(i, s)| s[c] * illu[i]).sum();
+        for (i, s) in sens.iter_mut().enumerate() {
+            s[c] *= filter[i] / (num / den);
+        }
+    }
+}
+
+pub fn apply_surface(lut: &mut TcLut, params: &[Vec<f64>], illu: &[f32]) {
+    if params.len() != 3 || params.iter().any(|p| p.len() != 15) {
+        return;
+    }
+    let xy = spektrafilm_math::spectral::illuminant_to_xy(illu);
+    let center = spektrafilm_math::spectral::xy_to_tc(xy.0, xy.1);
+    for i in 0..lut.size {
+        for j in 0..lut.size {
+            let x = i as f64 / (lut.size - 1) as f64 - center.0;
+            let y = j as f64 / (lut.size - 1) as f64 - center.1;
+            let terms = [
+                0.,
+                x,
+                y,
+                x * x,
+                y * y,
+                x * y,
+                x * x * x,
+                y * y * y,
+                x * x * y,
+                x * y * y,
+                x.powi(4),
+                y.powi(4),
+                x.powi(3) * y,
+                x * x * y * y,
+                x * y.powi(3),
+            ];
+            for c in 0..3 {
+                let raw: f64 = params[c].iter().zip(terms).map(|(p, t)| p * t).sum();
+                let surface = raw / (1. + (raw / 2.).powi(2)).sqrt();
+                lut.data[(i * lut.size + j) * 3 + c] *= 2f64.powf(surface);
+            }
+        }
+    }
+}

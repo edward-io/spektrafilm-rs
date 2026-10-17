@@ -1,0 +1,34 @@
+[package]
+name = "spektrafilm-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[features]
+default = ["bundled-lensfun"]
+bundled-lensfun = []
+precision-f64 = ["spektrafilm-math/precision-f64"]
+[dependencies]
+spektrafilm-math.workspace = true
+serde.workspace = true
+rayon.workspace = true
+image.workspace = true
+exr.workspace = true
+tiff = "0.10"
+rawler.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+little_exif = "=0.6.23"
+crc32fast = "1"
+libloading = "0.8"
+quick-xml = "0.37.5"
+ureq = "3.3"
+bzip2 = "0.6"
+tar = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

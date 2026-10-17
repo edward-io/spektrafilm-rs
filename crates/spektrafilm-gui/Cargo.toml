@@ -10,12 +10,15 @@ path = "src/main.rs"
 
 [features]
 precision-f64 = [
+    "spektrafilm-io/precision-f64",
     "spektrafilm-math/precision-f64",
     "spektrafilm-core/precision-f64",
     "spektrafilm-gpu/precision-f64",
 ]
 
 [dependencies]
+spektrafilm-io.workspace = true
+serde.workspace = true
 spektrafilm-core.workspace = true
 spektrafilm-gpu.workspace = true
 spektrafilm-math.workspace = true
@@ -28,9 +31,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.15"
 rayon.workspace = true
-imagepipe = "0.5"
-rawloader = "0.37"
-rawler = "0.7"
+bytemuck = { version = "1.25", features = ["derive"] }
 raw-window-handle = "0.6"
 
 # macOS-only: tag the CAMetalLayer's colorspace as sRGB so the OS
@@ -41,3 +42,6 @@ raw-window-handle = "0.6"
 objc2 = "0.5"
 core-graphics = "0.24"
 foreign-types = "0.5"
+
+[dev-dependencies]
+pollster = "0.4"

@@ -33,4 +33,5 @@ blas-src = { version = "0.10", features = ["openblas"] }
 openblas-src = "0.10"
 
 [dev-dependencies]
+serde_json.workspace = true
 tracing-subscriber = { workspace = true }

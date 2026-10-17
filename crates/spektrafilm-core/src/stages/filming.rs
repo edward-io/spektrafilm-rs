@@ -4,9 +4,8 @@
 /// 2D LUT lookup (spectra × sensitivity) → per-channel film raw exposure.
 use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
-use spektrafilm_math::colorspace;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{from_f32, from_f64, to_f32};
+use spektrafilm_math::precision::{from_f32, from_f64};
 use spektrafilm_math::spectral::{self, TcLut};
 use std::time::Instant;
 
@@ -32,7 +31,7 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
 /// (`spektrafilm/utils/autoexposure.py`).
 ///
 /// Python downsamples the image to ≤ 256 px on the long edge using
-/// `skimage.transform.rescale(order=0)` (nearest neighbour) before
+/// `skimage.transform.rescale(order=0)` (anti-alias, then nearest neighbor) before
 /// measuring (`small_preview`), then meters luminance Y with one of
 /// several patterns. We mirror that — the downsample is what makes the
 /// metered mean Python-parity-compatible; measuring on the full-res
@@ -44,66 +43,50 @@ pub fn pixel_size_um(film_format_mm: f32, width: u32, height: u32) -> f32 {
 /// `highlight_weighted`. Anything else meters a flat 1.0 (0 EV), matching
 /// the Python `else` branch.
 pub fn measure_autoexposure_ev(image: &ImageBuf, rgb_to_xyz: &[[f32; 3]; 3], method: &str) -> f32 {
-    const MAX_SIZE: usize = 256;
-    let w = image.width as usize;
-    let h = image.height as usize;
-    let max_dim = w.max(h);
-    // skimage.rescale(scale, order=0) with scale = MAX/max_dim:
-    // output shape = round(orig * scale); each output pixel takes the
-    // nearest source via iy = round((oy + 0.5) / scale - 0.5)
-    // (scipy.ndimage.zoom convention).
-    let (sw, sh, ix, iy) = if max_dim > MAX_SIZE {
-        let scale = (MAX_SIZE as f64) / (max_dim as f64);
-        let sw = ((w as f64) * scale).round() as usize;
-        let sh = ((h as f64) * scale).round() as usize;
-        // skimage rounds each axis independently, so the effective per-axis
-        // scale is src_dim/out_dim — which differs from the global `scale` on
-        // the short edge (e.g. 200/171 vs 300/256). Sample at the pixel centre
-        // (skimage `warp` convention): src = round((o + 0.5)·src/out − 0.5).
-        let map = |out_dim: usize, src_dim: usize| -> Vec<usize> {
-            let axis_scale = src_dim as f64 / out_dim as f64;
-            (0..out_dim)
-                .map(|o| {
-                    let f = ((o as f64 + 0.5) * axis_scale - 0.5).round() as isize;
-                    f.clamp(0, src_dim as isize - 1) as usize
-                })
-                .collect()
-        };
-        (sw, sh, map(sw, w), map(sh, h))
-    } else {
-        let ix: Vec<usize> = (0..w).collect();
-        let iy: Vec<usize> = (0..h).collect();
-        (w, h, ix, iy)
-    };
+    measure_autoexposure_ev_with_transfer(image, rgb_to_xyz, method, None)
+}
 
-    // Downsampled luminance grid (row-major, sw × sh).
-    let (ix, iy) = (&ix, &iy);
-    let lum: Vec<f64> = (0..sh)
-        .into_par_iter()
-        .flat_map_iter(|y| {
-            let row_off = iy[y] * w * 3;
-            (0..sw).map(move |x| {
-                let idx = row_off + ix[x] * 3;
-                (rgb_to_xyz[1][0] * to_f32(image.data[idx])
-                    + rgb_to_xyz[1][1] * to_f32(image.data[idx + 1])
-                    + rgb_to_xyz[1][2] * to_f32(image.data[idx + 2])) as f64
-            })
+/// Meter after the reference's encoded-space thumbnail, then decode only its
+/// pixels. Decoding a full image before anti-aliasing changes the exposure.
+pub fn measure_autoexposure_ev_with_transfer(
+    image: &ImageBuf,
+    rgb_to_xyz: &[[f32; 3]; 3],
+    method: &str,
+    transfer: Option<spektrafilm_math::transfer::Transfer>,
+) -> f32 {
+    let small;
+    let image = if image.width.max(image.height) > 256 {
+        small = crate::resize::metering_preview(image, 256);
+        &small
+    } else {
+        image
+    };
+    let (sw, sh) = (image.width as usize, image.height as usize);
+    let lum: Vec<f64> = image
+        .data
+        .par_chunks_exact(3)
+        .map(|p| {
+            (0..3)
+                .map(|c| {
+                    let v = p[c] as f64;
+                    rgb_to_xyz[1][c] as f64 * transfer.map_or(v, |t| t.decode(v))
+                })
+                .sum()
         })
         .collect();
-
     let metered = meter_luminance(&lum, sw, sh, method);
-    let exposure = (metered / 0.184) as f32;
-    if exposure <= 0.0 || exposure.is_infinite() {
-        return 0.0;
+    let exposure = metered / 0.184;
+    if exposure <= 0. || exposure.is_infinite() {
+        return 0.;
     }
-    let ev = -exposure.log2();
+    let ev = (-exposure.log2()) as f32;
     tracing::info!(
-        sw = sw,
-        sh = sh,
-        method = method,
-        metered = metered,
+        sw,
+        sh,
+        method,
+        metered,
         exposure_div_184 = exposure,
-        ev = ev,
+        ev,
         "autoexposure"
     );
     ev
@@ -422,7 +405,6 @@ pub fn develop(
     // f32 versions kept for DIR couplers (still f32 API) and grain (legacy).
     let log_exposure = &film.log_exposure_f32();
     let density_curves = &film.density_curves_f32();
-    let norm_curves = spektrafilm_model::density_curves::normalize_density_curves(density_curves);
     let gamma = params.film_render.density_curve_gamma;
 
     // Filming.develop uses NORMALIZED curves (Python `develop` subtracts nanmin).
@@ -475,19 +457,44 @@ pub fn develop(
             &film.density_curves_f64(),
         );
         let density_max = spektrafilm_model::density_curves::max_density_f64(&norm_curves_f64);
-        density_cmy = spektrafilm_model::grain::apply_grain_to_density(
-            &density_cmy,
-            pix_um,
-            grain.agx_particle_area_um2,
-            grain.agx_particle_scale,
-            grain.density_min,
-            density_max,
-            grain.uniformity,
-            grain.blur,
-            grain.n_sub_layers,
-            grain.monochrome,
-            backend,
-        );
+        density_cmy = if grain.sublayers_active
+            && film.data.density_curves_layers.len() == norm_curves_f64.len()
+        {
+            spektrafilm_model::grain::apply_grain_to_density_layers(
+                &density_cmy,
+                pix_um,
+                &norm_curves_f64,
+                &film.data.density_curves_layers,
+                film.is_positive(),
+                &spektrafilm_model::grain::LayeredGrainParams {
+                    particle_area: grain.agx_particle_area_um2,
+                    channel_scale: grain.agx_particle_scale,
+                    layer_scale: grain.agx_particle_scale_layers,
+                    density_min: grain.density_min,
+                    uniformity: grain.uniformity,
+                    blur: grain.blur,
+                    dye_cloud_blur: grain.blur_dye_clouds_um,
+                    micro_structure: grain.micro_structure,
+                    monochrome: grain.monochrome,
+                    fast_stats: params.settings.use_fast_stats,
+                },
+                backend,
+            )
+        } else {
+            spektrafilm_model::grain::apply_grain_to_density(
+                &density_cmy,
+                pix_um,
+                grain.agx_particle_area_um2,
+                grain.agx_particle_scale,
+                grain.density_min,
+                density_max,
+                grain.uniformity,
+                grain.blur,
+                grain.n_sub_layers,
+                grain.monochrome,
+                backend,
+            )
+        };
         print_stage_timing(stage_timings, "filming_develop.grain", t);
     }
 
@@ -503,27 +510,25 @@ pub fn process(
     tc_lut: Option<&TcLut>,
 ) -> ImageBuf {
     let ref_illuminant = select_illuminant(&film.info.reference_illuminant);
-    let log_raw = expose(image, film, params, backend, tc_lut, None, ref_illuminant, 1.0);
+    let log_raw = expose(
+        image,
+        film,
+        params,
+        backend,
+        tc_lut,
+        None,
+        ref_illuminant,
+        1.0,
+    );
     develop(&log_raw, film, params, backend)
 }
 
 pub fn input_colorspace_to_xyz(name: &str) -> [[f32; 3]; 3] {
-    match name {
-        "sRGB" => colorspace::SRGB_TO_XYZ,
-        "ProPhoto RGB" => colorspace::PROPHOTO_TO_XYZ,
-        "Rec. 2020" | "Rec2020" | "ITU-R BT.2020" => colorspace::REC2020_TO_XYZ,
-        "ACES2065-1" => colorspace::ACES_TO_XYZ,
-        _ => colorspace::PROPHOTO_TO_XYZ,
-    }
+    spectral::colorspace_to_xyz(name)
 }
 
 pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {
-    match name {
-        "D50" => &spectral::ILLUMINANT_D50,
-        "D55" => &spectral::ILLUMINANT_D55,
-        "D65" => &spectral::ILLUMINANT_D65,
-        _ => &spectral::ILLUMINANT_D55,
-    }
+    spektrafilm_math::illuminants::get_f32(name).expect("validated illuminant")
 }
 
 #[cfg(test)]

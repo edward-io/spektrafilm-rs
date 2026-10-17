@@ -1,11 +1,11 @@
 // Stochastic grain generation.
 // Poisson-binomial particle model with dye cloud blur and lognormal micro-structure.
 
+use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::gaussian;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::{Scalar, ZERO, from_f64};
-use rayon::prelude::*;
 use std::time::Instant;
 
 fn stage_timings_enabled() -> bool {
@@ -78,11 +78,11 @@ pub fn layer_particle_model(
         *slot = from_f64((developed as f64) * od_particle * sat_arr[i]);
     }
 
-    if blur_particle > 0.4 {
+    if blur_particle > 0.0 {
         // Match Python: `sigma = blur_particle * np.sqrt(od_particle)`
         // — keep the multiplication in f64 and narrow at the end.
         let sigma = (blur_particle as f64 * od_particle.sqrt()) as f32;
-        if sigma > 0.1 {
+        if sigma > 0.0 {
             let mut img = ImageBuf::from_data(
                 width,
                 height,
@@ -94,6 +94,245 @@ pub fn layer_particle_model(
     }
 
     grain
+}
+
+/// Three physical emulsion layers per dye channel (Python's default grain model).
+pub struct LayeredGrainParams {
+    pub particle_area: f64,
+    pub channel_scale: [f64; 3],
+    pub layer_scale: [f64; 3],
+    pub density_min: [f64; 3],
+    pub uniformity: [f64; 3],
+    pub blur: f32,
+    pub dye_cloud_blur: f32,
+    pub micro_structure: [f32; 2],
+    pub monochrome: bool,
+    pub fast_stats: bool,
+}
+
+pub fn layered_gpu_params(
+    pixel_size_um: f32,
+    curves: &[[f64; 3]],
+    layers: &[Vec<Vec<f64>>],
+    positive: bool,
+    p: &LayeredGrainParams,
+) -> spektrafilm_gpu::LayeredGrainGpuParams {
+    let maxima: [[f64; 3]; 3] = std::array::from_fn(|sl| {
+        std::array::from_fn(|ch| {
+            layers
+                .iter()
+                .map(|r| r[sl][ch])
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+    });
+    let total: [f64; 3] = std::array::from_fn(|ch| maxima.iter().map(|r| r[ch]).sum());
+    let layer_params = std::array::from_fn(|sl| {
+        let fraction: [f64; 3] = std::array::from_fn(|ch| {
+            if total[ch] > 0. && maxima[sl][ch].is_finite() {
+                maxima[sl][ch] / total[ch]
+            } else {
+                0.
+            }
+        });
+        let min: [f32; 3] = std::array::from_fn(|ch| (fraction[ch] * p.density_min[ch]) as f32);
+        let max: [f32; 3] = std::array::from_fn(|ch| (maxima[sl][ch] + min[ch] as f64) as f32);
+        let particles: [f32; 3] = std::array::from_fn(|ch| {
+            ((pixel_size_um as f64).powi(2) * fraction[ch]
+                / (p.particle_area * p.channel_scale[ch] * p.layer_scale[sl])) as f32
+        });
+        let cloud_sigma = std::array::from_fn(|ch| {
+            if particles[ch] > 0. {
+                p.dye_cloud_blur * (max[ch] / particles[ch]).sqrt()
+            } else {
+                0.
+            }
+        });
+        spektrafilm_gpu::LayerParticleGpuParams {
+            density_min: min,
+            density_max: max,
+            particles,
+            cloud_sigma,
+        }
+    });
+    let mut table = Vec::with_capacity(curves.len() * 3);
+    for (i, row) in curves.iter().enumerate() {
+        for ch in 0..3 {
+            table.push([
+                if positive { -row[ch] } else { row[ch] } as f32,
+                layers[i][0][ch] as f32,
+                layers[i][1][ch] as f32,
+                layers[i][2][ch] as f32,
+            ]);
+        }
+    }
+    spektrafilm_gpu::LayeredGrainGpuParams {
+        curves: table,
+        layers: layer_params,
+        uniformity: p.uniformity.map(|v| v as f32),
+        density_min: p.density_min.map(|v| v as f32),
+        blur: p.blur,
+        micro_sigma: p.micro_structure[1] * 0.001 / pixel_size_um,
+        micro_blur: p.micro_structure[0] / pixel_size_um,
+        fast_stats: p.fast_stats,
+        positive,
+        monochrome: p.monochrome,
+    }
+}
+
+pub fn apply_grain_to_density_layers(
+    density: &ImageBuf,
+    pixel_size_um: f32,
+    curves: &[[f64; 3]],
+    layers: &[Vec<Vec<f64>>],
+    positive: bool,
+    p: &LayeredGrainParams,
+    backend: &dyn ComputeBackend,
+) -> ImageBuf {
+    if backend.supports_layered_grain() {
+        if let Some(out) = backend.layered_grain(
+            density,
+            &layered_gpu_params(pixel_size_um, curves, layers, positive, p),
+        ) {
+            return out;
+        }
+    }
+    use spektrafilm_math::numpy_rng::{GaussRng, rk_binomial, rk_poisson};
+    let mut out = ImageBuf::new(density.width, density.height);
+    let area = (pixel_size_um as f64).powi(2);
+    let channels: Vec<Vec<Scalar>> = (0..3)
+        .into_par_iter()
+        .map(|ch| {
+            let axis: Vec<f64> = curves
+                .iter()
+                .map(|r| if positive { -r[ch] } else { r[ch] })
+                .collect();
+            let maxima: [f64; 3] = std::array::from_fn(|l| {
+                layers
+                    .iter()
+                    .map(|r| r[l][ch])
+                    .fold(f64::NEG_INFINITY, f64::max)
+            });
+            let total: f64 = maxima.iter().sum();
+            let mut sum = vec![ZERO; density.pixel_count()];
+            for sl in 0..3 {
+                let fraction = maxima[sl] / total;
+                let dmin = fraction * p.density_min[ch];
+                let dmax = maxima[sl] + dmin;
+                if fraction <= 0. || !fraction.is_finite() {
+                    continue;
+                }
+                let npp =
+                    area * fraction / (p.particle_area * p.channel_scale[ch] * p.layer_scale[sl]);
+                let od = dmax / npp;
+                let ys: Vec<f64> = layers.iter().map(|r| r[sl][ch]).collect();
+                let mut rng =
+                    GaussRng::new(if p.monochrome { 0 } else { ch as u32 } + sl as u32 * 10);
+                let mut probabilities = Vec::with_capacity(sum.len());
+                let mut saturations = Vec::with_capacity(sum.len());
+                for px in density.pixels() {
+                    let q = if positive {
+                        -(px[ch] as f64)
+                    } else {
+                        px[ch] as f64
+                    };
+                    // np.interp's right-biased exact matches, including plateaus.
+                    let upper = axis.partition_point(|v| *v <= q);
+                    let v = if q < axis[0] {
+                        ys[0]
+                    } else if upper >= axis.len() {
+                        ys[ys.len() - 1]
+                    } else {
+                        let lo = upper - 1;
+                        ys[lo] + (q - axis[lo]) / (axis[upper] - axis[lo]) * (ys[upper] - ys[lo])
+                    };
+                    let prob = ((v + dmin) / dmax).clamp(1e-6, 1. - 1e-6);
+                    probabilities.push(prob);
+                    saturations.push(1. - prob * p.uniformity[ch] * (1. - 1e-6));
+                }
+                let seeds: Vec<u64> = saturations
+                    .iter()
+                    .map(|sat| {
+                        let lam = npp / sat;
+                        if p.fast_stats && lam >= 30. {
+                            (lam + lam.sqrt() * rng.gauss()).round_ties_even().max(0.) as u64
+                        } else {
+                            rk_poisson(&mut rng.rng, lam)
+                        }
+                    })
+                    .collect();
+                let mut sampled: Vec<Scalar> = seeds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| {
+                        let prob = probabilities[i];
+                        let mean = n as f64 * prob;
+                        let var = mean * (1. - prob);
+                        let count = if p.fast_stats && var > 10. {
+                            (mean + var.sqrt() * rng.gauss())
+                                .round_ties_even()
+                                .clamp(0., n as f64) as u64
+                        } else {
+                            rk_binomial(&mut rng.rng, n, prob)
+                        };
+                        from_f64(count as f64 * od * saturations[i])
+                    })
+                    .collect();
+                if p.dye_cloud_blur > 0. {
+                    sampled = gaussian::gaussian_blur_channel(
+                        &sampled,
+                        density.width,
+                        density.height,
+                        (p.dye_cloud_blur as f64 * od.sqrt()) as f32,
+                    );
+                }
+                for (a, b) in sum.iter_mut().zip(sampled) {
+                    *a += b;
+                }
+            }
+            sum
+        })
+        .collect();
+    for (ch, values) in channels.iter().enumerate() {
+        out.write_channel(ch, values);
+    }
+    // Clumping is stochastic in the Python numba path as well. Give this
+    // independent field a stable seed for reproducible exports.
+    let sigma = p.micro_structure[1] as f64 * 0.001 / pixel_size_um as f64;
+    if sigma > 0.05 {
+        let variance = (1. + sigma * sigma).ln();
+        let mut rng = GaussRng::new(777);
+        let field_data = if p.monochrome {
+            // The native monochrome mode represents one emulsion. Broadcast
+            // one clumping draw per pixel across its RGB storage channels.
+            (0..out.pixel_count())
+                .flat_map(|_| {
+                    let value = from_f64((-variance / 2. + variance.sqrt() * rng.gauss()).exp());
+                    [value; 3]
+                })
+                .collect()
+        } else {
+            (0..out.data.len())
+                .map(|_| from_f64((-variance / 2. + variance.sqrt() * rng.gauss()).exp()))
+                .collect()
+        };
+        let mut field = ImageBuf::from_data(density.width, density.height, field_data);
+        let blur = p.micro_structure[0] / pixel_size_um;
+        if blur > 0.4 {
+            field = gaussian::gaussian_blur(&field, blur);
+        }
+        for (v, f) in out.data.iter_mut().zip(field.data) {
+            *v *= f;
+        }
+    }
+    for px in out.data.chunks_exact_mut(3) {
+        for c in 0..3 {
+            px[c] -= from_f64(p.density_min[c]);
+        }
+    }
+    if p.blur > 0. {
+        out = gaussian::gaussian_blur(&out, p.blur);
+    }
+    out
 }
 
 /// Apply grain to a CMY density image.
@@ -136,8 +375,7 @@ pub fn apply_grain_to_density(
             // Add density_min to input (kept in Scalar precision)
             let dmin_s = from_f64(density_min[ch]);
             let t = Instant::now();
-            let density_ch: Vec<Scalar> =
-                density_cmy.pixels().map(|px| px[ch] + dmin_s).collect();
+            let density_ch: Vec<Scalar> = density_cmy.pixels().map(|px| px[ch] + dmin_s).collect();
             print_stage_timing(stage_timings, "grain.extract_channel", t);
 
             let mut grain_sum = vec![ZERO; density_ch.len()];
@@ -145,8 +383,8 @@ pub fn apply_grain_to_density(
             for sl in 0..n_sub_layers {
                 let t = Instant::now();
                 // Monochrome (B&W): one shared noise field — every lane draws
-                // from channel 0's RNG stream (upstream n_channels==1 has a
-                // single emulsion, seed ch=0).
+                // from channel 0's RNG stream for the native monochrome
+                // profile extension, seed ch=0.
                 let seed_ch = if monochrome { 0 } else { ch as u64 };
                 let seed = seed_ch + (sl as u64) * 10;
                 let g = layer_particle_model(

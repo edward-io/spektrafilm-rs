@@ -11,7 +11,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> rgb: array<f32>;
 
 fn srgb_encode(x_in: f32) -> f32 {
-    let x = clamp(x_in, 0.0, 1.0);
+    let x = x_in;
     if x <= 0.0031308 {
         return 12.92 * x;
     }
@@ -29,9 +29,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rgb[base] = srgb_encode(rgb[base]);
         rgb[base + 1u] = srgb_encode(rgb[base + 1u]);
         rgb[base + 2u] = srgb_encode(rgb[base + 2u]);
-    } else {
-        rgb[base] = clamp(rgb[base], 0.0, 1.0);
-        rgb[base + 1u] = clamp(rgb[base + 1u], 0.0, 1.0);
-        rgb[base + 2u] = clamp(rgb[base + 2u], 0.0, 1.0);
     }
 }

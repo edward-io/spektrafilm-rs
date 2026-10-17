@@ -1,10 +1,10 @@
 // DIR (Development Inhibitor Release) coupler model.
 // Handles same-layer and inter-layer inhibition with spatial diffusion.
 
+use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::precision::{from_f32, from_f64};
-use rayon::prelude::*;
+use spektrafilm_math::precision::from_f64;
 
 use crate::density_curves::normalize_density_curves;
 
@@ -91,36 +91,48 @@ pub fn compute_exposure_correction(
         });
 
     if diffusion_size_pixel > 0.0 {
-        // Python: `(1 - w) * fast_gaussian_filter(corr, σ_size)
-        //         + w * fast_exponential_filter(corr, σ_tail)`.
-        // The tail kernel is EXPONENTIAL (3-Gaussian mixture), not
-        // another Gaussian — using two Gaussians here was a structural
-        // diff vs Python.
-        use spektrafilm_math::gaussian::{exponential_filter_channel, gaussian_blur_channel};
-        let w_img = correction.width;
-        let h_img = correction.height;
-        let n_pix = (w_img as usize) * (h_img as usize);
-        let w = from_f64(diffusion_tail_weight);
-        let one = from_f64(1.0);
-        let mut blended_channels: [Vec<spektrafilm_math::precision::Scalar>; 3] =
-            [vec![one; n_pix], vec![one; n_pix], vec![one; n_pix]];
-        for c in 0..3 {
-            let ch = correction.extract_channel(c);
-            let g = gaussian_blur_channel(&ch, w_img, h_img, diffusion_size_pixel);
-            let t = exponential_filter_channel(&ch, w_img, h_img, diffusion_tail_pixel);
-            for i in 0..n_pix {
-                blended_channels[c][i] = (one - w) * g[i] + w * t[i];
+        if let Some(output) = backend.dir_diffusion(
+            &correction,
+            diffusion_size_pixel,
+            diffusion_tail_pixel,
+            diffusion_tail_weight as f32,
+        ) {
+            correction = output;
+        } else {
+            // Python: `(1 - w) * fast_gaussian_filter(corr, σ_size)
+            //         + w * fast_exponential_filter(corr, σ_tail)`.
+            // The tail kernel is EXPONENTIAL (3-Gaussian mixture), not
+            // another Gaussian — using two Gaussians here was a structural
+            // diff vs Python.
+            use spektrafilm_math::gaussian::{exponential_filter_channel, gaussian_blur_channel};
+            let w_img = correction.width;
+            let h_img = correction.height;
+            let n_pix = (w_img as usize) * (h_img as usize);
+            let w = from_f64(diffusion_tail_weight);
+            let one = from_f64(1.0);
+            let mut blended_channels: [Vec<spektrafilm_math::precision::Scalar>; 3] =
+                [vec![one; n_pix], vec![one; n_pix], vec![one; n_pix]];
+            for c in 0..3 {
+                let ch = correction.extract_channel(c);
+                let g = gaussian_blur_channel(&ch, w_img, h_img, diffusion_size_pixel);
+                let t = exponential_filter_channel(&ch, w_img, h_img, diffusion_tail_pixel);
+                for i in 0..n_pix {
+                    blended_channels[c][i] = (one - w) * g[i] + w * t[i];
+                }
+            }
+            for c in 0..3 {
+                correction.write_channel(c, &blended_channels[c]);
             }
         }
-        for c in 0..3 {
-            correction.write_channel(c, &blended_channels[c]);
-        }
     }
-
     let mut result = log_raw.clone();
-    result.data.par_iter_mut().zip(correction.data.par_iter()).for_each(|(r, c)| {
-        *r -= c;
-    });
+    result
+        .data
+        .par_iter_mut()
+        .zip(correction.data.par_iter())
+        .for_each(|(r, c)| {
+            *r -= c;
+        });
     result
 }
 

@@ -5,3 +5,4 @@ pub mod emulsion;
 pub mod glare;
 pub mod grain;
 pub mod illuminants;
+pub mod parametric;

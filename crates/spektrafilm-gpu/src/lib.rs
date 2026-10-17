@@ -142,13 +142,54 @@ pub trait ComputeBackend: Send + Sync {
         false
     }
 
-    /// True for f32 GPU backends where effects may trade exactness for
-    /// speed (the diffusion filter uses a downsampled sum-of-Gaussians
-    /// instead of the exact FFT convolution). CPU keeps the exact path.
+    /// True for a GPU compute backend. Numerical fidelity is checked against
+    /// the f64 CPU model; wgpu uses the exact discrete diffusion PSF.
     fn is_gpu(&self) -> bool {
         false
     }
 
+    fn pchip3d(
+        &self,
+        _image: &ImageBuf,
+        _prepared: &spektrafilm_math::pchip3d::PreparedPchip3d,
+        _min: [f64; 3],
+        _max: [f64; 3],
+    ) -> Option<ImageBuf> {
+        None
+    }
+
+    /// Named input/output CCTFs and general RGB primaries in the resident chain.
+    fn supports_extended_color(&self) -> bool {
+        false
+    }
+
+    fn supports_layered_grain(&self) -> bool {
+        false
+    }
+    fn layered_grain(
+        &self,
+        _image: &ImageBuf,
+        _params: &LayeredGrainGpuParams,
+    ) -> Option<ImageBuf> {
+        None
+    }
+    /// Exact reflected diffusion PSF, also available outside the resident chain.
+    fn diffusion_filter(&self, _image: &ImageBuf, _plan: &DiffusionGpuPlan) -> Option<ImageBuf> {
+        None
+    }
+    /// Accurate spatial effects for paths that cannot use the full resident chain.
+    fn halation(&self, _image: &ImageBuf, _params: &HalationGpuParams) -> Option<ImageBuf> {
+        None
+    }
+    fn dir_diffusion(
+        &self,
+        _image: &ImageBuf,
+        _core: f32,
+        _tail: f32,
+        _weight: f32,
+    ) -> Option<ImageBuf> {
+        None
+    }
     fn name(&self) -> &str;
 }
 
@@ -157,6 +198,10 @@ pub trait ComputeBackend: Send + Sync {
 /// DIR couplers, …) doesn't churn every callsite.
 pub struct FilmChainParams<'a> {
     pub image: &'a ImageBuf,
+    pub input_transfer: spektrafilm_math::transfer::Transfer,
+    /// Autoexposure scales encoded input before the transfer is decoded.
+    pub input_scale: f64,
+    pub output_transfer: spektrafilm_math::transfer::Transfer,
     /// RGB → film-raw front pass (the configured upsampler).
     pub front: FrontPass<'a>,
     pub film_log_exposure: &'a [f64],
@@ -199,9 +244,10 @@ pub struct FilmChainParams<'a> {
     pub dir_couplers: Option<DirCouplersGpuParams<'a>>,
     /// Optional grain pass — Poisson-binomial particle model on the film
     /// density buffer, after DIR couplers and before print spectral.
-    /// Uses normal-approximation sampling on the GPU (matches what the
-    /// CPU path does for typical λ > 30 / variance > 9 regimes).
+    /// wgpu samples the exact Poisson-thinning law; its deterministic streams
+    /// differ from the CPU NumPy stream. CUDA still uses its approximation.
     pub grain: Option<GrainGpuParams>,
+    pub layered_grain: Option<LayeredGrainGpuParams>,
     /// Optional viewing glare pass — applied after scan spectral on the
     /// final RGB buffer. Lognormal-distributed per-pixel surface noise +
     /// blur + per-channel illuminant offset.
@@ -226,8 +272,8 @@ pub struct FilmChainParams<'a> {
     pub highlight_boost: Option<HighlightBoostGpuParams>,
     /// Optional camera lens diffusion filter — applied on the raw film
     /// exposure buffer right after hanatos2025, before halation (matching
-    /// the CPU filming order). A downsampled sum-of-Gaussians; see
-    /// `DiffusionGpuPlan`.
+    /// the CPU filming order). wgpu uses the exact reflected radial PSF;
+    /// see `DiffusionGpuPlan`.
     pub diffusion: Option<DiffusionGpuPlan>,
     /// Optional enlarger diffusion filter. Applied in the print stage on
     /// linear print raw between print_spectral and print density curves.
@@ -236,7 +282,7 @@ pub struct FilmChainParams<'a> {
     /// when `enlarger_diffusion` is active so it can preserve the CPU
     /// print-stage ordering around preflash.
     pub print_exposure_scale: f64,
-    /// Whether the final output should be sRGB-encoded after clamping. Mirrors
+    /// Whether the final unclipped output should be sRGB-encoded. Mirrors
     /// `RuntimeParams::io.output_cctf_encoding`.
     pub output_cctf_encoding: bool,
 }
@@ -257,14 +303,15 @@ pub enum FrontPass<'a> {
     Mallett2019 { matrix: [[f64; 3]; 3] },
 }
 
-/// Pre-computed plan for the GPU-resident diffusion filter. The per-channel
-/// PSF is decomposed into Gaussian components (3 per PSF sub-component) and
-/// the whole scattered field is computed on an image downsampled by `d` so
-/// the blur σ stay small. `sigmas`/`coeffs` are parallel: component `i`
-/// blurs the downsampled image at `sigmas[i]` (working-resolution px) and
-/// adds `coeffs[i]` (per-channel) into the accumulator.
+/// Physical diffusion PSF and working geometry. wgpu generates and normalizes
+/// the discrete radial PSF on the GPU, then applies reflected FFT convolution.
+/// The Gaussian decomposition fields are retained for the experimental CUDA
+/// implementation, whose numerical accuracy has not been verified here.
 #[derive(Debug, Clone)]
 pub struct DiffusionGpuPlan {
+    pub psf_side: u32,
+    /// Exact radial exponential components: lambda in pixels, then RGB weights.
+    pub radial_psf: Vec<[f32; 4]>,
     pub d: u32,
     pub small_w: u32,
     pub small_h: u32,
@@ -306,6 +353,26 @@ pub struct DirCouplersGpuParams<'a> {
 /// already divided by `n_sub_layers`, density_max already includes
 /// `density_min`, etc.
 #[derive(Debug, Clone, Copy)]
+pub struct LayerParticleGpuParams {
+    pub density_min: [f32; 3],
+    pub density_max: [f32; 3],
+    pub particles: [f32; 3],
+    pub cloud_sigma: [f32; 3],
+}
+pub struct LayeredGrainGpuParams {
+    /// Row-major [curve sample][dye], containing total density and three layers.
+    pub curves: Vec<[f32; 4]>,
+    pub layers: [LayerParticleGpuParams; 3],
+    pub uniformity: [f32; 3],
+    pub density_min: [f32; 3],
+    pub blur: f32,
+    pub micro_sigma: f32,
+    pub micro_blur: f32,
+    pub fast_stats: bool,
+    pub positive: bool,
+    pub monochrome: bool,
+}
+
 pub struct GrainGpuParams {
     pub density_min: [f32; 3],
     pub density_max: [f32; 3],
@@ -326,7 +393,11 @@ pub struct GrainGpuParams {
 /// perceptual transform + Reinhard knee.
 #[derive(Debug, Clone, Copy)]
 pub struct GamutGpuParams<'a> {
-    /// 0 = aces_rgc, 1 = oklch, 2 = oklrab, 3 = cam16ucs — must match the
+    pub rgb_to_xyz: [[f32; 3]; 3],
+    pub xyz_to_rgb: [[f32; 3]; 3],
+    pub cam_gain: [f32; 3],
+    pub cam_aw: f32,
+    /// 0 = aces_rgc, 1 = oklch, 2 = oklrab, 3 = cam16ucs, 4 = jzazbz; matches
     /// mode dispatch in `gamut_compress.wgsl`.
     pub mode: u32,
     /// Reinhard knee on normalized chroma: (threshold, limit, power).
@@ -366,27 +437,27 @@ pub struct GlareGpuParams {
     pub rgb_offset: [f32; 3],
 }
 
-/// Halation parameters for the GPU-resident scatter + multi-bounce pass.
-/// Mirrors the field layout of the CPU `apply_halation_um`, but pre-converts
-/// the per-channel µm sigmas to a single pixel-space sigma (the GPU path
-/// uses the average across channels, matching the existing CPU impl).
+/// Physical scatter and back-reflection parameters in pixel units. wgpu uses
+/// per-channel widths and exponential tails. Scalar average-width fields are
+/// retained for the experimental CUDA path.
 #[derive(Debug, Clone, Copy)]
 pub struct HalationGpuParams {
     pub scatter_amount: f32,
     pub scatter_core_px: f32,
+    pub scatter_core_px_rgb: [f32; 3],
     pub scatter_tail_px: f32,
+    pub scatter_tail_px_rgb: [f32; 3],
     /// Per-channel tail weight. Python applies these per channel
     /// (Portra 0.78 / 0.65 / 0.67); averaging is a noticeable
     /// chromatic drift.
     pub scatter_tail_weight: [f32; 3],
     pub halation_amount: f32,
     pub halation_strength_avg: f32,
-    /// Per-channel `halation_strength[c] * halation_amount`. Used only
-    /// for the renormalize pass (which is per-channel even though the
-    /// blur/add use the averaged scalar). When `halation_renormalize`
-    /// is false this is ignored.
+    /// Per-channel `halation_strength[c] * halation_amount` for additive
+    /// bounces and optional energy renormalization.
     pub halation_a_tot: [f32; 3],
     pub halation_first_sigma_px: f32,
+    pub halation_first_sigma_px_rgb: [f32; 3],
     pub halation_n_bounces: u32,
     pub halation_bounce_decay: f32,
     pub halation_renormalize: bool,

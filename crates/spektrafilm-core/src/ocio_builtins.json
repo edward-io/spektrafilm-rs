@@ -1,0 +1,149 @@
+{
+  "ACES2065-1": [],
+  "ACEScg": [
+    [
+      "ACEScg_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "ACEScct": [
+    [
+      "ACEScct_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "ACEScc": [
+    [
+      "ACEScc_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "Panasonic V-Log": [
+    [
+      "PANASONIC_VLOG-VGAMUT_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "Sony S-Log3": [
+    [
+      "SONY_SLOG3-SGAMUT3_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "Sony S-Log3 (S-Gamut3.Cine)": [
+    [
+      "SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "ARRI LogC3 (EI800)": [
+    [
+      "ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "ARRI LogC4": [
+    [
+      "ARRI_LOGC4_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "Apple Log": [
+    [
+      "APPLE_LOG_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "Canon Log 3": [
+    [
+      "CANON_CLOG3-CGAMUT_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "RED Log3G10": [
+    [
+      "RED_LOG3G10-RWG_to_ACES2065-1",
+      "inverse"
+    ]
+  ],
+  "sRGB": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_sRGB",
+      "forward"
+    ]
+  ],
+  "Rec.709": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_REC.1886-REC.709",
+      "forward"
+    ]
+  ],
+  "Rec.2020": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_REC.1886-REC.2020",
+      "forward"
+    ]
+  ],
+  "Display P3": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_DisplayP3",
+      "forward"
+    ]
+  ],
+  "DCI-P3": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_G2.6-P3-DCI-BFD",
+      "forward"
+    ]
+  ],
+  "Rec.2100 PQ": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_REC.2100-PQ",
+      "forward"
+    ]
+  ],
+  "Rec.2100 HLG": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_REC.2100-HLG-1000nit",
+      "forward"
+    ]
+  ],
+  "P3-D65 PQ": [
+    [
+      "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD",
+      "forward"
+    ],
+    [
+      "DISPLAY - CIE-XYZ-D65_to_ST2084-P3-D65",
+      "forward"
+    ]
+  ]
+}

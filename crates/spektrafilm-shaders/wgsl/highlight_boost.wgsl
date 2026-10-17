@@ -13,8 +13,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> data: array<f32>;
 
 @compute @workgroup_size(1024)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
+    let idx = gid.x+gid.y*groups.x*1024u;
     if idx >= params.n_values {
         return;
     }

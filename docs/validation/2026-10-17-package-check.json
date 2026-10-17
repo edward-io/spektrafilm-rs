@@ -1,0 +1,33 @@
+{
+  "platform": "macOS / Apple M1 Max",
+  "application": "dist/spektrafilm-macos/Spektrafilm.app",
+  "signature": "codesign --verify --deep --strict: valid",
+  "camera": "SONY ILCE-7M5",
+  "decoder": "Auto / LibRaw",
+  "gpu_backend": "wgpu / Metal",
+  "image_dimensions": [
+    7168,
+    5120
+  ],
+  "load_ms": 1097,
+  "gpu_pipeline_ms": 4194,
+  "save_ms": 1388,
+  "output_color_space": "Display P3",
+  "icc_bytes": 456,
+  "exif_orientation": 1,
+  "bottom_half_std": 16.784466499375583,
+  "full_workspace_tests": {
+    "f32": 121,
+    "f64": 131
+  },
+  "additional_checks": [
+    "full-cube envelope regression in f32/f64",
+    "final GUI geometry / project / GPU export regression",
+    "Python readers for CUBE/3DL/Hald/Lumix",
+    "all four OCIO topologies",
+    "multi-paper ZIP and quality reports",
+    "source-equivalent gamut diagnostics on native LUT",
+    "packaged measure-profile and calibration-strip"
+  ],
+  "native_clickthrough": "unverified: Mac locked"
+}

@@ -18,3 +18,6 @@ half = "2.7"
 libm.workspace = true
 rand_mt = "5"
 rustfft.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -4,11 +4,11 @@ use rayon::prelude::*;
 
 /// Separable Gaussian blur on an ImageBuf.
 ///
-/// Uses FIR convolution for small sigma (<= 3.0) and recursive IIR
+/// Uses FIR convolution for small sigma (< 3.0) and recursive IIR
 /// (Young-van Vliet) for larger sigma. Each channel is processed independently.
 /// Processes rows in parallel via rayon.
-/// Single-channel 2D Gaussian blur. Same separable FIR (σ ≤ 3) +
-/// Young-van Vliet IIR (σ > 3) dispatch as `gaussian_blur`, just on a
+/// Single-channel 2D Gaussian blur. Same separable FIR (σ < 3) +
+/// Young-van Vliet IIR (σ >= 3) dispatch as `gaussian_blur`, just on a
 /// `Vec<Scalar>` of length `w * h`. Used by callers that need
 /// per-channel σ — extracting channels and processing each
 /// independently avoids the 3x-redundant work of blurring a 3-channel
@@ -102,6 +102,27 @@ fn blur_1d_parallel(
     }
 }
 
+/// scipy / Python small-sigma half-sample reflection, including dimensions
+/// shorter than the kernel radius.
+fn reflect(index: isize, n: usize) -> usize {
+    if index >= 0 && index < n as isize {
+        return index as usize;
+    }
+    if index < 0 && index >= -(n as isize) {
+        return (-index - 1) as usize;
+    }
+    if index >= n as isize && index < 2 * n as isize {
+        return (2 * n as isize - 1 - index) as usize;
+    }
+    let period = 2 * n as isize;
+    let value = index.rem_euclid(period);
+    if value < n as isize {
+        value as usize
+    } else {
+        (period - 1 - value) as usize
+    }
+}
+
 /// FIR Gaussian blur (truncated kernel). Good for small sigma.
 fn fir_blur_1d(
     src: &[Scalar],
@@ -119,7 +140,7 @@ fn fir_blur_1d(
     // care about. Rust used to use `.ceil()` here, which biases the
     // radius up by 1 when `truncate·sigma` lands at a half-integer
     // and changes the FIR kernel size — measurable parity drift.
-    let radius = (from_f64(3.0) * sigma + from_f64(0.5)) as usize;
+    let radius = (3.0 * sigma as f64 + 0.5) as usize;
     let kernel = make_gaussian_kernel(sigma, radius);
 
     if horizontal {
@@ -130,9 +151,7 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sx = (x as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(w as isize - 1) as usize;
+                        let sx = reflect(x as isize + ki as isize - radius as isize, w);
                         sum += row_src[sx] * kv;
                     }
                     row_dst[x] = sum;
@@ -145,9 +164,7 @@ fn fir_blur_1d(
                 for x in 0..w {
                     let mut sum = ZERO;
                     for (ki, &kv) in kernel.iter().enumerate() {
-                        let sy = (y as isize + ki as isize - radius as isize)
-                            .max(0)
-                            .min(h as isize - 1) as usize;
+                        let sy = reflect(y as isize + ki as isize - radius as isize, h);
                         sum += src[sy * w + x] * kv;
                     }
                     row_dst[x] = sum;
@@ -168,22 +185,24 @@ fn iir_blur_1d(
     sigma: Scalar,
     horizontal: bool,
 ) {
+    // Wide recurrences need f64 coefficients / states even with f32 image
+    // storage; cancellation at sigma 100 otherwise exceeds 0.1% full scale.
+    let sigma = sigma as f64;
     // Compute IIR coefficients (Young-van Vliet, 3rd order)
-    let q = if sigma >= from_f64(2.5) {
-        from_f64(0.98711) * sigma - from_f64(0.96330)
+    let q = if sigma >= 2.5 {
+        0.98711 * sigma - 0.96330
     } else {
-        from_f64(3.97156) - from_f64(4.14554) * (from_f64(1.0) - from_f64(0.26891) * sigma).sqrt()
+        3.97156 - 4.14554 * (1.0 - 0.26891 * sigma).sqrt()
     };
 
     let q2 = q * q;
     let q3 = q2 * q;
 
-    let b0 =
-        from_f64(1.57825) + from_f64(2.44413) * q + from_f64(1.4281) * q2 + from_f64(0.422205) * q3;
-    let b1 = (from_f64(2.44413) * q + from_f64(2.85619) * q2 + from_f64(1.26661) * q3) / b0;
-    let b2 = -(from_f64(1.4281) * q2 + from_f64(1.26661) * q3) / b0;
-    let b3 = (from_f64(0.422205) * q3) / b0;
-    let a = from_f64(1.0) - b1 - b2 - b3;
+    let b0 = 1.57825 + 2.44413 * q + 1.4281 * q2 + 0.422205 * q3;
+    let b1 = (2.44413 * q + 2.85619 * q2 + 1.26661 * q3) / b0;
+    let b2 = -(1.4281 * q2 + 1.26661 * q3) / b0;
+    let b3 = (0.422205 * q3) / b0;
+    let a = 1.0 - b1 - b2 - b3;
 
     if horizontal {
         dst.par_chunks_exact_mut(w)
@@ -215,14 +234,7 @@ fn iir_blur_1d(
 }
 
 /// Apply Young-van Vliet IIR filter to a 1D signal (forward + backward pass).
-fn iir_filter_row(
-    src: &[Scalar],
-    dst: &mut [Scalar],
-    a: Scalar,
-    b1: Scalar,
-    b2: Scalar,
-    b3: Scalar,
-) {
+fn iir_filter_row(src: &[Scalar], dst: &mut [Scalar], a: f64, b1: f64, b2: f64, b3: f64) {
     let n = src.len();
     if n == 0 {
         return;
@@ -248,24 +260,25 @@ fn iir_filter_row(
     // n-3..0). The previous Rust code zeroed the state and skipped the
     // last three positions in the backward pass — which produced a
     // small but visible edge bias vs. Python at every halation σ.
-    let x0 = src[0];
+    let mut forward = vec![0f64; n];
+    let x0 = src[0] as f64;
     let mut w1 = x0;
     let mut w2 = x0;
     let mut w3 = x0;
     for j in 0..n {
-        let w = a * src[j] + b1 * w1 + b2 * w2 + b3 * w3;
-        dst[j] = w;
+        let w = a * src[j] as f64 + b1 * w1 + b2 * w2 + b3 * w3;
+        forward[j] = w;
         w3 = w2;
         w2 = w1;
         w1 = w;
     }
-    let xn = dst[n - 1];
+    let xn = forward[n - 1];
     w1 = xn;
     w2 = xn;
     w3 = xn;
     for j in (0..n).rev() {
-        let w = a * dst[j] + b1 * w1 + b2 * w2 + b3 * w3;
-        dst[j] = w;
+        let w = a * forward[j] + b1 * w1 + b2 * w2 + b3 * w3;
+        dst[j] = from_f64(w);
         w3 = w2;
         w2 = w1;
         w1 = w;

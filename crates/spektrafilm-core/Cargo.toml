@@ -12,6 +12,7 @@ precision-f64 = [
 ]
 
 [dependencies]
+base64 = "0.22"
 spektrafilm-math.workspace = true
 spektrafilm-gpu.workspace = true
 spektrafilm-model.workspace = true
@@ -22,6 +23,7 @@ thiserror.workspace = true
 tracing.workspace = true
 libm.workspace = true
 image.workspace = true
+rustfft.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cblas = "0.4"

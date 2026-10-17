@@ -19,3 +19,6 @@ rand_distr.workspace = true
 rand_mt = "5"
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
