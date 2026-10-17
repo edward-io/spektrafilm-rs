@@ -4,15 +4,14 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 import numpy as np
 from spektrafilm_lut_creator.qa.tests.picture_style import _polar_oklch_input_samples,noise_sensitivity
-from spektrafilm_lut_creator.color_spaces import encode_qa_input,native_stops_above_midgray
+from spektrafilm_lut_creator.color_spaces import BakeFrame
 root=Path(__file__).resolve().parents[2]
 f=json.loads((root/'crates/spektrafilm-core/tests/fixtures/qa.json').read_text());n=f['n']
 table=np.array(f['table']).reshape(n,n,n,3)
 figures=Path('/tmp/spektrafilm-noise-oracle');figures.mkdir(exist_ok=True)
 cases=[]
 for name in ['sRGB','ProPhoto RGB','Panasonic V-Log','Rec.2100 HLG']:
- stops=native_stops_above_midgray(name)
- frame=NS(input_color_space=name,output_color_space='sRGB',encode_input=lambda p:encode_qa_input(p,name,stops))
+ frame=BakeFrame.from_spec(NS(input_color_space=name,output_color_space='sRGB',exposure_ev=0.))
  samples=_polar_oklch_input_samples(frame,L=.5646225971435698,chroma_rings=(.07,.14,.21),n_hues=16)
  ctx=NS(frame=frame,spec=NS(input_color_space=name,output_color_space='sRGB'),lut=NS(table=table,resolution=n),figures_dir=figures,bundle=NS(meta=NS(provenance=NS(spektrafilm_version='0.3.4'))))
  result=noise_sensitivity(ctx)

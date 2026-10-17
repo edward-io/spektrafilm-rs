@@ -262,3 +262,38 @@ mod tests {
         assert!((v[2] - 0.5).abs() < 1e-6);
     }
 }
+
+/// Experimental runtime's four-corner interpolation, in R/G/B axis order.
+#[derive(Clone, Debug)]
+pub struct TetrahedralLut {
+    pub size: usize,
+    pub data: Vec<f64>,
+}
+impl TetrahedralLut {
+    pub fn sample(&self, coordinate: [f64; 3]) -> [f64; 3] {
+        let n = self.size;
+        let q = coordinate.map(|v| v.clamp(0., (n - 1) as f64));
+        let index = q.map(|v| (v.floor() as usize).min(n - 2));
+        let f: [f64; 3] = std::array::from_fn(|c| q[c] - index[c] as f64);
+        let mut order = [0, 1, 2];
+        order.sort_by(|a, b| f[*b].total_cmp(&f[*a]));
+        let at = |offset: [usize; 3]| {
+            let i =
+                (((index[0] + offset[0]) * n + index[1] + offset[1]) * n + index[2] + offset[2])
+                    * 3;
+            [self.data[i], self.data[i + 1], self.data[i + 2]]
+        };
+        let a = at([0; 3]);
+        let mut offset = [0; 3];
+        offset[order[0]] = 1;
+        let b = at(offset);
+        offset[order[1]] = 1;
+        let c = at(offset);
+        let d = at([1; 3]);
+        std::array::from_fn(|i| {
+            a[i] + f[order[0]] * (b[i] - a[i])
+                + f[order[1]] * (c[i] - b[i])
+                + f[order[2]] * (d[i] - c[i])
+        })
+    }
+}

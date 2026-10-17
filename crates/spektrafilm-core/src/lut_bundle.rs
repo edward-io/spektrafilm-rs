@@ -117,6 +117,9 @@ fn write_bundle_contents(
     let gain = options.gain.unwrap_or(input.auto_gain);
     let mut params = options.params.clone();
     params.debug.lut_mode = true;
+    params.settings.preview_mode = false;
+    params.workflow.route = "input > film > print > scan".into();
+    params.io.scan_film = false;
     params.io.input_color_space = input.primaries.into();
     params.io.output_color_space = output.primaries.into();
     params.io.input_cctf_decoding = false;
@@ -222,7 +225,7 @@ fn write_bundle_contents(
         schema_version: 1,
         provenance: serde_json::json!({
             "implementation": "spektrafilm-rs", "implementation_version": env!("CARGO_PKG_VERSION"),
-            "reference_version": "0.3.4", "reference_commit": "3bb2c2d2801ff68b92019cf1dbcbb133d60832bc",
+            "reference_version": "0.3.4", "reference_commit": "28bf883e1672e884307edc75852549376e13644e",
             "created_unix_seconds": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs(),
             "precision": if cfg!(feature="precision-f64") {"f64"} else {"f32"},
             "license": "Profiles and derived LUTs: CC BY-SA 4.0; see SPEKTRAFILM_LICENSE.txt.",
@@ -232,7 +235,7 @@ fn write_bundle_contents(
         stocks: serde_json::json!({"film": options.film, "prints": [options.paper]}),
         color_spaces: serde_json::json!({"input": {"name":input.name,"primaries":input.primaries,"cctf":!matches!(input.curve, spektrafilm_math::transfer::Transfer::Linear)},
             "output": {"name":output.name,"primaries":output.primaries,"cctf":!matches!(output.curve, spektrafilm_math::transfer::Transfer::Linear)}}),
-        input_exposure: serde_json::json!({"gain":gain,"stops_above_midgray":(gain*input.curve.decode(1.)/0.18).log2(),"mode":if options.gain.is_none(){"auto"}else{"explicit"}}),
+        input_exposure: serde_json::json!({"gain":gain,"exposure_ev":(gain/input.auto_gain).log2(),"stops_above_midgray":(gain*input.curve.decode(1.)/0.18).log2(),"mode":if options.gain.is_none(){"auto"}else{"explicit"}}),
         params_snapshot: serde_json::json!({options.paper: {"runtime": base.params,"input_gain":gain,"output_gain":output.output_gain,"resolution":options.size,"topology":topology,"format":format}}),
         version: 1,
         film: options.film.into(),

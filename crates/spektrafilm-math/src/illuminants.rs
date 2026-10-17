@@ -74,3 +74,7 @@ pub fn white_xyz(t: f64) -> [f64; 3] {
     };
     [x / y, 1., (1. - x - y) / y]
 }
+
+pub fn names() -> impl Iterator<Item = &'static str> {
+    registry::ILLUMINANTS.iter().map(|(name, _)| *name)
+}

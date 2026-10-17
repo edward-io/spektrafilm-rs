@@ -6,3 +6,5 @@ pub mod glare;
 pub mod grain;
 pub mod illuminants;
 pub mod parametric;
+
+pub mod convert;

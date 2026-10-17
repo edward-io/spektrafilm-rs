@@ -139,6 +139,14 @@ enum Commands {
         /// Source white exposure in stops above 0.18. Default follows the input registry.
         #[arg(long)]
         stops_above_midgray: Option<f64>,
+        /// Re-expose the LUT input relative to its native midgray.
+        #[arg(
+            long,
+            default_value = "0",
+            allow_hyphen_values = true,
+            conflicts_with = "stops_above_midgray"
+        )]
+        exposure_ev: f64,
     },
 }
 
@@ -233,6 +241,7 @@ fn main() -> Result<()> {
             output_space,
             format,
             stops_above_midgray,
+            exposure_ev,
             topology,
             include_combinations,
             qa,
@@ -248,6 +257,7 @@ fn main() -> Result<()> {
                 &output_space,
                 &format,
                 stops_above_midgray,
+                exposure_ev,
                 topology.as_deref(),
                 include_combinations,
                 qa,
@@ -299,7 +309,16 @@ fn cmd_process(
     } else {
         (RuntimeParams::default(), [false; 2])
     };
+    if scan_film && !params.scans_film() {
+        params.workflow.route = if params.converts_film() {
+            "input > convert-film > scan"
+        } else {
+            "input > film > scan"
+        }
+        .into();
+    }
     params.io.scan_film |= scan_film;
+    params.digest();
     let scan_film = params.io.scan_film;
 
     // Load profiles
@@ -307,7 +326,7 @@ fn cmd_process(
     let film = profile::load_profile_by_name(data_dir, film_name)
         .with_context(|| format!("loading film profile: {film_name}"))?;
 
-    let print_stock = if scan_film {
+    let print_stock = if scan_film || params.route() == "input" {
         film_name.to_string()
     } else if let Some(p) = paper_name {
         p.to_string()
@@ -472,6 +491,7 @@ fn cmd_export_lut(
     out: &str,
     format: &str,
     stops: Option<f64>,
+    exposure_ev: f64,
     topology: Option<&str>,
     combinations: bool,
     qa: bool,
@@ -488,7 +508,16 @@ fn cmd_export_lut(
         RuntimeParams::default()
     };
     let entry = lut_export::space(input).map_err(anyhow::Error::msg)?;
-    let gain = stops.map(|v| 0.18 * 2f64.powf(v) / entry.curve.decode(1.));
+    anyhow::ensure!(exposure_ev.is_finite(), "LUT exposure EV must be finite");
+    let gain = stops
+        .map(|v| 0.18 * 2f64.powf(v) / entry.curve.decode(1.))
+        .or_else(|| {
+            if exposure_ev == 0. {
+                None
+            } else {
+                Some(entry.auto_gain * 2f64.powf(exposure_ev))
+            }
+        });
     let options = BakeOptions {
         film: film_name,
         paper: &print_stock,
@@ -528,7 +557,7 @@ fn cmd_export_lut(
     let title = format!("spektrafilm {film_name} -> {print_stock} ({input} -> {out})");
     lut_export::write_lut(&image, size, output, format, &title, input)
         .map_err(anyhow::Error::msg)?;
-    let metadata = serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"film":film_name,"paper":print_stock,"input_color_space":input,"output_color_space":out,"resolution":size,"format":format,"input_gain":gain.unwrap_or(entry.auto_gain),"params":options.params,"precision":if cfg!(feature="precision-f64") {"f64"} else {"f32"}});
+    let metadata = serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"reference_commit":"28bf883e1672e884307edc75852549376e13644e","film":film_name,"paper":print_stock,"input_color_space":input,"output_color_space":out,"resolution":size,"format":format,"input_gain":gain.unwrap_or(entry.auto_gain),"params":options.params,"precision":if cfg!(feature="precision-f64") {"f64"} else {"f32"}});
     std::fs::write(
         output.with_extension("json"),
         serde_json::to_vec_pretty(&metadata)?,

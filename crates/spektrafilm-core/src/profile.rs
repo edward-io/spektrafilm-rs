@@ -143,6 +143,8 @@ pub struct ProfileData {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DensityCurvesModel {
     #[serde(default)]
+    pub alphas: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
     pub model_type: String,
     #[serde(default)]
     pub centers: Vec<Vec<f64>>,
@@ -437,6 +439,9 @@ pub fn resolve_for_render(mut profile: Profile, development_time: Option<f64>) -
         model.centers = pick(&model.centers);
         model.amplitudes = pick(&model.amplitudes);
         model.sigmas = pick(&model.sigmas);
+        if let Some(alphas) = &mut model.alphas {
+            *alphas = pick(alphas);
+        }
     }
     // Layers are n_le × n_layers × n_times on B&W families (upstream slices
     // `[:, :, idx]`). Select the same development time as the total curves.
@@ -479,6 +484,9 @@ pub fn resolve_for_render(mut profile: Profile, development_time: Option<f64>) -
         bcast(&mut model.centers);
         bcast(&mut model.amplitudes);
         bcast(&mut model.sigmas);
+        if let Some(alphas) = &mut model.alphas {
+            bcast(alphas);
+        }
     }
     profile
 }

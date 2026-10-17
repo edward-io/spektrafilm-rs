@@ -111,8 +111,13 @@ pub(crate) fn input(
     let reference = white(reference_name)?;
     let locus = crate::input_gamut::spectral_locus_xy();
     let tri = triangle(input);
-    let compressor =
+    let mut compressor =
         InputGamutCompress::build(if spec.active { &spec.algorithm } else { "off" }, spec.knee)?;
+    compressor.set_boundary(
+        &spec.boundary,
+        spec.hull_detail as f64,
+        [reference[0], reference[1]],
+    )?;
     let points = projection(cube, input, reference)?;
     let mut cloud = Cloud::new(720, 800, [-0.05, 0.85, -0.05, 0.95]);
     let (mut valid, mut oog, mut bright) = (0usize, 0usize, 0usize);
@@ -435,6 +440,8 @@ mod tests {
                 active: case["active"].as_bool().unwrap(),
                 algorithm: case["algorithm"].as_str().unwrap().into(),
                 knee: [0., 1., 6.],
+                boundary: "locus".into(),
+                hull_detail: 5.,
             };
             let (preview, smooth) = input(&grid, space, &spec, "D55", &directory).unwrap();
             for (actual, key) in [(&preview, "preview"), (&smooth, "smooth")] {

@@ -92,6 +92,33 @@ pub fn measure_autoexposure_ev_with_transfer(
     ev
 }
 
+/// Film raw is balanced to 1 at midgray; meter the mean emulsion response.
+pub fn measure_raw_autoexposure_ev(raw: &ImageBuf, method: &str) -> f64 {
+    if ![
+        "average",
+        "median",
+        "center_weighted",
+        "partial",
+        "matrix",
+        "multi_zone",
+        "highlight_weighted",
+    ]
+    .contains(&method)
+    {
+        return 0.;
+    }
+    let field: Vec<_> = raw
+        .pixels()
+        .map(|p| (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.)
+        .collect();
+    let value = meter_luminance(&field, raw.width as usize, raw.height as usize, method);
+    if value > 0. && value.is_finite() {
+        -value.log2()
+    } else {
+        0.
+    }
+}
+
 /// Normalized pixel coordinate along an axis: `(i/dim - 0.5) * (dim/maxdim)`,
 /// so the long edge spans [-0.5, 0.5] (Python `_normalized_coords`).
 fn norm_coord(i: usize, dim: usize, max_dim: usize) -> f64 {
@@ -240,26 +267,7 @@ fn meter_luminance(lum: &[f64], sw: usize, sh: usize, method: &str) -> f64 {
 }
 
 /// Per-pixel `raw = m · rgb` for the Mallett2019 path (f64 matmul, rayon-parallel).
-fn apply_mallett_matrix(image: &ImageBuf, m: &[[f64; 3]; 3]) -> ImageBuf {
-    let mut out = image.clone();
-    out.data
-        .par_chunks_exact_mut(3)
-        .zip(image.data.par_chunks_exact(3))
-        .for_each(|(dst, src)| {
-            let rgb = [src[0] as f64, src[1] as f64, src[2] as f64];
-            let v = crate::mallett::apply(m, rgb);
-            dst[0] = from_f64(v[0]);
-            dst[1] = from_f64(v[1]);
-            dst[2] = from_f64(v[2]);
-        });
-    out
-}
-
-/// Expose: convert RGB to film raw exposure.
-///
-/// Dispatches on the configured upsampler: the Mallett2019 per-pixel matrix
-/// (when `mallett_core` is set), the full Hanatos2025 spectral path (when a
-/// TC LUT is provided), or a simplified RGB → log10 fallback.
+/// Expose through the selected method's shared spectral LUT.
 #[allow(clippy::too_many_arguments)]
 pub fn expose(
     image: &ImageBuf,
@@ -267,7 +275,6 @@ pub fn expose(
     params: &RuntimeParams,
     backend: &dyn ComputeBackend,
     tc_lut: Option<&TcLut>,
-    mallett_core: Option<&[[f64; 3]; 3]>,
     front_illuminant: &[f32],
     bw_filming_correction: f64,
 ) -> ImageBuf {
@@ -287,12 +294,7 @@ pub fn expose(
     rgb.data.par_iter_mut().for_each(|v| *v *= exp_comp);
 
     // RGB → film raw exposure
-    let mut raw = if let Some(core) = mallett_core {
-        // Mallett2019: per-pixel `raw = (core · M_cs) · rgb`, a single 3×3
-        // matrix folding the input-colour-space → linear-sRGB conversion.
-        let m = crate::mallett::film_matrix(core, &params.io.input_color_space);
-        apply_mallett_matrix(&rgb, &m)
-    } else if let Some(lut) = tc_lut {
+    let mut raw = if let Some(lut) = tc_lut {
         // Full Hanatos2025 spectral upsampling with CAT02 adaptation.
         backend.hanatos2025_rgb_to_raw(
             &rgb,
@@ -403,8 +405,6 @@ pub fn develop(
     let log_exposure_f64 = film.log_exposure_f64();
     let density_curves_f64 = film.density_curves_f64();
     // f32 versions kept for DIR couplers (still f32 API) and grain (legacy).
-    let log_exposure = &film.log_exposure_f32();
-    let density_curves = &film.density_curves_f32();
     let gamma = params.film_render.density_curve_gamma;
 
     // Filming.develop uses NORMALIZED curves (Python `develop` subtracts nanmin).
@@ -431,15 +431,17 @@ pub fn develop(
             &density_cmy,
             log_raw,
             pix_um,
-            log_exposure,
-            density_curves,
+            &log_exposure_f64,
+            &density_curves_f64,
             &matrix,
             dir.amount,
+            dir.langmuir_donor_k_rgb,
+            dir.langmuir_receiver_k_rgb,
             dir.diffusion_size_um,
             dir.diffusion_tail_um,
             dir.diffusion_tail_weight,
             film.is_positive(),
-            gamma,
+            gamma as f64,
             backend,
         );
         print_stage_timing(stage_timings, "filming_develop.dir_couplers", t);
@@ -467,9 +469,10 @@ pub fn develop(
                 &film.data.density_curves_layers,
                 film.is_positive(),
                 &spektrafilm_model::grain::LayeredGrainParams {
-                    particle_area: grain.agx_particle_area_um2,
-                    channel_scale: grain.agx_particle_scale,
-                    layer_scale: grain.agx_particle_scale_layers,
+                    rms_granularity: grain.rms_granularity,
+                    usm_sigma: grain.mult_usm_sigma,
+                    usm_amount: grain.mult_usm_amount,
+                    layer_scale: grain.particle_scale_sublayers,
                     density_min: grain.density_min,
                     uniformity: grain.uniformity,
                     blur: grain.blur,
@@ -510,16 +513,7 @@ pub fn process(
     tc_lut: Option<&TcLut>,
 ) -> ImageBuf {
     let ref_illuminant = select_illuminant(&film.info.reference_illuminant);
-    let log_raw = expose(
-        image,
-        film,
-        params,
-        backend,
-        tc_lut,
-        None,
-        ref_illuminant,
-        1.0,
-    );
+    let log_raw = expose(image, film, params, backend, tc_lut, ref_illuminant, 1.0);
     develop(&log_raw, film, params, backend)
 }
 

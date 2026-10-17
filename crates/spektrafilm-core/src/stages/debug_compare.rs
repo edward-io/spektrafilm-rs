@@ -355,18 +355,16 @@ mod tests {
             &pipeline.params,
             &backend,
             pipeline.tc_lut(),
-            None,
             crate::stages::filming::select_illuminant(&pipeline.film.info.reference_illuminant),
             1.0,
         );
         check(
             "log_e_film",
             log_raw.get(0, 0),
-            [
-                0.0055470069132583094,
-                -0.0046291033978263334,
-                -0.037191809233513652,
-            ],
+            serde_json::from_value(
+                crate::experimental_reference()["extra"]["taps"]["log_e_film"].clone(),
+            )
+            .unwrap(),
         );
 
         let density_cmy =
@@ -374,11 +372,10 @@ mod tests {
         check(
             "cmy_film",
             density_cmy.get(0, 0),
-            [
-                0.68987884029422741,
-                0.70272493086202847,
-                0.84508598425873571,
-            ],
+            serde_json::from_value(
+                crate::experimental_reference()["extra"]["taps"]["cmy_film"].clone(),
+            )
+            .unwrap(),
         );
 
         let log_raw_print = crate::stages::printing::expose_calibrated(
@@ -395,11 +392,10 @@ mod tests {
         check(
             "log_e_print",
             log_raw_print.get(0, 0),
-            [
-                -0.0058943653645049067,
-                0.0016183559749744021,
-                0.0019890502790478998,
-            ],
+            serde_json::from_value(
+                crate::experimental_reference()["extra"]["taps"]["log_e_print"].clone(),
+            )
+            .unwrap(),
         );
 
         let density_print = crate::stages::printing::develop(
@@ -411,11 +407,10 @@ mod tests {
         check(
             "cmy_print",
             density_print.get(0, 0),
-            [
-                0.64189250593682268,
-                0.54211141885697389,
-                0.52002829327970834,
-            ],
+            serde_json::from_value(
+                crate::experimental_reference()["extra"]["taps"]["cmy_print"].clone(),
+            )
+            .unwrap(),
         );
     }
 }

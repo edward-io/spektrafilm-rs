@@ -294,7 +294,10 @@ mod tests {
                         (p.sample.encoded[c]
                             - case["samples"]["input_encoded"][i][c].as_f64().unwrap())
                         .abs()
-                            < 1e-10
+                            < 1e-10,
+                        "{name} sample {i} channel {c}: {} vs {}",
+                        p.sample.encoded[c],
+                        case["samples"]["input_encoded"][i][c]
                     );
                 }
             }

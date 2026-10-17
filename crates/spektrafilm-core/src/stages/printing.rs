@@ -4,7 +4,7 @@
 use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::pchip3d::{PreparedPchip3d, pchip_interp, prepare_pchip_3d};
+use spektrafilm_math::lut::TetrahedralLut;
 use spektrafilm_math::precision::from_f64;
 
 use crate::params::RuntimeParams;
@@ -41,7 +41,7 @@ fn build_lut_grid(steps: usize, data_min: [f64; 3], data_max: [f64; 3]) -> Image
 }
 
 /// Run `print_spectral` on a `steps³` grid of CMY inputs spanning
-/// `[data_min, data_max]` per channel, then PCHIP-interpolate the
+/// `[data_min, data_max]` per channel, then tetrahedral-interpolate the
 /// full image against that LUT. Bit-parity with Python's
 /// `_lut_service.spectral_compute_enlarger(use_lut=True)` path.
 #[allow(clippy::too_many_arguments)]
@@ -57,7 +57,32 @@ fn print_spectral_via_lut(
     data_min: [f64; 3],
     data_max: [f64; 3],
     steps: usize,
+    monochrome: bool,
 ) -> ImageBuf {
+    if monochrome {
+        let axis: Vec<_> = (0..1024)
+            .map(|i| data_min[0] + (data_max[0] - data_min[0]) * i as f64 / 1023.)
+            .collect();
+        let grid = ImageBuf::from_data(
+            1024,
+            1,
+            axis.iter().flat_map(|d| [from_f64(*d); 3]).collect(),
+        );
+        let samples = backend.print_spectral(
+            &grid,
+            channel_density,
+            base_density,
+            print_illuminant,
+            print_sensitivity,
+            exposure_factor,
+            preflash,
+        );
+        let values: Vec<[f64; 3]> = samples
+            .pixels()
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .collect();
+        return backend.density_curve_interp(cmy_film, &axis, &values, 1.);
+    }
     let grid = build_lut_grid(steps, data_min, data_max);
     let lut_image = backend.print_spectral(
         &grid,
@@ -69,22 +94,24 @@ fn print_spectral_via_lut(
         preflash,
     );
     // Convert Scalar storage to f64 — no-op cast in precision-f64 mode,
-    // a widening in f32 mode. The PCHIP slopes are computed in f64
-    // regardless to match Python's f64 LUT type.
+    // a widening in f32 mode, matching Python's f64 LUT type.
     let lut_f64: Vec<f64> = lut_image.data.iter().map(|&v| v as f64).collect();
-    let prepared = prepare_pchip_3d(lut_f64, steps);
+    let prepared = TetrahedralLut {
+        size: steps,
+        data: lut_f64,
+    };
     backend
-        .pchip3d(cmy_film, &prepared, data_min, data_max)
-        .unwrap_or_else(|| apply_pchip_lut(cmy_film, &prepared, data_min, data_max))
+        .tetrahedral3d(cmy_film, &prepared, data_min, data_max)
+        .unwrap_or_else(|| apply_spectral_lut(cmy_film, &prepared, data_min, data_max))
 }
 
-/// Apply a prepared PCHIP LUT to every pixel. Mirrors Python's
+/// Apply a prepared tetrahedral LUT to every pixel. Mirrors Python's
 /// `compute_with_lut` normalisation (`(x - xmin) / (xmax - xmin)`)
-/// followed by `_apply_lut_pchip_3d_prepared` (which multiplies by
+/// followed by tetrahedral sampling (which multiplies by
 /// `size - 1` and interpolates). Rayon-parallel per pixel.
-fn apply_pchip_lut(
+fn apply_spectral_lut(
     image: &ImageBuf,
-    prepared: &PreparedPchip3d,
+    prepared: &TetrahedralLut,
     data_min: [f64; 3],
     data_max: [f64; 3],
 ) -> ImageBuf {
@@ -102,7 +129,7 @@ fn apply_pchip_lut(
             let r = (src[0] as f64 - data_min[0]) * inv[0];
             let g = (src[1] as f64 - data_min[1]) * inv[1];
             let b = (src[2] as f64 - data_min[2]) * inv[2];
-            let v = pchip_interp(prepared, r, g, b);
+            let v = prepared.sample([r, g, b]);
             dst[0] = from_f64(v[0]);
             dst[1] = from_f64(v[1]);
             dst[2] = from_f64(v[2]);
@@ -197,7 +224,7 @@ pub fn expose_calibrated(
     //
     // If `use_enlarger_lut` is set, evaluate the spectral function on
     // a `lut_resolution³` grid of cmy values (4913 nodes at the
-    // default resolution=17) and PCHIP-interpolate per pixel.
+    // default resolution=17) and tetrahedral-interpolate per pixel.
     // Matches Python's `_lut_service.spectral_compute_enlarger`.
     let mut log_raw_print = if params.settings.use_enlarger_lut {
         let (data_min, data_max) = enlarger_lut_bounds(film, params);
@@ -213,6 +240,7 @@ pub fn expose_calibrated(
             data_min,
             data_max,
             params.settings.lut_resolution as usize,
+            film.is_bw(),
         )
     } else {
         backend.print_spectral(
@@ -306,7 +334,7 @@ pub fn develop(
     // coupled-gamma morph when active), interpolated at gamma 1. Upstream
     // 0.3.4 has no stored-curve print path at all; the fallback below covers
     // model-less custom profiles and evaluation errors.
-    let morph = &params.print_render.density_curves_morph;
+    let morph = &params.print_render.chemistry;
     if let Some(model) = print.data.density_curves_model.as_ref() {
         match crate::print_morph::morph_density_curves(
             &log_exposure,

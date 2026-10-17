@@ -12,6 +12,7 @@ struct Params {
     positive: u32,
     _pad0: u32,
     _pad1: u32,
+    donor_k: vec4<f32>,
     density_max: vec4<f32>, // .xyz used, .w padding
     // Row-major couplers matrix [3][3], packed as three vec4s
     // (.w padding to satisfy std140 alignment).
@@ -37,6 +38,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     if params.positive != 0u {
         silver = params.density_max.xyz - silver;
+    } else {
+        for (var c=0u;c<3u;c++) {
+            let k=params.donor_k[c];
+            if k<3.402823e38 {silver[c]=select(0.,silver[c]*(k+0.5*params.density_max[c])/(k+silver[c]),k+silver[c]!=0.);}
+        }
     }
 
     // correction[m] = silver[0]*M[0][m] + silver[1]*M[1][m] + silver[2]*M[2][m]

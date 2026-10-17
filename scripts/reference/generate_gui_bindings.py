@@ -1,7 +1,7 @@
 """Import paths for Python v0.3.4 GUI state files (development only)."""
 from pathlib import Path
 import json
-from spektrafilm_gui import param_manifest as m
+from spektrafilm_gui import params_manifest as m
 bindings={}
 for section,group in [('input_image',m.INPUT_IMAGE_FIELDS),('special',m.SPECIAL_FIELDS),('simulation',m.SIMULATION_FIELDS)]:
  for spec in group:
@@ -13,6 +13,7 @@ for section,group in [('input_image',m.INPUT_IMAGE_FIELDS),('special',m.SPECIAL_
   elif path=='film_channel_swap':dst='params.film_render.channel_order'
   elif path=='print_channel_swap':dst='params.print_render.channel_order'
   elif path=='workflow.auto_preview':dst='auto_preview'
+  elif path in ['workflow.route','route']:dst='params.workflow.route'
   elif path.startswith('workflow.'):continue
   else:dst='params.'+path
   bindings[section+'.'+spec.leaf]=dst
@@ -24,4 +25,6 @@ for spec in m.DISPLAY_PANEL_FIELDS:
  for section in ['display','gui_only.display']:
   bindings[section+'.'+spec.leaf]=dst
   bindings[section+'.'+spec.path]=dst
+# Keep imports of existing main-branch GUI state files working.
+bindings.update({'simulation.scan_film':'params.io.scan_film','simulation.io.scan_film':'params.io.scan_film'})
 Path('crates/spektrafilm-gui/src/python_gui_bindings.json').write_text(json.dumps(bindings,indent=2)+'\n')

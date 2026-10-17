@@ -45,7 +45,7 @@ fn ray_polygon_distance(origin: [f64; 2], direction: [f64; 2], polygon: &[[f64; 
         // origin + t·direction = a + s·edge
         let t = (-ox * ey + oy * ex) / denom;
         let s = (-ox * dy + oy * dx) / denom;
-        if t > 1e-9 && (0.0..=1.0).contains(&s) && t < t_min {
+        if t > 1e-9 && (-1e-9..=1.0 + 1e-9).contains(&s) && t < t_min {
             t_min = t;
         }
     }
@@ -118,6 +118,67 @@ impl InputGamutCompress {
                 Vec::new()
             },
         })
+    }
+
+    pub fn set_boundary(
+        &mut self,
+        boundary: &str,
+        detail: f64,
+        white: [f64; 2],
+    ) -> Result<(), String> {
+        if !detail.is_finite() || detail <= 0. {
+            return Err("input gamut hull detail must be positive".into());
+        }
+        if boundary == "locus" || !self.active {
+            return Ok(());
+        }
+        if boundary != "inscribed_hull" {
+            return Err(format!("unknown input gamut boundary: {boundary}"));
+        }
+        use rustfft::{FftPlanner, num_complex::Complex};
+        let n = 1024usize;
+        let directions: Vec<_> = (0..n)
+            .map(|i| {
+                let t = i as f64 * std::f64::consts::TAU / n as f64;
+                [t.cos(), t.sin()]
+            })
+            .collect();
+        let reach: Vec<_> = directions
+            .iter()
+            .map(|&d| ray_polygon_distance(white, d, &self.locus))
+            .collect();
+        if reach.iter().any(|v| !v.is_finite()) {
+            return Err("input gamut hull has no finite boundary".into());
+        }
+        let mut frequencies: Vec<_> = reach.iter().map(|r| Complex::new(*r, 0.)).collect();
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(n).process(&mut frequencies);
+        for (i, f) in frequencies.iter_mut().enumerate() {
+            let k = i.min(n - i) as f64;
+            *f *= (-0.5 * (k / detail).powi(2)).exp();
+        }
+        planner.plan_fft_inverse(n).process(&mut frequencies);
+        let radii: Vec<_> = frequencies
+            .iter()
+            .map(|f| (f.re / n as f64).max(1e-12))
+            .collect();
+        let inscribe = reach
+            .iter()
+            .zip(&radii)
+            .map(|(a, b)| a / b)
+            .fold(f64::INFINITY, f64::min);
+        self.locus = directions
+            .iter()
+            .zip(radii)
+            .map(|(d, r)| {
+                [
+                    white[0] + inscribe * r * d[0],
+                    white[1] + inscribe * r * d[1],
+                ]
+            })
+            .collect();
+        self.locus.push(self.locus[0]);
+        Ok(())
     }
 
     pub fn is_active(&self) -> bool {

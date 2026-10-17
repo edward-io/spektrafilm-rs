@@ -21,6 +21,7 @@ struct Spec {
     qa_print_index: Option<usize>,
     input_gamut_compress: InputGamutCompressParams,
     output_gamut_compress: serde_json::Value,
+    exposure_ev: f64,
     stops_above_midgray: serde_json::Value,
     ocio_config: bool,
     include_combinations: bool,
@@ -40,8 +41,12 @@ impl Default for Spec {
             qa: false,
             qa_print_index: None,
             input_gamut_compress: Default::default(),
-            output_gamut_compress: serde_json::to_value(OutputGamutCompressParams::default())
-                .unwrap(),
+            output_gamut_compress: serde_json::to_value(OutputGamutCompressParams {
+                algorithm: "cam16ucs".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+            exposure_ev: 0.,
             stops_above_midgray: serde_json::json!("auto"),
             ocio_config: false,
             include_combinations: false,
@@ -76,6 +81,8 @@ pub struct Overrides {
         allow_hyphen_values = true
     )]
     stops: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    exposure_ev: Option<f64>,
     #[arg(long)]
     qa: bool,
     #[arg(long)]
@@ -95,6 +102,7 @@ impl Overrides {
             };
         }
         replace!(name, name);
+        replace!(exposure_ev, exposure_ev);
         replace!(film_profile, film);
         replace!(input_color_space, input_space);
         replace!(output_color_space, output_space);
@@ -169,12 +177,24 @@ pub fn build(
     }
     let input = lut_export::space(&spec.input_color_space).map_err(anyhow::Error::msg)?;
     let out = lut_export::space(&spec.output_color_space).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        spec.exposure_ev.is_finite(),
+        "LUT exposure EV must be finite"
+    );
+    anyhow::ensure!(
+        spec.exposure_ev == 0. || spec.stops_above_midgray == "auto",
+        "choose exposure_ev or legacy stops_above_midgray"
+    );
     let gain = if spec.stops_above_midgray.is_null() {
         Some(1.)
     } else if let Some(stops) = spec.stops_above_midgray.as_f64() {
         Some(0.18 * 2f64.powf(stops) / input.curve.decode(1.))
     } else if spec.stops_above_midgray == "auto" {
-        None
+        if spec.exposure_ev == 0. {
+            None
+        } else {
+            Some(input.auto_gain * 2f64.powf(spec.exposure_ev))
+        }
     } else {
         bail!("stops_above_midgray must be a number, null (JSON), or 'auto'");
     };

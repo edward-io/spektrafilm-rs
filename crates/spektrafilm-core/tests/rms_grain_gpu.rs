@@ -1,4 +1,4 @@
-//! The resident simple grain kernel must produce the reference law and texture.
+//! The resident physical RMS grain kernel must produce the reference law and texture.
 use spektrafilm_core::{params::RuntimeParams, pipeline::Pipeline, profile::load_profile_by_name};
 use spektrafilm_math::{image::ImageBuf, precision::from_f64};
 fn stats(image: &ImageBuf, c: usize) -> (f64, f64) {
@@ -11,7 +11,7 @@ fn stats(image: &ImageBuf, c: usize) -> (f64, f64) {
     (mean, var)
 }
 #[test]
-fn resident_simple_grain_is_repeatable_and_preserves_reference_statistics() {
+fn resident_rms_grain_is_repeatable_and_preserves_reference_statistics() {
     let Some(gpu) = spektrafilm_gpu::wgpu_backend::WgpuBackend::new() else {
         return;
     };
@@ -22,11 +22,11 @@ fn resident_simple_grain_is_repeatable_and_preserves_reference_statistics() {
     params.camera.film_format_mm = 2.048;
     params.film_render.halation.active = false;
     params.film_render.dir_couplers.active = false;
-    params.film_render.grain.sublayers_active = false;
+    params.settings.apply_stock_specifics = false;
     params.print_render.glare.active = false;
     params.scanner.unsharp_mask = [0., 0.];
-    for (layers, blur) in [(1, 0.), (4, 0.7), (3, 4.)] {
-        params.film_render.grain.n_sub_layers = layers;
+    for (rms, blur) in [(3., 0.), (6., 0.7), (12., 4.)] {
+        params.film_render.grain.rms_granularity = [rms; 3];
         params.film_render.grain.blur = blur;
         let p = Pipeline::new_with_spectral(
             load_profile_by_name(&data, "kodak_portra_400").unwrap(),
@@ -40,20 +40,21 @@ fn resident_simple_grain_is_repeatable_and_preserves_reference_statistics() {
         let repeat = p.process_resident_borrowed(&image, &gpu).unwrap();
         assert_eq!(
             output.data, repeat.data,
-            "simple GPU grain is not repeatable"
+            "physical GPU grain is not repeatable"
         );
         for c in 0..3 {
             let (a, va) = stats(&reference, c);
             let (b, vb) = stats(&output, c);
-            eprintln!(
-                "simple layers {layers}, blur {blur}, channel {c}: mean {a}/{b}, variance {va}/{vb}"
+            eprintln!("RMS {rms}, blur {blur}, channel {c}: mean {a}/{b}, variance {va}/{vb}");
+            assert!((a - b).abs() < 0.003, "physical RMS grain changed tone");
+            assert!(
+                vb > 1e-9,
+                "physical RMS grain kernel did not write its texture"
             );
-            assert!((a - b).abs() < 0.003, "simple grain changed tone");
-            assert!(vb > 1e-9, "simple grain kernel did not write its texture");
             if blur < 1. {
                 assert!(
                     (vb / va - 1.).abs() < 0.06,
-                    "simple grain variance drift {}",
+                    "physical RMS grain variance drift {}",
                     vb / va
                 );
             }

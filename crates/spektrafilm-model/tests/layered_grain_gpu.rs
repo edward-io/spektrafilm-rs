@@ -40,8 +40,9 @@ fn gpu_layered_grain_matches_cpu_statistics_and_controls() {
             .collect(),
     );
     let mut p = LayeredGrainParams {
-        particle_area: 0.2,
-        channel_scale: [1.6, 1.6, 3.2],
+        rms_granularity: [8., 8., 12.],
+        usm_sigma: 0.,
+        usm_amount: 0.,
         layer_scale: [2., 1., 0.5],
         density_min: [0.03; 3],
         uniformity: [0.97, 0.99, 0.97],
@@ -51,7 +52,7 @@ fn gpu_layered_grain_matches_cpu_statistics_and_controls() {
         monochrome: false,
         fast_stats: false,
     };
-    for case in 0..3 {
+    for case in 0..4 {
         if case == 1 {
             p.blur = 0.65;
             p.dye_cloud_blur = 5.;
@@ -60,6 +61,12 @@ fn gpu_layered_grain_matches_cpu_statistics_and_controls() {
             p.micro_structure = [2., 1000.];
             curves.reverse();
             layers.reverse();
+        }
+        if case == 3 {
+            curves.reverse();
+            layers.reverse();
+            p.usm_sigma = 0.7;
+            p.usm_amount = 1.5;
         }
         let a = apply_grain_to_density_layers(&input, 5., &curves, &layers, case == 2, &p, &cpu);
         let b = apply_grain_to_density_layers(&input, 5., &curves, &layers, case == 2, &p, &gpu);
@@ -85,8 +92,11 @@ fn gpu_layered_grain_matches_cpu_statistics_and_controls() {
     p.blur = 0.;
     p.dye_cloud_blur = 0.;
     p.micro_structure = [0., 0.];
+    p.usm_amount = 0.;
     let a = apply_grain_to_density_layers(&input, 5., &curves, &layers, false, &p, &gpu);
-    p.particle_area *= 4.;
+    for rms in &mut p.rms_granularity {
+        *rms *= 2.;
+    }
     let b = apply_grain_to_density_layers(&input, 5., &curves, &layers, false, &p, &gpu);
     for c in 0..3 {
         let (ma, va) = stats(&a, c);

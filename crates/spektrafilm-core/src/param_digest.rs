@@ -3,6 +3,93 @@ use crate::params::*;
 impl RuntimeParams {
     pub fn validate(&self) -> Result<(), String> {
         spektrafilm_math::illuminants::get(&self.enlarger.illuminant)?;
+        spektrafilm_math::illuminants::get(&self.film_render.convert.scan_illuminant)?;
+        crate::spectral_service::taking_filter(&self.camera.color_filter)?;
+        if ![
+            "input",
+            "input > film > scan",
+            "input > film > print > scan",
+            "input > convert-film > print > scan",
+            "input > convert-film > scan-minus-base",
+            "input > convert-film > scan",
+        ]
+        .contains(&self.route())
+        {
+            return Err(format!("unknown workflow route: {}", self.route()));
+        }
+        if !["locus", "inscribed_hull"].contains(&self.io.input_gamut_compress.boundary.as_str())
+            || !self.io.input_gamut_compress.hull_detail.is_finite()
+            || self.io.input_gamut_compress.hull_detail <= 0.
+        {
+            return Err("invalid input gamut boundary or hull detail".into());
+        }
+        for chemistry in [&self.film_render.chemistry, &self.print_render.chemistry] {
+            if ![
+                chemistry.gamma_factor,
+                chemistry.gamma_factor_fast,
+                chemistry.gamma_factor_slow,
+                chemistry.gamma_factor_red,
+                chemistry.gamma_factor_green,
+                chemistry.gamma_factor_blue,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.)
+                || !chemistry.developer_exhaustion.is_finite()
+                || !(0. ..=1.).contains(&chemistry.developer_exhaustion)
+                || chemistry
+                    .development_time
+                    .is_some_and(|v| !v.is_finite() || v <= 0.)
+            {
+                return Err("invalid chemistry gamma, exhaustion or development time".into());
+            }
+        }
+        for base in [&self.film_render.base, &self.print_render.base] {
+            if ![base.scale, base.cyan, base.magenta, base.yellow]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.)
+                || !base.tilt.is_finite()
+            {
+                return Err(
+                    "base density requires finite nonnegative scale and CMY factors".into(),
+                );
+            }
+        }
+        let convert = &self.film_render.convert;
+        if !convert.exposure_compensation_ev.is_finite()
+            || !2f64.powf(convert.exposure_compensation_ev).is_finite()
+            || !convert.base_percentile.is_finite()
+            || !(0. ..=100.).contains(&convert.base_percentile)
+        {
+            return Err(
+                "conversion requires finite exposure and a base percentile in [0,100]".into(),
+            );
+        }
+        let dir = &self.film_render.dir_couplers;
+        if !dir
+            .langmuir_donor_k_rgb
+            .iter()
+            .chain(&dir.langmuir_receiver_k_rgb)
+            .all(|v| !v.is_nan() && *v > 0.)
+        {
+            return Err("DIR Langmuir knees must be positive".into());
+        }
+        let grain = &self.film_render.grain;
+        if !grain
+            .rms_granularity
+            .iter()
+            .chain(&grain.particle_scale_sublayers)
+            .all(|v| v.is_finite() && *v > 0.)
+            || ![grain.mult_usm_sigma, grain.mult_usm_amount]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.)
+        {
+            return Err(
+                "grain RMS and sublayer scales must be positive, sharpening nonnegative".into(),
+            );
+        }
+        if !(2..=129).contains(&self.settings.convert_lut_resolution) {
+            return Err("convert LUT resolution must be between 2 and 129".into());
+        }
         for mut order in [
             self.film_render.channel_order,
             self.print_render.channel_order,
@@ -107,7 +194,7 @@ impl RuntimeParams {
         if start > end {
             return Err("collect tap precedes inject tap".into());
         }
-        if self.io.scan_film && ((start == 4 || start == 5) || (end == 4 || end == 5)) {
+        if self.scans_film() && ((start == 4 || start == 5) || (end == 4 || end == 5)) {
             return Err("print taps are unavailable in scan_film mode".into());
         }
         Ok(())
@@ -115,11 +202,39 @@ impl RuntimeParams {
 
     /// Apply the same preview/debug regime as Python's digest_params.
     pub fn digest(&mut self) {
+        self.film_render.grain.sublayers_active = true;
+        self.io.scan_film = self.scans_film();
+        if self.io.scan_film {
+            self.film_render.glare.active = false;
+        }
+        for (gamma, chemistry) in [
+            (
+                &mut self.film_render.density_curve_gamma,
+                &mut self.film_render.chemistry,
+            ),
+            (
+                &mut self.print_render.density_curve_gamma,
+                &mut self.print_render.chemistry,
+            ),
+        ] {
+            if *gamma != 1. {
+                chemistry.active = true;
+                chemistry.gamma_factor *= *gamma as f64;
+                *gamma = 1.;
+            }
+        }
+        if self.film_render.chemistry.development_time.is_none() {
+            self.film_render.chemistry.development_time = self.film_render.development_time;
+        }
+        if self.print_render.chemistry.development_time.is_none() {
+            self.print_render.chemistry.development_time = self.print_render.development_time;
+        }
         if self.settings.preview_mode {
             self.enlarger.lens_blur = 0.;
             self.film_render.dir_couplers.diffusion_size_um = 0.;
             self.film_render.grain.active = false;
             self.film_render.grain.blur = 0.;
+            self.film_render.grain.mult_usm_amount = 0.;
             self.print_render.glare.blur = 0.;
             self.film_render.glare.blur = 0.;
             self.camera.lens_blur_um = 0.;
@@ -133,6 +248,13 @@ impl RuntimeParams {
             self.camera.exposure_compensation_ev = 0.;
             self.enlarger.print_exposure_compensation = false;
             self.enlarger.print_exposure = 1.;
+            self.enlarger.preflash_exposure = 0.;
+            self.enlarger.m_filter_shift = 0.;
+            self.enlarger.y_filter_shift = 0.;
+            self.io.crop = false;
+            self.io.upscale_factor = 1.;
+            self.settings.use_enlarger_lut = false;
+            self.settings.use_scanner_lut = false;
             self.film_render.halation.boost_ev = 0.;
             self.scanner.white_correction = false;
             self.scanner.black_correction = false;
@@ -142,6 +264,7 @@ impl RuntimeParams {
             self.film_render.halation.active = false;
             self.film_render.dir_couplers.diffusion_size_um = 0.;
             self.film_render.grain.blur = 0.;
+            self.film_render.grain.mult_usm_amount = 0.;
             self.film_render.grain.blur_dye_clouds_um = 0.;
             self.print_render.glare.blur = 0.;
             self.film_render.glare.blur = 0.;

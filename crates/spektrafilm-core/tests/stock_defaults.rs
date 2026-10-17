@@ -13,8 +13,10 @@ fn gui_stock_seeding_preserves_subsequent_low_level_edits() {
     assert!(!params.settings.apply_stock_specifics);
     assert_eq!(
         params.film_render.dir_couplers.gamma_samelayer_rgb,
-        [0.336, 0.319, 0.273]
+        [0.5159, 0.5934, 0.2829]
     );
+    assert_eq!(params.film_render.grain.rms_granularity, [4.5; 3]);
+    params.film_render.grain.rms_granularity = [7., 8., 9.];
     params.film_render.dir_couplers.gamma_samelayer_rgb = [0.1, 0.2, 0.3];
     params.film_render.halation.halation_strength = [0.01, 0.02, 0.03];
     params.film_render.halation.halation_first_sigma_um = [2., 4., 6.];
@@ -30,6 +32,10 @@ fn gui_stock_seeding_preserves_subsequent_low_level_edits() {
     assert_eq!(
         pipeline.params.film_render.halation.halation_first_sigma_um,
         [2., 4., 6.]
+    );
+    assert_eq!(
+        pipeline.params.film_render.grain.rms_granularity,
+        [7., 8., 9.]
     );
     let updated = pipeline.with_params(params);
     assert_eq!(

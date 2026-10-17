@@ -538,17 +538,12 @@ mod parity_tests {
 
         assert!(cref.has_remap(), "print path must build a luminance remap");
         let (m, q) = cref.xyz_remap.unwrap();
-        // Reference values from upstream 0.3.4's color_reference.py print
-        // path (SimulationPipeline at default params, corrections on):
-        //   m = 1.1805080822518117
-        //   q = -3.99466139952556459e-3
-        //   printing_exposure_correction = 1.0644087236240962
-        assert!((m - 1.1805080822518117).abs() < 1e-6, "m = {m}");
-        assert!((q - -3.99466139952556459e-3).abs() < 1e-7, "q = {q}");
+        let reference = crate::experimental_reference()["extra"]["color_reference"].clone();
+        assert!((m - reference["m"].as_f64().unwrap()).abs() < 1e-6, "m={m}");
+        assert!((q - reference["q"].as_f64().unwrap()).abs() < 1e-7, "q={q}");
         assert!(
-            (cref.printing_exposure_correction - 1.0644087236240962).abs() < 1e-6,
-            "printing_exposure_correction = {}",
-            cref.printing_exposure_correction
+            (cref.printing_exposure_correction - reference["printing"].as_f64().unwrap()).abs()
+                < 1e-6
         );
         assert_eq!(
             cref.filming_exposure_correction, 1.0,

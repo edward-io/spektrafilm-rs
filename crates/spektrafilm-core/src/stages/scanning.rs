@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_math::colorspace;
 use spektrafilm_math::image::ImageBuf;
-use spektrafilm_math::pchip3d::{pchip_interp, prepare_pchip_3d};
+use spektrafilm_math::lut::TetrahedralLut;
 use spektrafilm_math::precision::{Scalar, from_f64};
 use spektrafilm_math::spectral;
 
@@ -76,14 +76,14 @@ fn scanner_lut_bounds(profile: &Profile, params: &RuntimeParams) -> ([f64; 3], [
 }
 
 /// Build a 17³ log_xyz LUT (matching Python's `cmy_to_log_xyz`),
-/// PCHIP-interpolate per pixel, then apply `10^log_xyz → CAT →
+/// tetrahedral-interpolate per pixel, then apply `10^log_xyz → CAT →
 /// xyz_to_rgb` to get RGB. Glare is added after this returns in RGB
 /// space — algebraically equivalent to Python's add_glare-in-XYZ
 /// because the matrices are linear (see comment in `scan()` below).
 ///
 /// This LUTs the *same intermediate quantity* Python LUTs
 /// (`cmy_to_log_xyz`), not the post-`10^x`/post-matrix RGB output —
-/// keeps the PCHIP interpolating the smoother log10-domain surface
+/// keeps the tetrahedral interpolating the smoother log10-domain surface
 /// for bit-identical parity with Python's LUT path.
 #[allow(clippy::too_many_arguments)]
 fn scan_spectral_via_lut(
@@ -99,24 +99,53 @@ fn scan_spectral_via_lut(
     data_max: [f64; 3],
     steps: usize,
     color_ref: &crate::color_reference::ColorReference,
+    monochrome: bool,
 ) -> ImageBuf {
-    let grid = build_lut_grid(steps, data_min, data_max);
-    // log_xyz LUT — same function Python LUTs.
-    let lut_log_xyz = spektrafilm_gpu::cpu_backend::scan_log_xyz_cpu(
-        &grid,
-        channel_density,
-        base_density,
-        illuminant,
-        normalization,
-    );
-    let prepared = prepare_pchip_3d(lut_log_xyz, steps);
+    let one_dimensional = if monochrome {
+        let axis: Vec<_> = (0..1024)
+            .map(|i| data_min[0] + (data_max[0] - data_min[0]) * i as f64 / 1023.)
+            .collect();
+        let grid = ImageBuf::from_data(
+            1024,
+            1,
+            axis.iter().flat_map(|d| [from_f64(*d); 3]).collect(),
+        );
+        let flat = spektrafilm_gpu::cpu_backend::scan_log_xyz_cpu(
+            &grid,
+            channel_density,
+            base_density,
+            illuminant,
+            normalization,
+        );
+        let values: Vec<[f64; 3]> = flat.chunks_exact(3).map(|r| [r[0], r[1], r[2]]).collect();
+        Some(backend.density_curve_interp(density_cmy, &axis, &values, 1.))
+    } else {
+        None
+    };
+    let prepared = if one_dimensional.is_none() {
+        let grid = build_lut_grid(steps, data_min, data_max);
+        Some(TetrahedralLut {
+            size: steps,
+            data: spektrafilm_gpu::cpu_backend::scan_log_xyz_cpu(
+                &grid,
+                channel_density,
+                base_density,
+                illuminant,
+                normalization,
+            ),
+        })
+    } else {
+        None
+    };
     let scale = (steps - 1) as f64;
     let inv = [
         scale / (data_max[0] - data_min[0]),
         scale / (data_max[1] - data_min[1]),
         scale / (data_max[2] - data_min[2]),
     ];
-    let interpolated = backend.pchip3d(density_cmy, &prepared, data_min, data_max);
+    let interpolated = one_dimensional.or_else(|| {
+        backend.tetrahedral3d(density_cmy, prepared.as_ref().unwrap(), data_min, data_max)
+    });
     let mut out = density_cmy.clone();
     out.data
         .par_chunks_exact_mut(3)
@@ -129,7 +158,7 @@ fn scan_spectral_via_lut(
             let log_xyz = if let Some(interpolated) = &interpolated {
                 std::array::from_fn(|c| interpolated.data[index * 3 + c] as f64)
             } else {
-                pchip_interp(&prepared, r, g, b)
+                prepared.as_ref().unwrap().sample([r, g, b])
             };
             // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
             // `_density_to_rgb` AFTER the LUT call. bw_correction and
@@ -237,7 +266,7 @@ pub fn scan(
     // applies the two matrices in sequence — we pass them separately.
     //
     // `use_scanner_lut` path: evaluate `scan_spectral` on a 17³ CMY
-    // grid and PCHIP-interpolate per pixel. Glare is added in RGB
+    // grid and tetrahedral-interpolate per pixel. Glare is added in RGB
     // space after this returns (the existing post-step at the bottom
     // of this function), so swapping to the LUT path is glare-safe.
     // The faithful B&W/slide luminance remap (color_ref.has_remap) applies
@@ -260,6 +289,7 @@ pub fn scan(
             data_max,
             params.settings.lut_resolution as usize,
             color_ref,
+            profile.is_bw(),
         )
     } else {
         backend.scan_spectral(

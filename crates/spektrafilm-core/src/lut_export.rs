@@ -21,7 +21,7 @@ impl LutSpace {
                 if v <= 0.5 {
                     v * v / 3.
                 } else {
-                    (((v - 0.55991073) / 0.17883277).exp() + 0.28466892) / 12.
+                    (((v - 0.559910729529562) / 0.17883277).exp() + 0.28466892) / 12.
                 }
             });
             let y = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
@@ -43,7 +43,7 @@ impl LutSpace {
                 if e <= 1. / 12. {
                     (3. * e).max(0.).sqrt()
                 } else {
-                    0.17883277 * (12. * e - 0.28466892).ln() + 0.55991073
+                    0.17883277 * (12. * e - 0.28466892).ln() + 0.559910729529562
                 }
             })
         } else {
@@ -137,6 +137,9 @@ pub fn reference_image(
     }
     let mut params = options.params.clone();
     params.debug.lut_mode = true;
+    params.settings.preview_mode = false;
+    params.workflow.route = "input > film > print > scan".into();
+    params.io.scan_film = false;
     params.io.input_color_space = input.primaries.into();
     params.io.output_color_space = output.primaries.into();
     params.io.input_cctf_decoding = false;

@@ -5,6 +5,7 @@
 // a control changes. The output texture is uploaded to egui once per
 // render; the panel scales it to fit.
 
+mod calibration_ui;
 mod icons;
 mod lut_ui;
 mod paper_back;
@@ -261,6 +262,7 @@ struct App {
     paper_tex: Option<egui::TextureHandle>,
     paper_size: Option<[usize; 2]>,
     animation: Option<(Instant, bool)>,
+    calibration_job: Option<calibration_ui::Job>,
     pipeline_cache_key: Option<String>,
     pipeline_cache: Option<Pipeline>,
     last_render_ms: f32,
@@ -443,6 +445,7 @@ impl App {
             canvas_paper: None,
             paper_tex: None,
             paper_size: None,
+            calibration_job: None,
             pipeline_cache_key: None,
             pipeline_cache: None,
             last_render_ms: 0.0,
@@ -802,7 +805,7 @@ impl App {
                                 .map_err(|e| format!("film profile: {e}"))?;
                             let print = profile::load_profile_by_name(
                                 &data_dir,
-                                if params.io.scan_film {
+                                if params.scans_film() {
                                     &film_name
                                 } else {
                                     &print_name
@@ -823,6 +826,7 @@ impl App {
                     .to_string();
                     if backend.is_gpu()
                         && pipeline.params.film_render.grain.active
+                        && !pipeline.params.converts_film()
                         && pipeline.params.film_render.grain.sublayers_active
                         && !backend.supports_layered_grain()
                     {
@@ -831,7 +835,7 @@ impl App {
                     let output = match () {
                         () if pipeline.params.io.crop
                             || (pipeline.params.io.upscale_factor - 1.).abs() > 1e-6
-                            || (pipeline.params.io.scan_film && pipeline.film.is_positive()) =>
+                            || (pipeline.params.scans_film() && pipeline.film.is_positive()) =>
                         {
                             pipeline.process((*image).clone(), backend.as_ref())
                         }
@@ -1563,6 +1567,45 @@ impl App {
                 self.dirty_since = None;
             }
         });
+        let route = self.params.route().to_owned();
+        let mut selected = route.clone();
+        tooltips::combo(
+            ui,
+            egui::ComboBox::from_id_salt("workflow").selected_text(match selected.as_str() {
+                "input" => "Input only",
+                "input > film > scan" => "Film → scan",
+                "input > film > print > scan" => "Film → print → scan",
+                "input > convert-film > print > scan" => "Negative scan → print",
+                "input > convert-film > scan-minus-base" => "Negative scan → dyes",
+                _ => "Negative scan → scan",
+            }),
+            "Workflow",
+            "Choose whether to simulate film, convert a scanned negative, or pass the input through.",
+            |ui| {
+                for route in [
+                    "input",
+                    "input > film > scan",
+                    "input > film > print > scan",
+                    "input > convert-film > print > scan",
+                    "input > convert-film > scan-minus-base",
+                    "input > convert-film > scan",
+                ] {
+                    ui.selectable_value(&mut selected,route.to_owned(),route).on_hover_text(match route {
+                    "input"=>"Convert input to the output color space without film simulation.",
+                    "input > film > scan"=>"Expose and develop film, then scan it directly.",
+                    "input > film > print > scan"=>"Expose film, print it onto paper, then scan the print.",
+                    "input > convert-film > print > scan"=>"Recover dye densities from a scanned negative and print them.",
+                    "input > convert-film > scan-minus-base"=>"Recover film dye densities and scan them without the film base.",
+                    _=>"Recover film dye densities and scan them under the selected scan illuminant.",
+                });
+                }
+            },
+        );
+        if selected != route {
+            self.params.workflow.route = selected;
+            self.params.digest();
+            self.dirty = true;
+        }
         // ── Profiles ────────────────────────────────────────────────────
         egui::CollapsingHeader::new("Profiles")
             .default_open(true)
@@ -1571,7 +1614,7 @@ impl App {
                     profile_combo(ui, "film", "Film stock", &self.films, &mut self.film_name);
                 if film_changed {
                     self.film_dev_times = Vec::new();
-                    self.params.film_render.development_time = None;
+                    self.params.film_render.chemistry.development_time = None;
                     if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name)
                     {
                         // Slide/positive stocks have no print paper — they
@@ -1579,7 +1622,15 @@ impl App {
                         // paired `target_print`. Auto-follow the film type
                         // so switching stocks doesn't leave a wrong (or, for
                         // a paperless slide, a failed) render.
-                        self.params.io.scan_film = film.is_positive();
+                        if !self.params.converts_film() && self.params.route() != "input" {
+                            self.params.io.scan_film = film.is_positive();
+                            self.params.workflow.route = if film.is_positive() {
+                                "input > film > scan"
+                            } else {
+                                "input > film > print > scan"
+                            }
+                            .into();
+                        }
                         spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
                         self.film_dev_times = film.data.development_time.clone();
                         if let Some(target) = film.info.target_print.as_deref()
@@ -1589,7 +1640,7 @@ impl App {
                             self.print_name = target.to_string();
                             self.print_dev_times =
                                 profile_dev_times(&self.data_dir, &self.print_name);
-                            self.params.print_render.development_time = None;
+                            self.params.print_render.chemistry.development_time = None;
                         }
                     }
                     self.dirty = true;
@@ -1603,7 +1654,7 @@ impl App {
                         "film_dev_time",
                         "Development time",
                         &self.film_dev_times.clone(),
-                        &mut self.params.film_render.development_time,
+                        &mut self.params.film_render.chemistry.development_time,
                     )
                 {
                     self.dirty = true;
@@ -1611,15 +1662,15 @@ impl App {
                 // Slide films are scanned directly, so the print paper is
                 // unused — disable the picker and say why rather than
                 // letting it silently affect nothing.
-                if self.params.io.scan_film {
+                if self.params.scans_film() {
                     ui.label(
-                        egui::RichText::new("Slide film — scanned directly (no print paper).")
+                        egui::RichText::new("Film scanned directly (no print paper).")
                             .italics()
                             .small(),
                     );
                 }
                 let paper_changed = ui
-                    .add_enabled_ui(!self.params.io.scan_film, |ui| {
+                    .add_enabled_ui(!self.params.scans_film(), |ui| {
                         profile_combo(
                             ui,
                             "paper",
@@ -1631,17 +1682,17 @@ impl App {
                     .inner;
                 if paper_changed {
                     self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
-                    self.params.print_render.development_time = None;
+                    self.params.print_render.chemistry.development_time = None;
                     self.dirty = true;
                 }
-                if !self.params.io.scan_film
+                if !self.params.scans_film()
                     && self.print_dev_times.len() > 1
                     && dev_time_combo(
                         ui,
                         "print_dev_time",
                         "Print development time",
                         &self.print_dev_times.clone(),
-                        &mut self.params.print_render.development_time,
+                        &mut self.params.print_render.chemistry.development_time,
                     )
                 {
                     self.dirty = true;
@@ -1925,6 +1976,10 @@ impl App {
                     tooltips::CONTROL_TAIL_WEIGHT_2,
                 )
                 .changed();
+                for c in 0..3 {
+                    changed|=tooltips::labeled(ui,egui::Slider::new(&mut d.langmuir_donor_k_rgb[c],0.01..=20.).logarithmic(true),format!("Donor knee {}",["R","G","B"][c]),"Negative-film inhibitor release knee as a fraction of maximum density; larger values approach a linear donor.").changed();
+                    changed|=tooltips::labeled(ui,egui::Slider::new(&mut d.langmuir_receiver_k_rgb[c],0.01..=20.).logarithmic(true),format!("Receiver knee {}",["R","G","B"][c]),"Reversal-film receiver saturation after diffusion, relative to its inhibitor ceiling.").changed();
+                }
                 egui::CollapsingHeader::new("Inhibition matrix")
                     .show(ui, |ui| {
                         changed |= tooltips::labeled(
@@ -2070,6 +2125,33 @@ impl App {
             .header_response
             .on_hover_text(tooltips::SECTION_DIFFUSION_FILTER_LENS);
 
+        egui::CollapsingHeader::new("Taking filter").show(ui, |ui| {
+            let mut changed = false;
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("taking_filter")
+                    .selected_text(&self.params.camera.color_filter),
+                "Color filter",
+                "Measured transmission of a filter placed in front of the taking lens.",
+                |ui| {
+                    for name in [
+                        "none", "hoya_x0", "hoya_x1", "hoya_y2", "hoya_ya3", "hoya_r1",
+                    ] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.camera.color_filter,
+                                name.into(),
+                                name,
+                            )
+                            .changed();
+                    }
+                },
+            );
+            if changed {
+                self.dirty = true;
+            }
+        });
+
         // ── Grain ───────────────────────────────────────────────────────
         egui::CollapsingHeader::new("Grain")
             .default_open(true)
@@ -2078,13 +2160,11 @@ impl App {
                 let mut changed = false;
                 changed |= tooltips::checkbox(ui, &mut g.active, "Active", tooltips::ENABLE_GRAIN)
                     .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut g.agx_particle_area_um2, 0.05..=1.0),
-                    "Particle area (µm²)",
-                    tooltips::CONTROL_PARTICLE_AREA_UM2,
-                )
-                .changed();
+                for c in 0..3 {
+                    changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.rms_granularity[c],0.1..=60.),format!("RMS granularity {}",["R","G","B"][c]),"Peak density noise in thousandths, measured with a 48 µm aperture; higher values give coarser grain.").changed();
+                }
+                changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.mult_usm_sigma,0. ..=3.),"Grain sharpening σ","Blur radius in pixels used by the multiplicative grain sharpen.").changed();
+                changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.mult_usm_amount,0. ..=3.),"Grain sharpening amount","Sharpen absolute grain density while preserving each channel's mean density.").changed();
                 changed |= tooltips::labeled(
                     ui,
                     egui::Slider::new(&mut g.blur, 0.0..=3.0),
@@ -2092,22 +2172,6 @@ impl App {
                     tooltips::CONTROL_POST_BLUR_SIGMA,
                 )
                 .changed();
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut g.sublayers_active,
-                    "Physical emulsion layers",
-                    tooltips::CONTROL_PHYSICAL_EMULSION_LAYERS,
-                )
-                .changed();
-                if !g.sublayers_active {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut g.n_sub_layers, 1..=4),
-                        "Simple grain layers",
-                        tooltips::CONTROL_SIMPLE_GRAIN_LAYERS,
-                    )
-                    .changed();
-                }
                 if changed {
                     self.dirty = true;
                 }
@@ -2119,11 +2183,7 @@ impl App {
         egui::CollapsingHeader::new("Glare")
             .default_open(false)
             .show(ui, |ui| {
-                let g = if self.params.io.scan_film {
-                    &mut self.params.film_render.glare
-                } else {
-                    &mut self.params.print_render.glare
-                };
+                let g = &mut self.params.print_render.glare;
                 let mut changed = false;
                 changed |= tooltips::checkbox(ui, &mut g.active, "Active", tooltips::ENABLE_GLARE)
                     .changed();
@@ -2156,75 +2216,141 @@ impl App {
             .on_hover_text(tooltips::SECTION_GLARE);
 
         // ── Print curves (s023 morph) ───────────────────────────────────
-        egui::CollapsingHeader::new("Print curves")
-            .default_open(false)
-            .show(ui, |ui| {
-                let m = &mut self.params.print_render.density_curves_morph;
-                let mut changed = false;
-                changed |= tooltips::checkbox(
+        for (title, m) in [
+            ("Film chemistry", &mut self.params.film_render.chemistry),
+            ("Print chemistry", &mut self.params.print_render.chemistry),
+        ] {
+            egui::CollapsingHeader::new(title)
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut changed = false;
+                    changed |= tooltips::checkbox(
+                        ui,
+                        &mut m.active,
+                        "Active chemistry",
+                        tooltips::MORPH_PRINT_CURVES,
+                    )
+                    .changed();
+                    if m.active {
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor, 0.5..=2.0),
+                            "Gamma",
+                            tooltips::CONTROL_GAMMA,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor_fast, 0.5..=2.0),
+                            "Gamma fast",
+                            tooltips::CONTROL_GAMMA_FAST,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor_slow, 0.5..=2.0),
+                            "Gamma slow",
+                            tooltips::CONTROL_GAMMA_SLOW,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor_red, 0.5..=2.0),
+                            "Gamma R",
+                            tooltips::CONTROL_GAMMA_R,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor_green, 0.5..=2.0),
+                            "Gamma G",
+                            tooltips::CONTROL_GAMMA_G,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.gamma_factor_blue, 0.5..=2.0),
+                            "Gamma B",
+                            tooltips::CONTROL_GAMMA_B,
+                        )
+                        .changed();
+                        changed |= tooltips::labeled(
+                            ui,
+                            egui::Slider::new(&mut m.developer_exhaustion, 0.0..=1.0),
+                            "Developer exhaustion",
+                            tooltips::CONTROL_DEVELOPER_EXHAUSTION,
+                        )
+                        .changed();
+                    }
+                    if changed {
+                        self.dirty = true;
+                    }
+                })
+                .header_response
+                .on_hover_text(
+                    "Morph the fitted development curves and physical emulsion layers together.",
+                );
+        }
+
+        for (title, base, film) in [
+            ("Film base", &mut self.params.film_render.base, true),
+            ("Print base", &mut self.params.print_render.base, false),
+        ] {
+            egui::CollapsingHeader::new(title).show(ui, |ui| {
+                let mut changed = tooltips::checkbox(
                     ui,
-                    &mut m.active,
-                    "Morph density curves",
-                    tooltips::MORPH_PRINT_CURVES,
+                    &mut base.active,
+                    "Active base tuning",
+                    "Enable changes to the stock's base and fog density.",
                 )
                 .changed();
-                if m.active {
+                changed |= tooltips::labeled(
+                    ui,
+                    egui::Slider::new(&mut base.scale, 0. ..=3.),
+                    "Base scale",
+                    "Scale the stock's spectral base density.",
+                )
+                .changed();
+                for (name, value) in [
+                    ("Cyan", &mut base.cyan),
+                    ("Magenta", &mut base.magenta),
+                    ("Yellow", &mut base.yellow),
+                ] {
                     changed |= tooltips::labeled(
                         ui,
-                        egui::Slider::new(&mut m.gamma_factor, 0.5..=2.0),
-                        "Gamma",
-                        tooltips::CONTROL_GAMMA,
+                        egui::Slider::new(value, 0. ..=3.),
+                        name,
+                        "Scale this color component of the spectral base density.",
                     )
                     .changed();
+                }
+                if film {
                     changed |= tooltips::labeled(
                         ui,
-                        egui::Slider::new(&mut m.gamma_factor_fast, 0.5..=2.0),
-                        "Gamma fast",
-                        tooltips::CONTROL_GAMMA_FAST,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut m.gamma_factor_slow, 0.5..=2.0),
-                        "Gamma slow",
-                        tooltips::CONTROL_GAMMA_SLOW,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut m.gamma_factor_red, 0.5..=2.0),
-                        "Gamma R",
-                        tooltips::CONTROL_GAMMA_R,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut m.gamma_factor_green, 0.5..=2.0),
-                        "Gamma G",
-                        tooltips::CONTROL_GAMMA_G,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut m.gamma_factor_blue, 0.5..=2.0),
-                        "Gamma B",
-                        tooltips::CONTROL_GAMMA_B,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut m.developer_exhaustion, 0.0..=1.0),
-                        "Developer exhaustion",
-                        tooltips::CONTROL_DEVELOPER_EXHAUSTION,
+                        egui::Slider::new(&mut base.tilt, -1. ..=1.),
+                        "Base tilt",
+                        "Tilt the film base density across wavelength around 555 nm.",
                     )
                     .changed();
                 }
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_PRINT_CURVES);
+            });
+        }
+        egui::CollapsingHeader::new("Scan conversion").show(ui,|ui| {
+            let p=&mut self.params.film_render.convert;let mut changed=false;
+            tooltips::combo(ui,egui::ComboBox::from_id_salt("scan_illuminant").selected_text(&p.scan_illuminant),"Scan illuminant","The physical light used to capture the scanned negative.",|ui| {
+                for name in spektrafilm_math::illuminants::names() {changed|=ui.selectable_value(&mut p.scan_illuminant,name.into(),name).changed();}
+            });
+            changed|=tooltips::labeled(ui,egui::Slider::new(&mut p.exposure_compensation_ev,-8. ..=8.),"Scan exposure EV","Align the scanned input's level to the physical scan model before inversion.").changed();
+            changed|=tooltips::labeled(ui,egui::Slider::new(&mut p.base_percentile,90. ..=100.),"Base percentile","Use the brightest pixels above this luminance percentile to estimate clear film base.").changed();
+            changed|=tooltips::labeled(ui,egui::TextEdit::singleline(&mut p.calibration).desired_width(170.),"Device matrix","Nine row-major numbers correcting the scanner or camera color response before inversion.").changed();
+            changed|=tooltips::checkbox(ui,&mut self.params.settings.use_convert_lut,"Conversion LUT","Cache the inverse scan model in a 3D tetrahedral LUT for faster repeated previews.").changed();
+            if self.params.settings.use_convert_lut {changed|=tooltips::labeled(ui,egui::Slider::new(&mut self.params.settings.convert_lut_resolution,9..=65),"Conversion LUT resolution","Samples per RGB axis of the cached inverse scan model.").changed();}
+            if changed {self.dirty=true;}
+            self.calibration_controls(ui);
+        });
 
         // ── Scanner ─────────────────────────────────────────────────────
         egui::CollapsingHeader::new("Scanner")
@@ -2338,6 +2464,10 @@ impl App {
                         }
                     },
                 );
+                tooltips::combo(ui,egui::ComboBox::from_id_salt("input_boundary").selected_text(&self.params.io.input_gamut_compress.boundary),"Input boundary","Compress toward the spectral locus or its smooth inscribed hull.",|ui| {
+                    for name in ["inscribed_hull","locus"] {changed|=ui.selectable_value(&mut self.params.io.input_gamut_compress.boundary,name.into(),name).changed();}
+                });
+                changed|=tooltips::labeled(ui,egui::Slider::new(&mut self.params.io.input_gamut_compress.hull_detail,1. ..=30.),"Hull detail","Number of Fourier modes retained in the inscribed gamut boundary; higher values follow the locus more closely.").changed();
                 // CAT16 (vs CAT02) for the input chromatic adaptation feeding
                 // Hanatos — better blue/violet behavior; matches upstream >=0.3.3.
                 changed |= tooltips::checkbox(
@@ -2358,7 +2488,7 @@ impl App {
                     "RGB→raw upsampling",
                     tooltips::MENU_RGB_RAW_UPSAMPLING,
                     |ui| {
-                        for opt in ["hanatos2025", "arctic2026alpha02", "mallett2019"] {
+                        for opt in ["hanatos2025", "arctic2026beta04", "mallett2019", "jakob2019", "otsu2018", "gauss-lasers", "arctic2026alpha02"] {
                             changed |= ui
                                 .selectable_value(method, opt.to_string(), opt)
                                 .on_hover_text(tooltips::option(opt))
@@ -2436,17 +2566,6 @@ impl App {
             .show(ui, |ui| {
                 let io = &mut self.params.io;
                 let mut changed = false;
-                let mut scan_film = io.scan_film;
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut scan_film,
-                    "Scan film (skip printing)",
-                    tooltips::SCAN_FILM,
-                )
-                .changed();
-                if changed {
-                    io.scan_film = scan_film;
-                }
                 changed |= tooltips::labeled(
                     ui,
                     egui::Slider::new(&mut io.upscale_factor, 0.1..=1.0),
@@ -2517,6 +2636,7 @@ impl eframe::App for App {
         let _ = frame;
 
         self.poll_load_job();
+        self.poll_calibration(ctx);
         // Refine an interactive 640 px frame after the slider is released.
         let configured_limit = if self.params.settings.preview_max_size == 0 {
             self.image
@@ -2843,11 +2963,18 @@ fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &Runtim
     serde_json::json!({
         "film": film_name,
         "print": print_name,
+        "workflow":params.route(),
+        "film_chemistry":params.film_render.chemistry,"print_chemistry":params.print_render.chemistry,
+        "print_gamma":params.print_render.density_curve_gamma,
+        "film_base":params.film_render.base,"print_base":params.print_render.base,
+        "scan_illuminant":params.film_render.convert.scan_illuminant,
+        "convert_lut":params.settings.use_convert_lut,"convert_resolution":params.settings.convert_lut_resolution,
+        "taking_filter":params.camera.color_filter,"auto_exposure":params.camera.auto_exposure,"auto_exposure_method":params.camera.auto_exposure_method,
         "film_dev": params.film_render.development_time,
         "film_gamma":params.film_render.density_curve_gamma,
         "debug":params.debug,
         "print_dev": params.print_render.development_time,
-        "scan_film": params.io.scan_film,
+        "scan_film": params.scans_film(),
         "film_channel_order":params.film_render.channel_order,"print_channel_order":params.print_render.channel_order,
         "input_color_space": params.io.input_color_space,
         "input_cctf_decoding": params.io.input_cctf_decoding,
@@ -3163,7 +3290,7 @@ fn run_f64_export(
         .arg(data_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if params.io.scan_film {
+    if params.scans_film() {
         cmd.arg("--scan-film");
     }
 
@@ -3193,7 +3320,7 @@ fn run_gpu_export(
     let film = profile::load_profile_by_name(data_dir, film_name)?;
     let paper = profile::load_profile_by_name(
         data_dir,
-        if params.io.scan_film {
+        if params.scans_film() {
             film_name
         } else {
             paper_name
@@ -3668,17 +3795,13 @@ impl App {
                     )
                     .changed();
                 }
-                changed |= ui
-                    .add_enabled_ui(self.params.film_render.grain.sublayers_active, |ui| {
-                        tooltips::checkbox(
-                            ui,
-                            &mut self.params.settings.use_fast_stats,
-                            "Approximate physical-grain statistics",
-                            tooltips::CONTROL_APPROXIMATE_PHYSICAL_GRAIN_STATISTICS,
-                        )
-                    })
-                    .inner
-                    .changed();
+                changed |= tooltips::checkbox(
+                    ui,
+                    &mut self.params.settings.use_fast_stats,
+                    "Approximate physical-grain statistics",
+                    tooltips::CONTROL_APPROXIMATE_PHYSICAL_GRAIN_STATISTICS,
+                )
+                .changed();
                 ui.label("Output gamut compression")
                     .on_hover_text(tooltips::CONTROL_OUTPUT_GAMUT_COMPRESSION);
                 egui::ComboBox::from_id_salt("gamut_algorithm")
@@ -3731,13 +3854,6 @@ impl App {
                         .changed();
                     }
                 }
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.film_render.grain.sublayers_active,
-                    "Emulsion sublayer grain",
-                    tooltips::CONTROL_PHYSICAL_EMULSION_LAYERS,
-                )
-                .changed();
                 changed |= tooltips::labeled(
                     ui,
                     egui::Slider::new(
@@ -3752,7 +3868,7 @@ impl App {
                     changed |= tooltips::labeled(
                         ui,
                         egui::Slider::new(
-                            &mut self.params.film_render.grain.agx_particle_scale_layers[i],
+                            &mut self.params.film_render.grain.particle_scale_sublayers[i],
                             0.1..=5.0,
                         ),
                         format!("Layer {} particle scale", i + 1),
@@ -4297,7 +4413,7 @@ mod preview_cache_tests {
         use serde_json::json;
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let build = |film: &str, paper: &str, params: RuntimeParams| {
-            let print = if params.io.scan_film { film } else { paper };
+            let print = if params.scans_film() { film } else { paper };
             Pipeline::new_with_spectral(
                 profile::load_profile_by_name(&data, film).unwrap(),
                 profile::load_profile_by_name(&data, print).unwrap(),
@@ -4308,7 +4424,8 @@ mod preview_cache_tests {
         };
         let changes = [
             ("/camera/exposure_compensation_ev", json!(1.0)),
-            ("/camera/auto_exposure", json!(true)),
+            ("/camera/auto_exposure", json!(false)),
+            ("/camera/auto_exposure_method", json!("matrix")),
             ("/camera/film_format_mm", json!(24.0)),
             ("/camera/lens_blur_um", json!(12.0)),
             ("/camera/filter_uv", json!([0.5, 410.0, 8.0])),
@@ -4328,7 +4445,7 @@ mod preview_cache_tests {
             ("/print_render/density_curve_gamma", json!(1.15)),
             ("/print_render/development_time", json!(12.0)),
             (
-                "/print_render/density_curves_morph",
+                "/print_render/chemistry",
                 json!({"active":true,"gamma_factor":1.2,"developer_exhaustion":0.25}),
             ),
             ("/io/scan_film", json!(true)),
@@ -4343,6 +4460,19 @@ mod preview_cache_tests {
                 json!(true),
             ),
             ("/settings/rgb_to_raw_method", json!("mallett2019")),
+            ("/camera/color_filter", json!("hoya_y2")),
+            ("/film_render/chemistry/gamma_factor", json!(1.18)),
+            ("/film_render/chemistry/developer_exhaustion", json!(0.3)),
+            ("/film_render/base/cyan", json!(1.2)),
+            ("/print_render/base/magenta", json!(0.85)),
+            ("/io/input_gamut_compress/hull_detail", json!(8.0)),
+            ("/film_render/convert/exposure_compensation_ev", json!(0.3)),
+            (
+                "/film_render/convert/calibration",
+                json!("1 .01 0 0 1 0 0 0 1"),
+            ),
+            ("/film_render/convert/scan_illuminant", json!("D65")),
+            ("/workflow/route", json!("input > convert-film > scan")),
             (
                 "/settings/neutral_print_filters_from_database",
                 json!(false),
@@ -4363,7 +4493,7 @@ mod preview_cache_tests {
         ] {
             let mut params = RuntimeParams::default();
             params.debug.deactivate_stochastic_effects = true;
-            params.camera.auto_exposure = false;
+            params.camera.auto_exposure = true;
             let template = build(film, paper, params.clone());
             let original_key = preview_pipeline_cache_key(film, paper, &params);
             for (path, value) in &changes {

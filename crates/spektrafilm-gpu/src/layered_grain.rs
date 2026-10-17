@@ -36,40 +36,9 @@ fn job<T: bytemuck::Pod>(
     params: &T,
     bindings: &[(&wgpu::Buffer, wgpu::BufferBindingType)],
 ) -> Step {
-    let mut layout = vec![wgpu::BufferBindingType::Uniform];
-    layout.extend(bindings.iter().map(|(_, ty)| *ty));
-    let pipeline = b.cached_pipeline(shader, &layout);
-    let uniform = b
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("layered_grain_params"),
-            contents: bytemuck::bytes_of(params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-    let mut entries = vec![wgpu::BindGroupEntry {
-        binding: 0,
-        resource: uniform.as_entire_binding(),
-    }];
-    entries.extend(
-        bindings
-            .iter()
-            .enumerate()
-            .map(|(i, (buffer, _))| wgpu::BindGroupEntry {
-                binding: i as u32 + 1,
-                resource: buffer.as_entire_binding(),
-            }),
-    );
-    let bg = b.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("layered_grain_bg"),
-        layout: &pipeline.layout,
-        entries: &entries,
-    });
-    Step::Compute(DispatchJob {
-        _params_buf: uniform,
-        pipeline,
-        bg,
-    })
+    Step::Compute(storage_job(b, shader, params, bindings))
 }
+
 fn buffer(b: &WgpuBackend, bytes: u64) -> wgpu::Buffer {
     b.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("layered_grain_scratch"),
@@ -219,6 +188,49 @@ fn build_with_draws(
     if p.blur > 0. {
         blur(&mut state, b, size, [p.blur; 3], density, scratch);
     }
+    let usm = p.usm_sigma > 0. && p.usm_amount > 0.;
+    let scale = buffer(b, 12);
+    if usm {
+        let blurred = buffer(b, bytes);
+        let partial = buffer(b, n.div_ceil(1024) as u64 * 24);
+        let mut filter = spatial::State::new();
+        filter.gaussian(b, size, [p.usm_sigma; 3], density, scratch, &blurred);
+        state.jobs.push(Step::Spatial(filter));
+        state.jobs.push(job(
+            b,
+            include_str!("../../spektrafilm-shaders/wgsl/grain_usm.wgsl"),
+            &FinishParams {
+                header: [n, n.div_ceil(1024), 0, 0],
+                value: [p.usm_amount, 0., 0., 0.],
+            },
+            &[
+                (density, READ),
+                (&blurred, READ),
+                (&sum, WRITE),
+                (&partial, WRITE),
+            ],
+        ));
+        state.jobs.push(job(
+            b,
+            include_str!("../../spektrafilm-shaders/wgsl/grain_usm_total.wgsl"),
+            &FinishParams {
+                header: [n, n.div_ceil(1024), 0, 0],
+                value: [0.; 4],
+            },
+            &[(&partial, READ), (&scale, WRITE)],
+        ));
+        state._buffers.extend([blurred, partial]);
+    }
+    state.jobs.push(job(
+        b,
+        include_str!("../../spektrafilm-shaders/wgsl/grain_usm_finish.wgsl"),
+        &FinishParams {
+            header: [n, usm as u32, 0, 0],
+            value: vec4(p.density_min),
+        },
+        &[(&scale, READ), (&sum, READ), (density, WRITE)],
+    ));
+    state._buffers.push(scale);
     state._buffers.extend([layer, sum, curves]);
     state
 }
@@ -304,6 +316,8 @@ mod tests {
                 uniformity: a3(case["uniformity"].clone()),
                 density_min: a3(case["density_min"].clone()),
                 blur: case["blur"].as_f64().unwrap() as f32,
+                usm_sigma: case["usm_sigma"].as_f64().unwrap() as f32,
+                usm_amount: case["usm_amount"].as_f64().unwrap() as f32,
                 micro_sigma: case["micro_sigma"].as_f64().unwrap() as f32,
                 micro_blur: case["micro_blur"].as_f64().unwrap() as f32,
                 positive: case["positive"].as_bool().unwrap(),
@@ -352,6 +366,8 @@ mod tests {
                 uniformity: [0.; 3],
                 density_min: [0.; 3],
                 blur: 0.,
+                usm_sigma: 0.,
+                usm_amount: 0.,
                 micro_sigma: 0.,
                 micro_blur: 0.,
                 positive: false,

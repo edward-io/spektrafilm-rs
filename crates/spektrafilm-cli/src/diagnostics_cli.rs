@@ -42,7 +42,7 @@ pub enum Commands {
         film: String,
         #[arg(long)]
         paper: Option<String>,
-        #[arg(long,default_value="negative_exposure",value_parser=["negative_exposure","print_exposure","grain_particle_area","dir_couplers","glare_percent"])]
+        #[arg(long,default_value="negative_exposure",value_parser=["negative_exposure","print_exposure","grain_rms_granularity","dir_couplers","glare_percent"])]
         kind: String,
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         values: Option<Vec<f64>>,
@@ -144,14 +144,14 @@ pub fn run(command: Commands) -> Result<()> {
             let ramp = match kind.as_str() {
                 "negative_exposure" => Ramp::NegativeExposure,
                 "print_exposure" => Ramp::PrintExposure,
-                "grain_particle_area" => Ramp::GrainParticleArea,
+                "grain_rms_granularity" => Ramp::GrainRmsGranularity,
                 "dir_couplers" => Ramp::DirCouplers,
                 _ => Ramp::GlarePercent,
             };
             let defaults = match ramp {
                 Ramp::NegativeExposure => vec![-3., -2., -1., 0., 1., 2., 3.],
                 Ramp::PrintExposure => vec![0.3, 0.5, 0.7, 1., 1.5, 2., 3.],
-                Ramp::GrainParticleArea => vec![0.05, 0.1, 0.2, 0.4, 0.8, 1.6],
+                Ramp::GrainRmsGranularity => vec![2., 4., 6., 8., 12., 20.],
                 Ramp::DirCouplers => vec![0., 0.5, 1., 1.5, 2.],
                 Ramp::GlarePercent => vec![0.02, 0.05, 0.1, 0.2, 0.4],
             };

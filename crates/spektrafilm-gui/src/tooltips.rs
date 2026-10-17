@@ -117,7 +117,19 @@ pub fn option(name: &str) -> &'static str {
         "arctic2026alpha02" => {
             "Reconstruct spectral exposure using the Arctic memory-color reflectance lookup basis."
         }
-        "mallett2019" => "Reconstruct spectral exposure using the Mallett 2019 matrix basis.",
+        "mallett2019" => {
+            "Relight the Mallett 2019 reflectance LUT and integrate it against film sensitivity."
+        }
+        "arctic2026beta04" => {
+            "Recover reflectance with Arctic beta04, relight it, and normalize its neutral per film channel."
+        }
+        "jakob2019" => {
+            "Recover reflectance using the Jakob 2019 basis and relight it for this film."
+        }
+        "otsu2018" => "Recover reflectance using the Otsu 2018 basis and relight it for this film.",
+        "gauss-lasers" => {
+            "Use narrow Gaussian spectra as a spectral-reconstruction comparison method."
+        }
         "black_pro_mist" => {
             "Use the Black Pro-Mist model's balance of core softness, halos and bloom."
         }
@@ -301,13 +313,7 @@ pub const CONTROL_BLOOM_INTENSITY: &str =
 pub const CONTROL_HALO_SIZE: &str =
     "Scale the distance that the medium-range diffusion halo spreads.";
 pub const CONTROL_BLOOM_SIZE: &str = "Scale the distance that the broad diffusion bloom spreads.";
-pub const CONTROL_PARTICLE_AREA_UM2: &str =
-    "Increase silver-halide particle area for coarser, more visible grain.";
 pub const CONTROL_POST_BLUR_SIGMA: &str = "Soften the generated grain with Gaussian blur whose standard deviation σ is measured in pixels.";
-pub const CONTROL_PHYSICAL_EMULSION_LAYERS: &str =
-    "Simulate three emulsion sublayers per color, each with its own grain response.";
-pub const CONTROL_SIMPLE_GRAIN_LAYERS: &str =
-    "Set how many averaged sublayers the simpler grain model combines.";
 pub const CONTROL_PERCENT: &str = "Set the percentage of glare light added to the scanned image.";
 pub const CONTROL_ROUGHNESS: &str = "Set the spatial variation in the glare field.";
 pub const CONTROL_BLUR_SIGMA_PX: &str =
@@ -386,8 +392,7 @@ pub const CONTROL_PREVIEW_LONG_EDGE_PX: &str =
     "Limit the interactive preview’s long edge in pixels; export starts from the original image.";
 pub const CONTROL_TEMPERATURE_K: &str =
     "Set the illuminant temperature used for custom RAW white balance.";
-pub const CONTROL_TINT: &str =
-    "Adjust green–magenta balance for custom RAW white balance.";
+pub const CONTROL_TINT: &str = "Adjust green–magenta balance for custom RAW white balance.";
 pub const CONTROL_LENS_CORRECTION_LENSFUN: &str =
     "Correct supported lens distortion, color fringing and vignetting using Lensfun profiles.";
 pub const CONTROL_USE_AUTOMATIC_LENSFUN_DATABASE: &str =
@@ -452,8 +457,6 @@ pub const SECTION_GRAIN: &str =
     "Control the size, softness and emulsion structure of simulated film grain.";
 pub const SECTION_GLARE: &str =
     "Add spatially varying veiling light during film or print scanning.";
-pub const SECTION_PRINT_CURVES: &str =
-    "Adjust the print paper’s contrast and parametric development response.";
 pub const SECTION_SCANNER: &str =
     "Control scan softness, sharpening and white/black reference levels.";
 pub const SECTION_COLOR_MANAGEMENT: &str =
@@ -513,7 +516,6 @@ pub const ENABLE_GRAIN: &str = "Enable simulated silver-halide grain in film dev
 pub const ENABLE_GLARE: &str = "Enable veiling glare light in the film or print scan.";
 pub const MORPH_PRINT_CURVES: &str = "Rebuild paper density curves from its parametric model to apply the contrast and developer controls.";
 pub const PREFLASH: &str = "Add a uniform paper preflash through the film base to adjust shadow density and lower print contrast.";
-pub const SCAN_FILM: &str = "Scan the developed film directly without exposing print paper.";
 pub const WORKING_RESOLUTION: &str =
     "Scale the image before processing, trading preview and export resolution for speed.";
 pub const DEVELOPMENT_VARIANT: &str =

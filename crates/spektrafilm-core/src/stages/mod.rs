@@ -95,13 +95,9 @@ mod integration_tests {
         }
     }
 
-    /// Full default chain vs upstream 0.3.4 `simulate()` — the post-defaults
-    /// baseline (CAT16, input gamut `xy`, output gamut `cam16ucs`, and the
-    /// model-evaluated print curves are all active here). Reference values
-    /// dumped from upstream `origin/main` (= 0.3.4) with the stochastic /
-    /// spatial effects off and linear sRGB in/out.
+    /// Experimental's fitted curves, gamut defaults, and spectral normalization.
     #[test]
-    fn full_chain_matches_python_0_3_4_defaults() {
+    fn full_chain_matches_python_experimental_defaults() {
         let dir = data_dir();
         let film = profile::load_profile_by_name(&dir, "kodak_portra_400").unwrap();
         let print = profile::load_profile_by_name(&dir, "kodak_portra_endura").unwrap();
@@ -131,11 +127,9 @@ mod integration_tests {
         // 1×1 midgray.
         let img = ImageBuf::from_data(1, 1, vec![from_f64(0.184); 3]);
         let out = pipeline.process(img, &backend);
-        let want = [
-            0.17518024973220059,
-            0.17883059767931708,
-            0.18934288118407094,
-        ];
+        let want: [f64; 3] =
+            serde_json::from_value(crate::experimental_reference()["extra"]["gray"].clone())
+                .unwrap();
         for c in 0..3 {
             let got = out.get(0, 0)[c] as f64;
             assert!(
@@ -153,25 +147,9 @@ mod integration_tests {
             .collect();
         let img = ImageBuf::from_data(w, h, data);
         let out = pipeline.process(img, &backend);
-        #[rustfmt::skip]
-        let want: [[f64; 3]; 16] = [
-            [0.030140578894842104, 0.10482173080681569, 0.16323263024872359],
-            [0.28284244086494625, 0.36230193922267084, 0.42928148064834676],
-            [0.3353451807767468, 0.076427614378209482, 0.13647407034435774],
-            [0.20879086264247579, 0.29459368653984946, 0.36196826709735686],
-            [0.40612358537107524, 0.34267145956453349, 0.098468693348025937],
-            [0.13020451874838482, 0.21646938505071839, 0.28562089684501552],
-            [0.36393816309250704, 0.43921581264848525, 0.49969437202741285],
-            [0.048658768968400892, 0.12737590764642162, 0.19018617795337284],
-            [0.30145661667996704, 0.37870527708934137, 0.44581696264428788],
-            [0.35937910731344802, 0.09909092393180377, 0.16141353541124179],
-            [0.22780229482543857, 0.31345554394629804, 0.37969407564677998],
-            [0.42292203106495652, 0.36564847210885171, 0.12172785269499363],
-            [0.15476048038036888, 0.23926341868289583, 0.30831655353252529],
-            [0.37946779125297414, 0.45406130948472612, 0.51171040229547315],
-            [0.068514332830799163, 0.1501539662811362, 0.21561362102769013],
-            [0.31940096432374643, 0.39473020737167158, 0.46156726106459162],
-        ];
+        let want: Vec<[f64; 3]> =
+            serde_json::from_value(crate::experimental_reference()["extra"]["ramp"].clone())
+                .unwrap();
         let mut max_diff = 0.0f64;
         for (i, want_px) in want.iter().enumerate() {
             let px = out.get(i as u32 % w, i as u32 / w);
@@ -238,12 +216,8 @@ mod integration_tests {
             .unwrap()
             .with_params(params);
         assert_eq!(
-            pipeline
-                .params
-                .film_render
-                .dir_couplers
-                .gamma_samelayer_rgb,
-            [0.12, 0.08, 0.06],
+            pipeline.params.film_render.dir_couplers.gamma_samelayer_rgb,
+            [0.2291, 0.1029, 0.2651],
             "GUI-style with_params must preserve positive-film DIR parameters"
         );
         let result = pipeline.process(img, &backend);
@@ -317,7 +291,7 @@ mod debug_tests {
 
         let ref_illuminant = stages::filming::select_illuminant(&film.info.reference_illuminant);
         let log_raw =
-            stages::filming::expose(&img, &film, &params, &backend, None, None, ref_illuminant, 1.0);
+            stages::filming::expose(&img, &film, &params, &backend, None, ref_illuminant, 1.0);
         eprintln!("log_raw: {:?}", log_raw.get(0, 0));
 
         let density_cmy = stages::filming::develop(&log_raw, &film, &params, &backend);

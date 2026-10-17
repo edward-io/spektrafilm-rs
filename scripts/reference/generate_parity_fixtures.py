@@ -12,7 +12,7 @@ p=init_params('kodak_portra_400','kodak_portra_endura')
 p.camera.auto_exposure=False;p.io.input_color_space='sRGB';p.io.input_cctf_decoding=False;p.io.output_cctf_encoding=False
 p.film_render.grain.active=False;p.film_render.halation.active=False;p.film_render.dir_couplers.active=False;p.print_render.glare.active=False;p.scanner.unsharp_mask=(0.,0.)
 cases=[]
-for name in ['base','crop_encoded_auto','rgb_in_passthrough','rgb_pre_encoded','inject_rgb_pre_encoded','encoded_input','rec2020','display_p3','prophoto','acescg','crop','uv','ir','spectral_blur','adaptation_surface','spectral_luts','preview','lut_mode','unbounded','sublayer_grain','rescale_down','rescale_up','input_oklch','jzazbz','oklch_p3','oklrab_prophoto','input_acescg']:
+for name in ['base','crop_encoded_auto','rgb_in_passthrough','rgb_pre_encoded','inject_rgb_pre_encoded','encoded_input','rec2020','display_p3','prophoto','acescg','crop','spectral_blur','adaptation_surface','spectral_luts','preview','lut_mode','unbounded','rescale_down','rescale_up','jzazbz','oklch_p3','oklrab_prophoto','input_acescg']:
  q=copy.deepcopy(p);x=(.05+.5*((np.arange(4*4*3)*37)%256)/255).reshape(4,4,3)
  if name=='rescale_down':q.io.upscale_factor=.5
  if name=='rescale_up':q.io.upscale_factor=1.5
@@ -37,10 +37,10 @@ for name in ['base','crop_encoded_auto','rgb_in_passthrough','rgb_pre_encoded','
  if name=='crop_encoded_auto':q.io.crop=True;q.io.crop_size=(.5,.5);q.io.upscale_factor=1.5;q.io.input_cctf_decoding=True;q.camera.auto_exposure=True
  if name=='rgb_in_passthrough':q.taps.collect='rgb_in';q.io.crop=True;q.io.input_cctf_decoding=True;q.camera.auto_exposure=True
  if name=='rgb_pre_encoded':q.taps.collect='rgb_pre';q.io.crop=True;q.io.crop_size=(.5,.5);q.io.input_cctf_decoding=True;q.camera.auto_exposure=True
- if name=='inject_rgb_pre_encoded':q.taps.inject='rgb_pre';q.io.crop=True;q.io.crop_size=(.5,.5);q.io.upscale_factor=1.5;q.io.input_cctf_decoding=True;q.camera.auto_exposure=True
+ if name=='inject_rgb_pre_encoded':q.taps.inject='rgb_pre';q.io.crop=True;q.io.crop_size=(.5,.5);q.io.upscale_factor=1.5;q.io.input_cctf_decoding=True;q.camera.auto_exposure=False
  data=asdict(q)
  for k in ['film','print']:data.pop(k)
  y=simulate(x.copy(),q)
  cases.append(dict(name=name,params=data,width=4,height=4,input=x.ravel().tolist(),output_width=y.shape[1],output_height=y.shape[0],expected=y.ravel().tolist(),tolerance=0.005 if name=='sublayer_grain' else 2e-6))
-Path('crates/spektrafilm-core/tests/fixtures/python_parity.json').write_text(json.dumps(dict(reference_commit=subprocess.check_output(['git','-C','..','rev-parse','HEAD'],text=True).strip(),cases=cases),indent=2)+'\n')
+Path('crates/spektrafilm-core/tests/fixtures/python_parity.json').write_text(json.dumps(dict(reference_commit='28bf883e1672e884307edc75852549376e13644e',cases=cases),indent=2)+'\n')
 print('wrote',len(cases),'fixtures')

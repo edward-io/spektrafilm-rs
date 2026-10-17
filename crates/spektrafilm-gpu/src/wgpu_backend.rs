@@ -2,6 +2,9 @@
 #[path = "color_transfer.rs"]
 mod color_transfer;
 #[cfg(feature = "wgpu-backend")]
+#[path = "conversion.rs"]
+mod conversion;
+#[cfg(feature = "wgpu-backend")]
 #[path = "fft_diffusion.rs"]
 mod fft_diffusion;
 #[cfg(feature = "wgpu-backend")]
@@ -13,6 +16,9 @@ mod pchip;
 #[cfg(feature = "wgpu-backend")]
 #[path = "spatial.rs"]
 mod spatial;
+#[cfg(feature = "wgpu-backend")]
+#[path = "tetrahedral.rs"]
+mod tetrahedral;
 /// wgpu compute backend — dispatches WGSL shaders on GPU via Metal/Vulkan/DX12.
 
 #[cfg(feature = "wgpu-backend")]
@@ -570,6 +576,7 @@ impl WgpuBackend {
                 rgb_to_adapted_xyz,
             } => (rgb_to_adapted_xyz, tc_lut.size as u32),
             crate::FrontPass::Mallett2019 { matrix } => (matrix, 0u32),
+            crate::FrontPass::Convert(_) => (&[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], 0),
         };
         let front_params = FrontParams {
             width: image.width,
@@ -721,6 +728,11 @@ impl WgpuBackend {
         // Front pass: hanatos (params + rgb_in + tc_lut + raw_out) or mallett
         // (params + rgb_in + raw_out). The tc_lut buffer rides along in the
         // tuple to outlive the encoder on the hanatos arm.
+        let convert_state = if let crate::FrontPass::Convert(params) = &p.front {
+            Some(conversion::build(self, params, n_pixels, &buf_a, &buf_b))
+        } else {
+            None
+        };
         let (front_pipe, bg_front, _front_tc_lut) = match &p.front {
             crate::FrontPass::Hanatos2025 { tc_lut, .. } => {
                 let tc_lut_f32: Vec<f32> = tc_lut.data.iter().map(|&v| v as f32).collect();
@@ -758,7 +770,7 @@ impl WgpuBackend {
                 });
                 (pipe, bg, Some(tc_lut_buf))
             }
-            crate::FrontPass::Mallett2019 { .. } => {
+            crate::FrontPass::Mallett2019 { .. } | crate::FrontPass::Convert(_) => {
                 let pipe = self.cached_pipeline(
                     include_str!("../../spektrafilm-shaders/wgsl/mallett_rgb_to_raw.wgsl"),
                     &[
@@ -1171,50 +1183,54 @@ impl WgpuBackend {
         if let Some(state) = &input_transfer_state {
             state.encode_passes(&mut encoder, n_pixels);
         }
-        // 1. Front pass (hanatos or mallett): buf_a (rgb in) → buf_b (raw)
-        dispatch(&mut encoder, &front_pipe.pipeline, &bg_front, n_pixels);
-        // 1a. Highlight boost on raw, before optical scatter.
-        if let Some(hs) = highlight_state.as_ref() {
-            hs.encode_passes(&mut encoder);
-        }
-        // 1a. Camera diffusion filter in-place on buf_b (raw), before
-        //     halation — mirrors the CPU filming order.
-        if let Some(ds) = diffusion_state.as_ref() {
-            ds.encode_passes(&mut encoder, &buf_b);
-        }
-        // 1b. Camera lens blur on raw, after camera diffusion and before halation.
-        if let Some(bs) = camera_lens_blur_state.as_ref() {
-            bs.encode(&mut encoder);
-        }
-        // 1b. Halation in-place on buf_b. Uses buf_a as blur scratch (the
-        //     input RGB image is no longer needed), buf_c / buf_d for the
-        //     scatter outputs and halation accumulator.
-        if let Some(hs) = halation_state.as_ref() {
-            hs.encode(&mut encoder);
-        }
-        // 2. log10 in-place on buf_b: raw → log_raw (3 channels per thread).
-        let (log10_pipe, log10_bg, _keepalive) = &bg_log10;
-        dispatch(&mut encoder, &log10_pipe.pipeline, log10_bg, n_pixels);
-        // 3. Density curve (film, normalized): buf_b (log_raw) → buf_a (density_cmy)
-        dispatch(
-            &mut encoder,
-            &density_pipe.pipeline,
-            &bg_density_film,
-            n_pixels,
-        );
-        // 3b. DIR couplers (operates on buf_a, mutates buf_b → log_raw_corrected,
-        //     re-interps density curve back into buf_a).
-        if let Some(ds) = dir_state.as_ref() {
-            let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
-            ds.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
-        }
-        // 3c. Grain (in-place on buf_a, optional post-blur via buf_b mid).
-        if let Some(gs) = grain_state.as_ref() {
-            let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
-            gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
-        }
-        if let Some(state) = &layered_grain_state {
-            state.encode(&mut encoder, n_pixels);
+        if let Some(state) = &convert_state {
+            state.encode(&mut encoder, n_pixels, &buf_a, &buf_b);
+        } else {
+            // 1. Front pass (hanatos or mallett): buf_a (rgb in) → buf_b (raw)
+            dispatch(&mut encoder, &front_pipe.pipeline, &bg_front, n_pixels);
+            // 1a. Highlight boost on raw, before optical scatter.
+            if let Some(hs) = highlight_state.as_ref() {
+                hs.encode_passes(&mut encoder);
+            }
+            // 1a. Camera diffusion filter in-place on buf_b (raw), before
+            //     halation — mirrors the CPU filming order.
+            if let Some(ds) = diffusion_state.as_ref() {
+                ds.encode_passes(&mut encoder, &buf_b);
+            }
+            // 1b. Camera lens blur on raw, after camera diffusion and before halation.
+            if let Some(bs) = camera_lens_blur_state.as_ref() {
+                bs.encode(&mut encoder);
+            }
+            // 1b. Halation in-place on buf_b. Uses buf_a as blur scratch (the
+            //     input RGB image is no longer needed), buf_c / buf_d for the
+            //     scatter outputs and halation accumulator.
+            if let Some(hs) = halation_state.as_ref() {
+                hs.encode(&mut encoder);
+            }
+            // 2. log10 in-place on buf_b: raw → log_raw (3 channels per thread).
+            let (log10_pipe, log10_bg, _keepalive) = &bg_log10;
+            dispatch(&mut encoder, &log10_pipe.pipeline, log10_bg, n_pixels);
+            // 3. Density curve (film, normalized): buf_b (log_raw) → buf_a (density_cmy)
+            dispatch(
+                &mut encoder,
+                &density_pipe.pipeline,
+                &bg_density_film,
+                n_pixels,
+            );
+            // 3b. DIR couplers (operates on buf_a, mutates buf_b → log_raw_corrected,
+            //     re-interps density curve back into buf_a).
+            if let Some(ds) = dir_state.as_ref() {
+                let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
+                ds.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+            }
+            // 3c. Grain (in-place on buf_a, optional post-blur via buf_b mid).
+            if let Some(gs) = grain_state.as_ref() {
+                let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
+                gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+            }
+            if let Some(state) = &layered_grain_state {
+                state.encode(&mut encoder, n_pixels);
+            }
         }
         // 4 + 5. Printing: print_spectral (buf_a → buf_b) then the print
         //     density curve (buf_b → buf_a). Skipped for scan_film — the
@@ -1783,6 +1799,16 @@ impl ComputeBackend for WgpuBackend {
         Some(self.run_film_chain(params))
     }
 
+    fn tetrahedral3d(
+        &self,
+        image: &ImageBuf,
+        lut: &spektrafilm_math::lut::TetrahedralLut,
+        min: [f64; 3],
+        max: [f64; 3],
+    ) -> Option<ImageBuf> {
+        Some(tetrahedral::apply(self, image, lut, min, max))
+    }
+
     fn pchip3d(
         &self,
         image: &ImageBuf,
@@ -1855,6 +1881,48 @@ struct DispatchJob {
     pipeline: CachedPipelineRef,
     bg: wgpu::BindGroup,
 }
+fn storage_job<T: bytemuck::Pod>(
+    b: &WgpuBackend,
+    shader: &'static str,
+    params: &T,
+    bindings: &[(&wgpu::Buffer, wgpu::BufferBindingType)],
+) -> DispatchJob {
+    use wgpu::util::DeviceExt;
+    let mut layout = vec![wgpu::BufferBindingType::Uniform];
+    layout.extend(bindings.iter().map(|(_, ty)| *ty));
+    let pipeline = b.cached_pipeline(shader, &layout);
+    let uniform = b
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("layered_grain_params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut entries = vec![wgpu::BindGroupEntry {
+        binding: 0,
+        resource: uniform.as_entire_binding(),
+    }];
+    entries.extend(
+        bindings
+            .iter()
+            .enumerate()
+            .map(|(i, (buffer, _))| wgpu::BindGroupEntry {
+                binding: i as u32 + 1,
+                resource: buffer.as_entire_binding(),
+            }),
+    );
+    let bg = b.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("layered_grain_bg"),
+        layout: &pipeline.layout,
+        entries: &entries,
+    });
+    DispatchJob {
+        _params_buf: uniform,
+        pipeline,
+        bg,
+    }
+}
+
 #[cfg(feature = "wgpu-backend")]
 fn build_halation_state(
     _device: &wgpu::Device,
@@ -2281,6 +2349,7 @@ fn build_dir_state(
         positive: u32,
         _pad0: u32,
         _pad1: u32,
+        donor_k: [f32; 4],
         density_max: [f32; 4],
         m_row0: [f32; 4],
         m_row1: [f32; 4],
@@ -2292,6 +2361,7 @@ fn build_dir_state(
         positive: if dp.is_positive { 1 } else { 0 },
         _pad0: 0,
         _pad1: 0,
+        donor_k: [dp.donor_k[0], dp.donor_k[1], dp.donor_k[2], 0.],
         density_max: [dp.density_max[0], dp.density_max[1], dp.density_max[2], 0.0],
         m_row0: [m[0][0], m[0][1], m[0][2], 0.0],
         m_row1: [m[1][0], m[1][1], m[1][2], 0.0],
@@ -2454,19 +2524,42 @@ fn build_dir_state(
     };
 
     // ── 4. Subtract: buf_b -= buf_mix ────────────────────────────────
+    let subtract_pipe = backend.cached_pipeline(
+        include_str!("../../spektrafilm-shaders/wgsl/dir_subtract.wgsl"),
+        &[
+            wgpu::BufferBindingType::Uniform,
+            wgpu::BufferBindingType::Storage { read_only: true },
+            wgpu::BufferBindingType::Storage { read_only: false },
+        ],
+    );
+    #[repr(C)]
+    #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct ReceiverParams {
+        n_pixels: u32,
+        positive: u32,
+        pad: [u32; 2],
+        knee: [f32; 4],
+        reference: [f32; 4],
+    }
     let subtract_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("dir_subtract_params"),
-        contents: bytemuck::bytes_of(&AddScaledParams {
+        contents: bytemuck::bytes_of(&ReceiverParams {
             n_pixels: n_pixels as u32,
-            scale: -1.0,
-            clear_first: 0,
-            _pad: 0,
+            positive: dp.is_positive as u32,
+            pad: [0; 2],
+            knee: [dp.receiver_k[0], dp.receiver_k[1], dp.receiver_k[2], 0.],
+            reference: [
+                dp.receiver_ref[0],
+                dp.receiver_ref[1],
+                dp.receiver_ref[2],
+                0.,
+            ],
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let subtract_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dir_subtract_bg"),
-        layout: &add_scaled_pipe.layout,
+        layout: &subtract_pipe.layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -2484,7 +2577,7 @@ fn build_dir_state(
     });
     let subtract = DispatchJob {
         _params_buf: subtract_params,
-        pipeline: add_scaled_pipe,
+        pipeline: subtract_pipe,
         bg: subtract_bg,
     };
 

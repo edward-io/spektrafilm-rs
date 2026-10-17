@@ -1933,6 +1933,7 @@ impl CudaBackend {
                     .arg(&mut buf_b);
                 unsafe { launch.launch(LaunchConfig::for_num_elems(n_pixels)) }?;
             }
+            FrontPass::Convert(_) => return Ok(None),
             FrontPass::Mallett2019 { matrix } => {
                 let matrix = matrix_f32(matrix);
                 let matrix_dev = self.stream.clone_htod(&matrix)?;
@@ -2279,6 +2280,16 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn try_run_film_chain(&self, params: &FilmChainParams<'_>) -> Option<ImageBuf> {
+        // CUDA's legacy DIR kernel is linear; use shared stages for saturating chemistry.
+        if params.dir_couplers.as_ref().is_some_and(|d| {
+            if d.is_positive {
+                d.receiver_k.iter().any(|v| v.is_finite())
+            } else {
+                d.donor_k.iter().any(|v| v.is_finite())
+            }
+        }) {
+            return None;
+        }
         match self.run_film_chain_resident(params) {
             Ok(out) => out,
             Err(e) => {

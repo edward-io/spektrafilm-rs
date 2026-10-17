@@ -269,8 +269,7 @@ pub fn midgray_raw_hanatos(
 ///   raw → log10(raw + 1e-10) → develop_simple (RAW curves, no normalization)
 ///   → compute_density_spectral (einsum + base_density).
 ///
-/// The raw is computed by the configured upsampler (`midgray_raw_hanatos` or
-/// the Mallett core matrix). Python's `_rgb_to_film_raw(rgb)` defaults to
+/// The raw is computed by the configured upsampler through the selected spectral TC LUT. Python's `_rgb_to_film_raw(rgb)` defaults to
 /// `color_space="sRGB"`, so midgray calibration is always done in sRGB
 /// regardless of the runtime input color space — otherwise the print exposure
 /// normalization would shift with the working space. Callers must honour that.
@@ -450,7 +449,9 @@ mod parity_tests {
         let pipeline = Pipeline::new_with_spectral(film, print, params, &dir).unwrap();
         let p = pipeline.preflash_raw();
 
-        let expect = [0.4567086334477163, 0.3959958805787103, 0.5172324967476551];
+        let expect: [f64; 3] =
+            serde_json::from_value(crate::experimental_reference()["extra"]["preflash"].clone())
+                .unwrap();
         for c in 0..3 {
             assert!(
                 (p[c] - expect[c]).abs() < 1e-12,

@@ -1,0 +1,248 @@
+{
+  "recorded_at_utc": "2026-10-17T22:22:33.559956+00:00",
+  "reference": {
+    "repository": "https://github.com/andreavolpato/spektrafilm",
+    "branch": "experimental",
+    "commit": "28bf883e1672e884307edc75852549376e13644e",
+    "version": "0.3.4",
+    "remote_head_rechecked": true,
+    "profiles_byte_identical": 31
+  },
+  "rust_base_commit": "c6bac46",
+  "environment": {
+    "gpu": "Apple M1 Max (32 GPU cores)",
+    "backend": "wgpu / Metal",
+    "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "oracle": {
+      "python": "3.13.5",
+      "numpy": "2.4.6",
+      "scipy": "1.17.1",
+      "colour-science": "0.4.6",
+      "numba": "0.64.0"
+    }
+  },
+  "tests": [
+    {
+      "command": "cargo test --workspace --no-fail-fast",
+      "passed": 169,
+      "failed": 0,
+      "ignored": 1,
+      "completed_test_targets": 41,
+      "exit_code": 0,
+      "note": "Full f32 run; the later GUI workflow compatibility changes were then covered by the separate 17-test GUI run. The added core workflow regression ran in the final f64 suite."
+    },
+    {
+      "command": "cargo test --workspace --exclude spektrafilm-gui --features precision-f64 --no-fail-fast",
+      "passed": 165,
+      "failed": 0,
+      "ignored": 1,
+      "completed_test_targets": 41,
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test -p spektrafilm-gui --bin spektrafilm-gui",
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "completed_test_targets": 1,
+      "exit_code": 0
+    }
+  ],
+  "ignored_test": "Lensfun official database download/cache integration test (requires internet and writes the user cache); unchanged by this migration.",
+  "experimental_runtime": {
+    "CPU": {
+      "cases": 51,
+      "max_absolute_error": 6.8e-07,
+      "worst_case": "kodak_vision3_500t",
+      "log_decimal_places": 8
+    },
+    "GPU": {
+      "cases": 51,
+      "max_absolute_error": 9.97e-06,
+      "worst_case": "input > convert-film > scan-minus-base_lut_calibrated",
+      "log_decimal_places": 8
+    }
+  },
+  "other_checks": {
+    "deterministic_gpu_gate_max_absolute_normalized_rgb": 0.001,
+    "gpu_gate_scope": [
+      "HDR and edge stress",
+      "optical filters and diffusion",
+      "all bundled stock/paper combinations",
+      "every named input/output transport",
+      "gamut, white balance and encoded metering residency"
+    ],
+    "coupled_python_grain_cases": 5,
+    "coupled_python_grain_max_absolute_error": 8.344650268554688e-07,
+    "python_lut_bake_cases": 5,
+    "release_f64_cli_current_params_ev_lut": {
+      "values": 375,
+      "max_absolute_error": 8.08297752688536e-09,
+      "result": "passed"
+    },
+    "cuda_compile_command": "cargo check -p spektrafilm-gpu --no-default-features --features cuda-backend",
+    "cuda_compile_result": "passed",
+    "rustfmt_changed_sources": "passed",
+    "python_reference_scripts_compile": "passed",
+    "git_diff_check": "passed"
+  },
+  "preview_benchmarks": {
+    "input": "Sony ILCE-7M5 RAW, 7008 x 4672 active pixels",
+    "film": "kodak_gold_200",
+    "paper": "kodak_portra_endura",
+    "precision": "f32",
+    "scope": "Renderer wall-clock time including GPU preparation, upload and readback; excludes GUI texture conversion/upload. Iteration zero is excluded from warm statistics. Every render asserts the resident path; shader cache and system load affect timing.",
+    "background_activity": "Release compilation and GUI cache tests had finished; one CPU reference test remained active.",
+    "modes": {
+      "physical": "Default film/print chain with RMS physical grain",
+      "off": "Same chain with grain disabled",
+      "convert": "Exact inverse scan solver followed by print/scan",
+      "convert_lut": "Tetrahedral inverse scan LUT followed by print/scan"
+    },
+    "runs": [
+      {
+        "long_edge": 640,
+        "dimensions": [
+          640,
+          426
+        ],
+        "decode_ms": 1109.6,
+        "resize_ms": 29.3,
+        "resident_assertion_passed": true,
+        "all_pixels_finite": true,
+        "modes": {
+          "physical": {
+            "build_ms": 99.9,
+            "first_frame_ms": 84.5,
+            "warm_frames_ms": [
+              32.7,
+              31.6,
+              32.2,
+              33.7,
+              33.1,
+              32.3,
+              32.0
+            ],
+            "warm_median_ms": 32.3
+          },
+          "off": {
+            "build_ms": 93.4,
+            "first_frame_ms": 26.5,
+            "warm_frames_ms": [
+              21.6,
+              22.0,
+              20.5,
+              20.3,
+              20.4,
+              20.4,
+              20.4
+            ],
+            "warm_median_ms": 20.4
+          },
+          "convert": {
+            "build_ms": 91.5,
+            "first_frame_ms": 16.1,
+            "warm_frames_ms": [
+              19.2,
+              25.8,
+              22.1,
+              15.4,
+              24.4,
+              16.1,
+              16.6
+            ],
+            "warm_median_ms": 19.2
+          },
+          "convert_lut": {
+            "build_ms": 199.5,
+            "first_frame_ms": 11.1,
+            "warm_frames_ms": [
+              9.2,
+              9.4,
+              9.3,
+              9.4,
+              9.5,
+              9.4,
+              9.2
+            ],
+            "warm_median_ms": 9.4
+          }
+        }
+      },
+      {
+        "long_edge": 2048,
+        "dimensions": [
+          2048,
+          1365
+        ],
+        "decode_ms": 1059.6,
+        "resize_ms": 35.3,
+        "resident_assertion_passed": true,
+        "all_pixels_finite": true,
+        "modes": {
+          "physical": {
+            "build_ms": 99.6,
+            "first_frame_ms": 264.7,
+            "warm_frames_ms": [
+              231.3,
+              222.8
+            ],
+            "warm_median_ms": 227.05
+          },
+          "off": {
+            "build_ms": 91.2,
+            "first_frame_ms": 149.8,
+            "warm_frames_ms": [
+              134.4,
+              135.2
+            ],
+            "warm_median_ms": 134.8
+          },
+          "convert": {
+            "build_ms": 92.4,
+            "first_frame_ms": 59.3,
+            "warm_frames_ms": [
+              47.4,
+              46.8
+            ],
+            "warm_median_ms": 47.099999999999994
+          },
+          "convert_lut": {
+            "build_ms": 112.7,
+            "first_frame_ms": 37.3,
+            "warm_frames_ms": [
+              36.2,
+              31.1
+            ],
+            "warm_median_ms": 33.650000000000006
+          }
+        }
+      }
+    ]
+  },
+  "builds": {
+    "commands": [
+      "cargo build --release -p spektrafilm-gui -p spektrafilm-cli --bin spektrafilm-gui --bin spektrafilm --example preview_bench --target-dir target/macos-app",
+      "cargo build --release -p spektrafilm-cli --bin spektrafilm-f64 --features precision-f64 --target-dir target/macos-app",
+      "cargo build --release -p spektrafilm-gui --bin spektrafilm-gui --target-dir target/macos-app"
+    ],
+    "result": "passed",
+    "binaries": [
+      "target/macos-app/release/spektrafilm-gui",
+      "target/macos-app/release/spektrafilm",
+      "target/macos-app/release/spektrafilm-f64"
+    ]
+  },
+  "fixtures_sha256": {
+    "crates/spektrafilm-core/tests/fixtures/experimental.json": "93be51d69d9bbc8b07e384dd8d38fa6aa0eae8c89394584cd2b793ff8f10c46d",
+    "crates/spektrafilm-core/tests/fixtures/luts.json": "c8be6379011fb3948c55a4d60b1abb7963123276b4b5fda525a98778adca3665",
+    "crates/spektrafilm-gpu/tests/fixtures/grain_replay.json": "b00b2d49851b55b3373db9cfd17bd9879e77fde50f2b9042777a0ea927349fee"
+  },
+  "limits": [
+    "Fixed 81-band 380-780 nm bundled spectral grid; no arbitrary Python research grid API.",
+    "GPU uses f32; CPU and GPU grain use distinct random streams.",
+    "CUDA compile checked only; conversion and saturating DIR have shared fallbacks. No NVIDIA hardware run.",
+    "Calibration actions tested with synthetic data; no physical scanner calibration was measured.",
+    "ICC coverage is unchanged; see docs/upstream-sync.md."
+  ]
+}

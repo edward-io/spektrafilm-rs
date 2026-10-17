@@ -8,6 +8,7 @@ use std::{path::PathBuf, process::Command};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub exposure_ev: f64,
     pub input: String,
     pub output: String,
     pub format: String,
@@ -20,6 +21,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            exposure_ev: 0.,
             input: "sRGB".into(),
             output: "sRGB".into(),
             format: "cube".into(),
@@ -60,6 +62,7 @@ impl App {
                             }
                         });
                 }
+                tooltips::labeled(ui,egui::Slider::new(&mut self.lut.exposure_ev,-6. ..=6.),"LUT exposure EV","Re-expose the LUT input from its native midgray; zero preserves the source exposure.");
                 ui.label("File format")
                     .on_hover_text(tooltips::MENU_LUT_FORMAT);
                 egui::ComboBox::from_id_salt("lut_format")
@@ -207,6 +210,8 @@ impl App {
                 .arg(settings.input)
                 .arg("--output-space")
                 .arg(settings.output)
+                .arg("--exposure-ev")
+                .arg(settings.exposure_ev.to_string())
                 .arg("--format")
                 .arg(settings.format)
                 .arg("--params")

@@ -227,7 +227,14 @@ fn set_path(root: &mut serde_json::Value, path: &str, value: serde_json::Value) 
 fn merge_group(root: &mut serde_json::Value, path: &str, source: &serde_json::Value) {
     if let Some(fields) = source.as_object() {
         for (key, value) in fields {
-            let key = if path == "params.film_render.grain" && key.starts_with("particle_") {
+            let key = if path == "params.film_render.grain"
+                && [
+                    "particle_area_um2",
+                    "particle_scale",
+                    "particle_scale_layers",
+                ]
+                .contains(&key.as_str())
+            {
                 format!("agx_{key}")
             } else {
                 key.clone()
@@ -253,7 +260,14 @@ fn python_project(source: &serde_json::Value) -> Result<Project> {
         ("grain", "film_render.grain"),
         ("halation", "film_render.halation"),
         ("couplers", "film_render.dir_couplers"),
-        ("chemistry", "print_render.density_curves_morph"),
+        ("chemistry", "print_render.chemistry"),
+        ("film_chemistry", "film_render.chemistry"),
+        ("print_chemistry", "print_render.chemistry"),
+        ("film_base", "film_render.base"),
+        ("print_base", "print_render.base"),
+        ("convert", "film_render.convert"),
+        ("workflow", "workflow"),
+        ("settings", "settings"),
         ("camera", "camera"),
         ("camera_diffusion", "camera.diffusion_filter"),
         ("enlarger_diffusion", "enlarger.diffusion_filter"),
@@ -294,6 +308,30 @@ fn python_project(source: &serde_json::Value) -> Result<Project> {
 #[cfg(test)]
 mod python_tests {
     use super::*;
+    #[test]
+    fn legacy_python_scan_flag_survives_import() {
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("python_gui_state_fixture.json")).unwrap();
+        source["simulation"]["scan_film"] = true.into();
+        let project = python_project(&source).unwrap();
+        assert_eq!(project.params.route(), "input > film > scan");
+    }
+    #[test]
+    fn experimental_workflow_overrides_legacy_scan_flag_on_import() {
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("python_gui_state_fixture.json")).unwrap();
+        for (route, legacy_scan, expected_scan) in [
+            ("input > convert-film > scan-minus-base", false, true),
+            ("input > film > print > scan", true, false),
+        ] {
+            source["simulation"]["route"] = route.into();
+            source["simulation"]["scan_film"] = legacy_scan.into();
+            let project = python_project(&source).unwrap();
+            project.params.validate().unwrap();
+            assert_eq!(project.params.route(), route);
+            assert_eq!(project.params.scans_film(), expected_scan);
+        }
+    }
     #[test]
     fn imports_python_gui_state() {
         let source: serde_json::Value =

@@ -11,7 +11,7 @@ port of [Andrea Volpato's spektrafilm](https://github.com/andreavolpato/spektraf
 The runtime implements RGB → spectral film exposure → dye density → enlarger
 and print paper → scanner RGB. It provides a native GUI, a batch CLI, calibrated
 LUT exports, full-resolution f32 GPU export and f64 CPU export. The implementation
-is checked against the Python v0.3.4 reference and runs without Python.
+is checked against the Python experimental branch at `28bf883` and runs without Python.
 GPU previews use f32; numerical parity is measured with tolerances.
 See the [changelog](#changelog) for changes from the original Rust fork,
 [reference status and limits](docs/upstream-sync.md), and
@@ -50,24 +50,37 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 Changes from the original Rust fork's v0.1.2 baseline,
 [turbasvin/spektrafilm-rs at `9dd59b0`](https://github.com/turbasvin/spektrafilm-rs/commit/9dd59b0380194b93686aaa230a8bb9680aa270a4):
 
+- **Experimental parity:** tracks Python experimental at
+  [`28bf883`](https://github.com/andreavolpato/spektrafilm/commit/28bf883e1672e884307edc75852549376e13644e),
+  with all 31 fitted profiles and stock presets; film/print chemistry and base
+  controls; saturating DIR; RMS physical grain and mass-preserving sharpening;
+  six spectral methods, taking filters and film-raw exposure metering.
+- **Scan conversion and calibration:** all six workflow routes, exact and
+  tetrahedral-LUT negative conversion, scan exposure/device matrices, and background
+  base detection, blind device calibration and neutral print balance. Explicit
+  workflows take precedence over legacy scan flags when importing and exporting.
 - **LUTs and tools:** calibrated CUBE, 3DL, Lumix and Hald export; multi-stage
   bundles, TOML/JSON specs, OCIO and QA reports; profile measurements and
-  calibration strips.
+  calibration strips. Experimental LUT bakes preserve native midgray, accept
+  exposure EV and carry current chemistry, base and spectral settings.
 - **Color and settings:** expanded named color spaces, transfer functions and
   gamut mapping; independent saving-space conversion; restored crop, spectral,
   filter and other previously ignored runtime controls.
 - **Grain and GPU:** physical three-sublayer grain with dye-cloud blur and
   microstructure; wgpu implementations of layered grain, spatial filters,
-  diffusion and color transforms; full-resolution GPU export.
+  diffusion and color transforms; resident GPU scan conversion and mass-preserving
+  grain sharpening; full-resolution GPU export.
 - **RAW and lenses:** shared GUI/CLI I/O, rawler 0.8 with Sony ILCE-7M5 support,
   optional LibRaw with Auto fallback, built-in Lensfun, automatic database
   download/cache, corrected RGB vignetting handling and clearer load errors.
 - **GUI and previews:** project/default persistence, Python GUI state import,
-  rotation, contextual hover help, layer/comparison controls and paper animation; cached previews with
-  adjustable resolution, smaller interactive frames and background workers.
-- **Reference validation:** Python v0.3.4 fixtures, f32/f64 checks and GPU
-  accuracy audits, with measured numerical tolerances and documented remaining
-  differences.
+  rotation, contextual hover help, layer/comparison controls and paper animation;
+  cached pipelines, scaled inputs and exposure-meter results, with adjustable
+  resolution, 640-pixel interactive frames and background workers.
+- **Reference validation:** 51 experimental Python runtime cases on CPU/GPU,
+  independent grain/LUT fixtures, f32/f64 suites and GUI regressions. The
+  [parity report](docs/experimental-parity.md) records preview timings, the strict
+  0.001 GPU error gate and remaining limits.
 
 ## GUI and RAW development
 
@@ -191,7 +204,7 @@ include_combinations = true
 ```
 
 Measurement output includes gamma, local exposure slopes and toe fits. Calibration
-supports exposure, print exposure, grain particle area, DIR amount and glare,
+supports exposure, print exposure, RMS grain granularity, DIR amount and glare,
 with crop/rotation, labeled SVG previews and JSON sidecars. Run either command
 with `--help` for its controls.
 

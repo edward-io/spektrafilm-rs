@@ -98,8 +98,9 @@ pub fn layer_particle_model(
 
 /// Three physical emulsion layers per dye channel (Python's default grain model).
 pub struct LayeredGrainParams {
-    pub particle_area: f64,
-    pub channel_scale: [f64; 3],
+    pub rms_granularity: [f64; 3],
+    pub usm_sigma: f32,
+    pub usm_amount: f32,
     pub layer_scale: [f64; 3],
     pub density_min: [f64; 3],
     pub uniformity: [f64; 3],
@@ -108,6 +109,65 @@ pub struct LayeredGrainParams {
     pub micro_structure: [f32; 2],
     pub monochrome: bool,
     pub fast_stats: bool,
+}
+
+/// Size particles from the realized variance peak of the complete physical layers.
+pub fn coarsest_particle_area(layers: &[Vec<Vec<f64>>], p: &LayeredGrainParams) -> [f64; 3] {
+    std::array::from_fn(|c| {
+        let maxima: [f64; 3] =
+            std::array::from_fn(|sl| layers.iter().map(|r| r[sl][c]).fold(0., f64::max));
+        let total: f64 = maxima.iter().sum();
+        let fractions = maxima.map(|v| v / total.max(1e-30));
+        let peak = layers
+            .iter()
+            .map(|row| {
+                (0..3)
+                    .filter(|sl| fractions[*sl] > 0.)
+                    .map(|sl| {
+                        let floor = fractions[sl] * p.density_min[c];
+                        let d = row[sl][c] + floor;
+                        p.layer_scale[sl] / fractions[sl]
+                            * d
+                            * (maxima[sl] + floor - p.uniformity[c] * d)
+                    })
+                    .sum::<f64>()
+            })
+            .fold(0., f64::max);
+        (p.rms_granularity[c] / 1000.).powi(2) * std::f64::consts::PI * 24f64.powi(2)
+            / peak.max(1e-9)
+    })
+}
+
+pub fn multiplicative_unsharp_mask(image: &ImageBuf, sigma: f32, amount: f32) -> ImageBuf {
+    if sigma <= 0. || amount <= 0. {
+        return image.clone();
+    }
+    let mut input = image.clone();
+    for d in &mut input.data {
+        *d = d.max(ZERO);
+    }
+    let blurred = gaussian::gaussian_blur(&input, sigma);
+    let mut out = input.clone();
+    for ((v, d), b) in out.data.iter_mut().zip(&input.data).zip(&blurred.data) {
+        *v = if *d <= ZERO {
+            ZERO
+        } else {
+            from_f64(
+                (*d as f64).max(1e-6).powf(1. + amount as f64)
+                    / (*b as f64).max(1e-6).powf(amount as f64),
+            )
+        };
+    }
+    for c in 0..3 {
+        let before: f64 = input.pixels().map(|p| p[c] as f64).sum();
+        let after: f64 = out.pixels().map(|p| p[c] as f64).sum();
+        if after > 0. {
+            for p in out.pixels_mut() {
+                p[c] *= from_f64(before / after);
+            }
+        }
+    }
+    out
 }
 
 pub fn layered_gpu_params(
@@ -126,6 +186,7 @@ pub fn layered_gpu_params(
         })
     });
     let total: [f64; 3] = std::array::from_fn(|ch| maxima.iter().map(|r| r[ch]).sum());
+    let areas = coarsest_particle_area(layers, p);
     let layer_params = std::array::from_fn(|sl| {
         let fraction: [f64; 3] = std::array::from_fn(|ch| {
             if total[ch] > 0. && maxima[sl][ch].is_finite() {
@@ -137,8 +198,7 @@ pub fn layered_gpu_params(
         let min: [f32; 3] = std::array::from_fn(|ch| (fraction[ch] * p.density_min[ch]) as f32);
         let max: [f32; 3] = std::array::from_fn(|ch| (maxima[sl][ch] + min[ch] as f64) as f32);
         let particles: [f32; 3] = std::array::from_fn(|ch| {
-            ((pixel_size_um as f64).powi(2) * fraction[ch]
-                / (p.particle_area * p.channel_scale[ch] * p.layer_scale[sl])) as f32
+            ((pixel_size_um as f64).powi(2) * fraction[ch] / (areas[ch] * p.layer_scale[sl])) as f32
         });
         let cloud_sigma = std::array::from_fn(|ch| {
             if particles[ch] > 0. {
@@ -171,6 +231,8 @@ pub fn layered_gpu_params(
         uniformity: p.uniformity.map(|v| v as f32),
         density_min: p.density_min.map(|v| v as f32),
         blur: p.blur,
+        usm_sigma: p.usm_sigma,
+        usm_amount: p.usm_amount,
         micro_sigma: p.micro_structure[1] * 0.001 / pixel_size_um,
         micro_blur: p.micro_structure[0] / pixel_size_um,
         fast_stats: p.fast_stats,
@@ -199,6 +261,7 @@ pub fn apply_grain_to_density_layers(
     use spektrafilm_math::numpy_rng::{GaussRng, rk_binomial, rk_poisson};
     let mut out = ImageBuf::new(density.width, density.height);
     let area = (pixel_size_um as f64).powi(2);
+    let areas = coarsest_particle_area(layers, p);
     let channels: Vec<Vec<Scalar>> = (0..3)
         .into_par_iter()
         .map(|ch| {
@@ -221,8 +284,7 @@ pub fn apply_grain_to_density_layers(
                 if fraction <= 0. || !fraction.is_finite() {
                     continue;
                 }
-                let npp =
-                    area * fraction / (p.particle_area * p.channel_scale[ch] * p.layer_scale[sl]);
+                let npp = area * fraction / (areas[ch] * p.layer_scale[sl]);
                 let od = dmax / npp;
                 let ys: Vec<f64> = layers.iter().map(|r| r[sl][ch]).collect();
                 let mut rng =
@@ -324,13 +386,14 @@ pub fn apply_grain_to_density_layers(
             *v *= f;
         }
     }
+    if p.blur > 0. {
+        out = gaussian::gaussian_blur(&out, p.blur);
+    }
+    out = multiplicative_unsharp_mask(&out, p.usm_sigma, p.usm_amount);
     for px in out.data.chunks_exact_mut(3) {
         for c in 0..3 {
             px[c] -= from_f64(p.density_min[c]);
         }
-    }
-    if p.blur > 0. {
-        out = gaussian::gaussian_blur(&out, p.blur);
     }
     out
 }

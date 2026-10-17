@@ -10,7 +10,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -21,7 +21,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -32,7 +32,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -43,7 +43,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -54,7 +54,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -65,7 +65,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -76,7 +76,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Srgb,
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -87,7 +87,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Gamma(2.4),
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -98,7 +98,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Srgb,
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -109,7 +109,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Gamma(2.4),
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -120,7 +120,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Gamma(2.6),
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -131,7 +131,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Gamma(2.2),
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -142,7 +142,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Acescct,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000007,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -164,7 +164,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Logc4,
         midgray_linear: 0.18,
-        auto_gain: 0.9999999999999998,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -175,7 +175,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Slog3,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000002,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -186,7 +186,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Slog3,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000002,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -197,7 +197,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Vlog,
         midgray_linear: 0.18,
-        auto_gain: 0.9999999999999996,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -219,7 +219,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Flog2,
         midgray_linear: 0.18,
-        auto_gain: 0.9999999999999994,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -230,7 +230,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Canonlog3,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000002,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -241,7 +241,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Log3g10,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000004,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -252,7 +252,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::DaVinci,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000004,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -263,7 +263,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Applelog,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000002,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -274,7 +274,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Blackmagic5,
         midgray_linear: 0.18,
-        auto_gain: 0.9999999999999997,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -285,7 +285,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Pq,
         midgray_linear: 100.0,
-        auto_gain: 0.0017999999999999993,
+        auto_gain: 0.0018,
         output_gain: 555.5555555555555,
     },
     LutSpace {
@@ -295,9 +295,9 @@ pub static SPACES: &[LutSpace] = &[
         input_role: true,
         output_role: true,
         curve: Transfer::Hlg,
-        midgray_linear: 0.18,
-        auto_gain: 0.9999999999999997,
-        output_gain: 1.0,
+        midgray_linear: 26.238265737,
+        auto_gain: 0.006860209504859624,
+        output_gain: 145.76814298333332,
     },
     LutSpace {
         name: "ACEScc",
@@ -307,7 +307,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Acescc,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000007,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -318,7 +318,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Linear,
         midgray_linear: 0.18,
-        auto_gain: 11.52,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -329,7 +329,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::Pq,
         midgray_linear: 100.0,
-        auto_gain: 0.0017999999999999993,
+        auto_gain: 0.0018,
         output_gain: 555.5555555555555,
     },
     LutSpace {
@@ -340,7 +340,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Dlog,
         midgray_linear: 0.18,
-        auto_gain: 1.0000000000000002,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -351,7 +351,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: true,
         curve: Transfer::ProPhoto,
         midgray_linear: 0.18,
-        auto_gain: 2.88,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
     LutSpace {
@@ -362,7 +362,7 @@ pub static SPACES: &[LutSpace] = &[
         output_role: false,
         curve: Transfer::Nlog,
         midgray_linear: 0.18,
-        auto_gain: 0.9999999999999998,
+        auto_gain: 1.0,
         output_gain: 1.0,
     },
 ];

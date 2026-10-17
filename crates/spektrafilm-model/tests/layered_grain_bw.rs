@@ -9,8 +9,9 @@ fn bw_microstructure_is_shared_across_rgb_storage_channels() {
         .map(|r| [0.2, 0.3, 0.5].map(|w| vec![r[0] * w; 3]).to_vec())
         .collect();
     let p = LayeredGrainParams {
-        particle_area: 0.2,
-        channel_scale: [1.; 3],
+        rms_granularity: [8.; 3],
+        usm_sigma: 0.,
+        usm_amount: 0.,
         layer_scale: [2., 1., 0.5],
         density_min: [0.03; 3],
         uniformity: [0.97; 3],

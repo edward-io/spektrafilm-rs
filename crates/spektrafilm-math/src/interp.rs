@@ -32,6 +32,96 @@ pub fn interp_1d(x: &[f32], y: &[f32], xq: f32) -> f32 {
     y[i] + t * (y[i + 1] - y[i])
 }
 
+/// NumPy-compatible right-biased interpolation, including repeated knots.
+pub fn interp_1d_f64(x: &[f64], y: &[f64], query: f64) -> f64 {
+    debug_assert!(!x.is_empty() && x.len() == y.len());
+    if query < x[0] {
+        return y[0];
+    }
+    let upper = x.partition_point(|v| *v <= query);
+    if upper >= x.len() {
+        return y[y.len() - 1];
+    }
+    if upper == 0 {
+        return y[0];
+    }
+    let i = upper - 1;
+    y[i] + (query - x[i]) / (x[upper] - x[i]) * (y[upper] - y[i])
+}
+
+/// NumPy's batch search order matters when strong DIR inhibition folds the axis.
+/// Search semantics follow NumPy compiled_base.c (BSD-3-Clause, data/licenses).
+pub fn interp_batch_f64(axis: &[f64], values: &[f64], queries: &[f64]) -> Vec<f64> {
+    let n = axis.len();
+    let mut guess = 0isize;
+    queries
+        .iter()
+        .map(|&q| {
+            if q.is_nan() {
+                return q;
+            }
+            if q > axis[n - 1] {
+                guess = n as isize;
+                return values[n - 1];
+            }
+            if q < axis[0] {
+                guess = -1;
+                return values[0];
+            }
+            let mut lo = 0usize;
+            let mut hi = n;
+            let mut found = None;
+            if n <= 4 {
+                lo = 1;
+                while lo < n && q >= axis[lo] {
+                    lo += 1;
+                }
+                found = Some(lo - 1);
+            } else {
+                let g = guess.clamp(1, (n - 3) as isize) as usize;
+                if q < axis[g] {
+                    if q < axis[g - 1] {
+                        hi = g - 1;
+                        if g > 8 && q >= axis[g - 8] {
+                            lo = g - 8;
+                        }
+                    } else {
+                        found = Some(g - 1);
+                    }
+                } else if q < axis[g + 1] {
+                    found = Some(g);
+                } else if q < axis[g + 2] {
+                    found = Some(g + 1);
+                } else {
+                    lo = g + 2;
+                    if g + 9 < n && q < axis[g + 8] {
+                        hi = g + 8;
+                    }
+                }
+            }
+            let index = found.unwrap_or_else(|| {
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if q >= axis[mid] {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo.saturating_sub(1)
+            });
+            guess = index as isize;
+            if index == n - 1 || axis[index] == q {
+                values[index]
+            } else {
+                (values[index + 1] - values[index]) / (axis[index + 1] - axis[index])
+                    * (q - axis[index])
+                    + values[index]
+            }
+        })
+        .collect()
+}
+
 /// Interpolate a uniformly-spaced table.
 #[inline]
 pub fn interp_uniform(x_min: f32, x_max: f32, y: &[f32], xq: f32) -> f32 {

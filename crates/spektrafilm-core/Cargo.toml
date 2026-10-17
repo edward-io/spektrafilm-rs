@@ -18,6 +18,7 @@ spektrafilm-gpu.workspace = true
 spektrafilm-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "1.1.8"
 rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

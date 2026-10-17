@@ -55,35 +55,7 @@ fn dgemm_no_transpose(a: &[f64], b: &[f64], c: &mut [f64], m: usize, n: usize, k
 /// Load the spectra LUT from the .npy file.
 /// Shape: (size, size, 81) — maps tc coordinates → 81-wavelength spectra.
 pub fn load_spectra_lut(data_dir: &Path) -> Result<SpectraLut, String> {
-    let path = data_dir
-        .join("luts")
-        .join("spectral_upsampling")
-        .join("irradiance_xy_tc.npy");
-
-    let file = std::fs::File::open(&path)
-        .map_err(|e| format!("opening spectra LUT {}: {e}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
-
-    let (shape, data) =
-        npy::load_npy_f32(reader).map_err(|e| format!("loading spectra LUT: {e}"))?;
-
-    if shape.len() != 3 || shape[2] != N_WAVELENGTHS {
-        return Err(format!(
-            "spectra LUT shape mismatch: expected (N, N, {N_WAVELENGTHS}), got {shape:?}"
-        ));
-    }
-    if shape[0] != shape[1] {
-        return Err(format!(
-            "spectra LUT must be square, got {}x{}",
-            shape[0], shape[1]
-        ));
-    }
-
-    Ok(SpectraLut {
-        size: shape[0],
-        n_wavelengths: shape[2],
-        data,
-    })
+    load_method(data_dir, "hanatos2025")
 }
 
 /// Load the arctic2026alpha02 effective-reflectance LUT.
@@ -123,6 +95,91 @@ pub fn load_arctic2026alpha02_lut(data_dir: &Path) -> Result<SpectraLut, String>
         n_wavelengths: shape[2],
         data,
     })
+}
+
+/// Resolve the same sidecar registry used by the experimental runtime.
+pub fn load_method(data_dir: &Path, identifier: &str) -> Result<SpectraLut, String> {
+    let root = data_dir.join("luts/spectral_upsampling");
+    for item in std::fs::read_dir(&root).map_err(|e| e.to_string())? {
+        let path = item.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let descriptor: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if descriptor.get("identifier").and_then(|v| v.as_str()) != Some(identifier) {
+            continue;
+        }
+        let filename = descriptor
+            .get("file")
+            .and_then(|v| v.as_str())
+            .ok_or("spectral descriptor missing file")?;
+        if std::path::Path::new(filename).components().count() != 1 {
+            return Err("invalid spectral LUT filename".into());
+        }
+        let file = std::fs::File::open(root.join(filename)).map_err(|e| e.to_string())?;
+        let (shape, data) =
+            npy::load_npy_f32(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+        if shape.len() != 3
+            || shape[0] < 2
+            || shape[0] != shape[1]
+            || shape[2] != N_WAVELENGTHS
+            || data.iter().any(|v| !v.is_finite())
+        {
+            return Err(format!("invalid {identifier} spectral LUT"));
+        }
+        return Ok(SpectraLut {
+            size: shape[0],
+            n_wavelengths: shape[2],
+            data,
+        });
+    }
+    Err(format!("unsupported rgb_to_raw_method: {identifier:?}"))
+}
+
+fn reconstructed_neutral(lut: &SpectraLut, illuminant: &[f64]) -> Vec<f64> {
+    let xyz: [f64; 3] = std::array::from_fn(|c| {
+        illuminant
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                e * [
+                    spectral::CMF_X_F64[i],
+                    spectral::CMF_Y_F64[i],
+                    spectral::CMF_Z_F64[i],
+                ][c]
+            })
+            .sum()
+    });
+    let total: f64 = xyz.iter().sum();
+    let (t, c) = spectral::xy_to_tc(xyz[0] / total, xyz[1] / total);
+    let data: Vec<_> = lut.data.iter().map(|v| *v as f64).collect();
+    spektrafilm_math::lut::bicubic_2d_f64(
+        &data,
+        lut.size,
+        lut.size,
+        lut.n_wavelengths,
+        t * (lut.size - 1) as f64,
+        c * (lut.size - 1) as f64,
+    )
+}
+
+/// Measured Akima-resampled taking filters, generated from experimental's CSVs.
+pub fn taking_filter(key: &str) -> Result<Option<Vec<f64>>, String> {
+    if key == "none" {
+        return Ok(None);
+    }
+    static FILTERS: std::sync::LazyLock<std::collections::HashMap<String, Vec<f64>>> =
+        std::sync::LazyLock::new(|| {
+            serde_json::from_str(include_str!("../../../data/filters/taking_filters.json"))
+                .expect("bundled taking filters")
+        });
+    FILTERS
+        .get(key)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| format!("unknown taking filter: {key}"))
 }
 
 pub struct SpectraLut {
@@ -212,6 +269,20 @@ pub fn compute_reflectance_tc_lut(
         }
     }
 
+    let neutral = reconstructed_neutral(
+        reflectance_lut,
+        spektrafilm_math::illuminants::get("D65").expect("D65"),
+    );
+    let response: [f64; 3] = std::array::from_fn(|c| {
+        (0..n_wl)
+            .map(|w| neutral[w] * illuminant[w] * sensitivity[w][c])
+            .sum()
+    });
+    for row in data.chunks_exact_mut(3) {
+        for c in 0..3 {
+            row[c] /= response[c].max(1e-30);
+        }
+    }
     TcLut {
         size,
         channels,
@@ -239,9 +310,55 @@ pub fn compute_tc_lut_with_window(
         .n_wavelengths
         .min(sensitivity.len())
         .min(N_WAVELENGTHS);
+    let windowed = windowed_sensitivity(spectra_lut, sensitivity, window_params, illuminant, true);
+    // Compute raw LUT via BLAS dgemm to match Python's
+    // `opt_einsum.contract('ijl,lm->ijm', spectra, sens*window)`.
+    // numpy/opt_einsum routes this through GEMM with pairwise
+    // accumulation, so a hand-rolled left-to-right loop is off by
+    // 1-2 ULP per cell. Going through dgemm matches bit-for-bit.
+    let size = spectra_lut.size;
+    let channels = 3;
+    let n_pix = size * size;
+    let mut spec_f64 = vec![0.0f64; n_pix * n_wl];
+    for i in 0..n_pix {
+        let src =
+            &spectra_lut.data[i * spectra_lut.n_wavelengths..i * spectra_lut.n_wavelengths + n_wl];
+        let dst = &mut spec_f64[i * n_wl..(i + 1) * n_wl];
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d = *s as f64;
+        }
+    }
+    // Build sens*window as (n_wl × 3) row-major.
+    let mut sw_flat = vec![0.0f64; n_wl * 3];
+    for wl in 0..n_wl {
+        for c in 0..3 {
+            sw_flat[wl * 3 + c] = windowed[wl][c];
+        }
+    }
+    let mut data = vec![0.0f64; n_pix * channels];
+    dgemm_no_transpose(&spec_f64, &sw_flat, &mut data, n_pix, channels, n_wl);
+
+    TcLut {
+        size,
+        channels,
+        data,
+    }
+}
+
+pub fn windowed_sensitivity(
+    spectra_lut: &SpectraLut,
+    sensitivity: &[[f64; 3]],
+    window_params: &[f64],
+    illuminant: &[f64],
+    active: bool,
+) -> Vec<[f64; 3]> {
+    let n_wl = spectra_lut
+        .n_wavelengths
+        .min(sensitivity.len())
+        .min(N_WAVELENGTHS);
 
     // Compute erf4 bandpass window in f64
-    let window = if window_params.len() >= 4 {
+    let window = if active && window_params.len() >= 4 {
         eval_erf4_bandpass(window_params)
     } else {
         vec![[1.0f64; 3]; N_WAVELENGTHS]
@@ -266,9 +383,10 @@ pub fn compute_tc_lut_with_window(
         Vec::with_capacity(n_wl),
         Vec::with_capacity(n_wl),
     ];
+    let neutral_sd = reconstructed_neutral(spectra_lut, illuminant);
     for wl in 0..n_wl {
         for c in 0..3 {
-            let si = sensitivity[wl][c] * illuminant[wl];
+            let si = sensitivity[wl][c] * neutral_sd[wl];
             num_per_wl[c].push(si * window[wl][c]);
             den_per_wl[c].push(si);
         }
@@ -285,38 +403,9 @@ pub fn compute_tc_lut_with_window(
         }
     }
 
-    // Compute raw LUT via BLAS dgemm to match Python's
-    // `opt_einsum.contract('ijl,lm->ijm', spectra, sens*window)`.
-    // numpy/opt_einsum routes this through GEMM with pairwise
-    // accumulation, so a hand-rolled left-to-right loop is off by
-    // 1-2 ULP per cell. Going through dgemm matches bit-for-bit.
-    let size = spectra_lut.size;
-    let channels = 3;
-    let n_pix = size * size;
-    let mut spec_f64 = vec![0.0f64; n_pix * n_wl];
-    for i in 0..n_pix {
-        let src =
-            &spectra_lut.data[i * spectra_lut.n_wavelengths..i * spectra_lut.n_wavelengths + n_wl];
-        let dst = &mut spec_f64[i * n_wl..(i + 1) * n_wl];
-        for (d, s) in dst.iter_mut().zip(src.iter()) {
-            *d = *s as f64;
-        }
-    }
-    // Build sens*window as (n_wl × 3) row-major.
-    let mut sw_flat = vec![0.0f64; n_wl * 3];
-    for wl in 0..n_wl {
-        for c in 0..3 {
-            sw_flat[wl * 3 + c] = sensitivity[wl][c] * window_normalized[wl][c];
-        }
-    }
-    let mut data = vec![0.0f64; n_pix * channels];
-    dgemm_no_transpose(&spec_f64, &sw_flat, &mut data, n_pix, channels, n_wl);
-
-    TcLut {
-        size,
-        channels,
-        data,
-    }
+    (0..n_wl)
+        .map(|w| std::array::from_fn(|c| sensitivity[w][c] * window_normalized[w][c]))
+        .collect()
 }
 
 /// Compute the midgray normalization factor for Hanatos2025.

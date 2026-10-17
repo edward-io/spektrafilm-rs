@@ -148,6 +148,16 @@ pub trait ComputeBackend: Send + Sync {
         false
     }
 
+    fn tetrahedral3d(
+        &self,
+        _image: &ImageBuf,
+        _lut: &spektrafilm_math::lut::TetrahedralLut,
+        _min: [f64; 3],
+        _max: [f64; 3],
+    ) -> Option<ImageBuf> {
+        None
+    }
+
     fn pchip3d(
         &self,
         _image: &ImageBuf,
@@ -290,6 +300,7 @@ pub struct FilmChainParams<'a> {
 /// (auto-exposure × EV compensation × B&W filming correction) into the
 /// matrix — no separate scale pass.
 pub enum FrontPass<'a> {
+    Convert(ConvertGpuParams<'a>),
     /// Hanatos2025 spectral upsampling: per-pixel chromaticity LUT lookup.
     Hanatos2025 {
         tc_lut: &'a spektrafilm_math::spectral::TcLut,
@@ -298,7 +309,20 @@ pub enum FrontPass<'a> {
     },
     /// Mallett2019 reflectance-basis upsampling: one rgb → raw 3×3 matmul
     /// (`core · M_cs`, see `spektrafilm-core/src/mallett.rs`).
-    Mallett2019 { matrix: [[f64; 3]; 3] },
+    Mallett2019 {
+        matrix: [[f64; 3]; 3],
+    },
+}
+
+pub struct ConvertGpuParams<'a> {
+    pub bands: &'a [[f64; 6]],
+    pub maximum: [f64; 3],
+    pub midpoint: [f64; 3],
+    pub log_rgb: [f64; 3],
+    pub seed_inverse: [[f64; 3]; 3],
+    pub calibration: [[f64; 3]; 3],
+    pub lut: Option<&'a spektrafilm_math::lut::TetrahedralLut>,
+    pub bounds: ([f64; 3], [f64; 3]),
 }
 
 /// Physical diffusion PSF and working geometry. wgpu generates and normalizes
@@ -335,6 +359,9 @@ pub struct DirCouplersGpuParams<'a> {
     /// Per-channel max density from the normalized curves (used only when
     /// `is_positive` is true; ignored otherwise).
     pub density_max: [f32; 3],
+    pub donor_k: [f32; 3],
+    pub receiver_k: [f32; 3],
+    pub receiver_ref: [f32; 3],
     pub is_positive: bool,
     pub diffusion_size_px: f32,
     pub diffusion_tail_px: f32,
@@ -364,6 +391,8 @@ pub struct LayeredGrainGpuParams {
     pub uniformity: [f32; 3],
     pub density_min: [f32; 3],
     pub blur: f32,
+    pub usm_sigma: f32,
+    pub usm_amount: f32,
     pub micro_sigma: f32,
     pub micro_blur: f32,
     pub fast_stats: bool,

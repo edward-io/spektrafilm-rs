@@ -259,13 +259,23 @@ fn compress_aces_rgc(rgb: vec3<f32>) -> vec3<f32> {
 }
 
 
-fn jz_pq(v: f32) -> f32 {
-    let n=pow(max(v/10000.0,0.0),0.1593017578125);
-    return pow((0.8359375+18.8515625*n)/(1.0+18.6875*n),134.034375);
+// Avoid forming near-one PQ ratios: f32 cancellation is amplified by m=134.
+fn jz_log1p(x:f32)->f32 {
+    return x*(1.+x*(-0.5+x*(1./3.+x*(-0.25+x*(0.2+x*(-1./6.+x*(1./7.+x*(-0.125+x/9.))))))));
 }
-fn jz_unpq(v: f32) -> f32 {
-    let n=pow(max(v,0.0),1.0/134.034375);
-    return 10000.0*pow(max(n-0.8359375,0.0)/(18.8515625-18.6875*n),1.0/0.1593017578125);
+fn jz_expm1(x:f32)->f32 {
+    if abs(x)>0.25 {return exp(x)-1.;}
+    return x*(1.+x*(0.5+x*(1./6.+x*(1./24.+x*(1./120.+x*(1./720.+x/5040.))))));
+}
+fn jz_pq(v:f32)->f32 {
+    let n=pow(max(v/10000.,0.),0.1593017578125);
+    let delta=0.1640625*(n-1.)/(1.+18.6875*n);
+    return exp(134.034375*jz_log1p(delta));
+}
+fn jz_unpq(v:f32)->f32 {
+    if v<=0. {return 0.;}
+    let delta=jz_expm1(log(v)/134.034375);
+    return 10000.*pow(max(0.1640625+delta,0.)/(0.1640625-18.6875*delta),1./0.1593017578125);
 }
 fn xyz_to_jzazbz(xyz: vec3<f32>) -> vec3<f32> {
     let v=xyz*100.0;
