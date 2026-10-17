@@ -4802,6 +4802,26 @@ mod catalog_loading_tests {
             ..Default::default()
         };
         app.params.camera.exposure_compensation_ev = 1.25;
+        app.params.workflow.route = "input > convert-film > print > scan".into();
+        app.params.camera.color_filter = "hoya_y2".into();
+        app.params.film_render.chemistry.active = true;
+        app.params.film_render.chemistry.gamma_factor = 1.18;
+        app.params.print_render.chemistry.active = true;
+        app.params.print_render.chemistry.developer_exhaustion = 0.3;
+        app.params.film_render.base.active = true;
+        app.params.film_render.base.cyan = 1.2;
+        app.params.film_render.convert.calibration = "1 .01 0 0 1 0 0 0 1".into();
+        let workflow_controls = |p: &RuntimeParams| {
+            serde_json::json!([
+                p.workflow,
+                p.camera.color_filter,
+                p.film_render.chemistry,
+                p.print_render.chemistry,
+                p.film_render.base,
+                p.film_render.convert
+            ])
+        };
+        let expected_controls = workflow_controls(&app.params);
         let dir = tempfile::tempdir().unwrap();
         let photo = |id, orientation, crop| {
             let path = dir.path().join(format!("{id}.dng"));
@@ -4842,6 +4862,7 @@ mod catalog_loading_tests {
             (32, 16)
         );
         assert_eq!(app.params.camera.exposure_compensation_ev, 1.25);
+        assert_eq!(workflow_controls(&app.params), expected_controls);
         let latest_pixels = app.image.as_ref().unwrap().clone();
         app.select_catalog_photo(first);
         finish(&mut app);
@@ -4858,6 +4879,7 @@ mod catalog_loading_tests {
         reopened.restore_project(&path, true).unwrap();
         finish(&mut reopened);
         assert_eq!(reopened.image.as_ref().unwrap().data, latest_pixels.data);
+        assert_eq!(workflow_controls(&reopened.params), expected_controls);
         assert_eq!(
             reopened.export_raw_options().lightroom_geometry,
             latest.geometry.ok()
