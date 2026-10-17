@@ -129,9 +129,14 @@ impl Project {
         }
         let mut p = self.clone();
         if let Some(image) = &self.image {
-            if let Ok(relative) = image.strip_prefix(path.parent().unwrap_or(Path::new("."))) {
-                p.image = Some(relative.into());
-            }
+            let image = std::path::absolute(image)?;
+            let parent = std::path::absolute(path.parent().unwrap_or(Path::new(".")))?;
+            p.image = Some(
+                image
+                    .strip_prefix(parent)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(image),
+            );
         }
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, serde_json::to_vec_pretty(&p)?)?;
@@ -158,6 +163,25 @@ pub fn default_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relative_image_paths_survive_saving_in_another_directory() {
+        let relative = PathBuf::from("Cargo.toml");
+        let expected = std::fs::canonicalize(&relative).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "spektrafilm-relative-project-{}.json",
+            std::process::id()
+        ));
+        let mut project = Project::default();
+        project.image = Some(relative);
+        project.save(&path).unwrap();
+        let loaded = Project::load(&path).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(loaded.image.unwrap()).unwrap(),
+            expected
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn project_roundtrip() {
         let path =

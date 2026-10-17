@@ -1,5 +1,5 @@
 //! Native LUT export controls; the bundled f64 CLI owns deterministic baking.
-use crate::{App, TempPath, locate_f64_cli, run_cli};
+use crate::{App, TempPath, locate_f64_cli, run_cli, tooltips};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use spektrafilm_core::lut_export;
@@ -33,41 +33,120 @@ impl Default for Settings {
 }
 impl App {
     pub(crate) fn lut_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CollapsingHeader::new("LUT export").show(ui, |ui| {
-            ui.label("Uses the selected film, paper and processing settings. Spatial effects and grain are excluded from LUTs.");
-            for (id,label,selected,input_role) in [("lut_input","Input",&mut self.lut.input,true),("lut_output","Output",&mut self.lut.output,false)] {
-                ui.label(label);
-                egui::ComboBox::from_id_salt(id).selected_text(selected.as_str()).show_ui(ui,|ui| {
-                    for space in lut_export::spaces().filter(|s| if input_role {s.input_role} else {s.output_role}) {
-                        ui.selectable_value(selected,space.name.into(),space.name);
-                    }
-                });
-            }
-            egui::ComboBox::from_id_salt("lut_format").selected_text(&self.lut.format).show_ui(ui,|ui| {
-                for (id,name) in [("cube","CUBE"),("3dl","Autodesk 3DL (10-bit)"),("lumix","Lumix V-Log CUBE"),("hald_png","Hald PNG")] {
-                    if ui.selectable_value(&mut self.lut.format,id.into(),name).changed() {
-                        if id=="hald_png" { self.lut.size=64; }
-                        else if ![17,33,65].contains(&self.lut.size) { self.lut.size=33; }
-                        if id=="lumix" { self.lut.input="Panasonic V-Log".into(); self.lut.output="sRGB".into();self.lut.topology="1lut".into(); }
-                    }
+        egui::CollapsingHeader::new("LUT export")
+            .show(ui, |ui| {
+                ui.label(tooltips::LUT_SETTINGS_NOTE);
+                for (id, label, selected, input_role) in [
+                    ("lut_input", "Input", &mut self.lut.input, true),
+                    ("lut_output", "Output", &mut self.lut.output, false),
+                ] {
+                    ui.label(label).on_hover_text(if input_role {
+                        tooltips::LUT_INPUT
+                    } else {
+                        tooltips::LUT_OUTPUT
+                    });
+                    egui::ComboBox::from_id_salt(id)
+                        .selected_text(selected.as_str())
+                        .show_ui(ui, |ui| {
+                            for space in lut_export::spaces().filter(|s| {
+                                if input_role {
+                                    s.input_role
+                                } else {
+                                    s.output_role
+                                }
+                            }) {
+                                ui.selectable_value(selected, space.name.into(), space.name)
+                                    .on_hover_text(tooltips::option(space.name));
+                            }
+                        });
                 }
-            });
-            ui.add(egui::DragValue::new(&mut self.lut.size).range(2..=129).prefix("Cube resolution: "));
-            if self.lut.format=="hald_png" {ui.label("Hald requires a square resolution, such as 16 or 64.");}
-            ui.checkbox(&mut self.lut.bundle,"Export a bundle with metadata and OCIO");
-            if self.lut.bundle {
-                egui::ComboBox::from_id_salt("lut_topology").selected_text(&self.lut.topology).show_ui(ui,|ui| {
-                    for value in ["1lut","2lut","3lut","4lut"] {ui.selectable_value(&mut self.lut.topology,value.into(),value);}
-                });
-                ui.checkbox(&mut self.lut.combinations,"Include combined stages");
-                ui.checkbox(&mut self.lut.qa,"Include diagnostic report");
-            }
-            let available=self.export_job.is_none();
-            if ui.add_enabled(available,egui::Button::new("Export LUT…")).clicked() {self.lut_export_dialog(ctx);}
-            if ui.add_enabled(available,egui::Button::new("Build from bundle spec…")).on_hover_text("Choose a JSON or TOML specification for multi-paper, ZIP and delivery-target workflows.").clicked() {
-                self.lut_spec_dialog(ctx);
-            }
-        });
+                ui.label("File format")
+                    .on_hover_text(tooltips::MENU_LUT_FORMAT);
+                egui::ComboBox::from_id_salt("lut_format")
+                    .selected_text(&self.lut.format)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in [
+                            ("cube", "CUBE"),
+                            ("3dl", "Autodesk 3DL (10-bit)"),
+                            ("lumix", "Lumix V-Log CUBE"),
+                            ("hald_png", "Hald PNG"),
+                        ] {
+                            if ui
+                                .selectable_value(&mut self.lut.format, id.into(), name)
+                                .on_hover_text(tooltips::option(id))
+                                .changed()
+                            {
+                                if id == "hald_png" {
+                                    self.lut.size = 64;
+                                } else if ![17, 33, 65].contains(&self.lut.size) {
+                                    self.lut.size = 33;
+                                }
+                                if id == "lumix" {
+                                    self.lut.input = "Panasonic V-Log".into();
+                                    self.lut.output = "sRGB".into();
+                                    self.lut.topology = "1lut".into();
+                                }
+                            }
+                        }
+                    });
+                tooltips::labeled(
+                    ui,
+                    egui::DragValue::new(&mut self.lut.size).range(2..=129),
+                    "Cube resolution: ",
+                    tooltips::CONTROL_CUBE_RESOLUTION,
+                );
+                if self.lut.format == "hald_png" {
+                    ui.label("Hald requires a square resolution, such as 16 or 64.");
+                }
+                tooltips::checkbox(
+                    ui,
+                    &mut self.lut.bundle,
+                    "Export a bundle with metadata and OCIO",
+                    tooltips::CONTROL_EXPORT_A_BUNDLE_WITH_METADATA_AND_OCIO,
+                );
+                if self.lut.bundle {
+                    ui.label("Stage layout")
+                        .on_hover_text(tooltips::MENU_LUT_TOPOLOGY);
+                    egui::ComboBox::from_id_salt("lut_topology")
+                        .selected_text(&self.lut.topology)
+                        .show_ui(ui, |ui| {
+                            for value in ["1lut", "2lut", "3lut", "4lut"] {
+                                ui.selectable_value(&mut self.lut.topology, value.into(), value)
+                                    .on_hover_text(tooltips::option(value));
+                            }
+                        });
+                    tooltips::checkbox(
+                        ui,
+                        &mut self.lut.combinations,
+                        "Include combined stages",
+                        tooltips::CONTROL_INCLUDE_COMBINED_STAGES,
+                    );
+                    tooltips::checkbox(
+                        ui,
+                        &mut self.lut.qa,
+                        "Include diagnostic report",
+                        tooltips::CONTROL_INCLUDE_DIAGNOSTIC_REPORT,
+                    );
+                }
+                let available = self.export_job.is_none();
+                if ui
+                    .add_enabled(available, egui::Button::new("Export LUT…"))
+                    .on_hover_text(tooltips::CONTROL_EXPORT_LUT)
+                    .on_disabled_hover_text(tooltips::CONTROL_EXPORT_LUT)
+                    .clicked()
+                {
+                    self.lut_export_dialog(ctx);
+                }
+                if ui
+                    .add_enabled(available, egui::Button::new("Build from bundle spec…"))
+                    .on_hover_text(tooltips::BUILD_BUNDLE_SPEC)
+                    .clicked()
+                {
+                    self.lut_spec_dialog(ctx);
+                }
+            })
+            .header_response
+            .on_hover_text(tooltips::SECTION_LUT_EXPORT);
     }
     fn lut_export_dialog(&mut self, ctx: &egui::Context) {
         let cli = match locate_f64_cli() {

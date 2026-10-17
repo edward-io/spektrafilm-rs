@@ -163,14 +163,50 @@ pub fn write_lut(
     title: &str,
     input: &str,
 ) -> Result<(), String> {
+    validate_format(size, format, input)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    write_lut_file(image, size, temporary.path(), format, title)?;
+    temporary.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn validate_format(size: u32, format: &str, input: &str) -> Result<(), String> {
+    if !(2..=129).contains(&size) {
+        return Err("LUT resolution must be in 2..=129".into());
+    }
+    match format {
+        "cube" | "3dl" => Ok(()),
+        "lumix" => {
+            if ![17, 33, 65].contains(&size) {
+                return Err("Lumix resolution must be 17, 33 or 65".into());
+            }
+            if space(input)?.tag != "vlog" {
+                return Err("Lumix input must be Panasonic V-Log".into());
+            }
+            Ok(())
+        }
+        "hald_png" if (size as f64).sqrt().fract() == 0. => Ok(()),
+        "hald_png" => Err("Hald PNG requires a square cube resolution".into()),
+        _ => Err(format!("unknown LUT format: {format}")),
+    }
+}
+
+fn write_lut_file(
+    image: &ImageBuf,
+    size: u32,
+    path: &Path,
+    format: &str,
+    title: &str,
+) -> Result<(), String> {
     if image.pixel_count() != size.pow(3) as usize {
         return Err("LUT data length does not match resolution".into());
     }
     if format == "hald_png" {
         let level = (size as f64).sqrt() as u32;
-        if level * level != size {
-            return Err("Hald PNG requires a square cube resolution (4, 9, 16, 25, 36, 49, 64, 81, 100, 121)".into());
-        }
         let side = level.pow(3);
         let data: Vec<u8> = image
             .data
@@ -211,18 +247,7 @@ pub fn write_lut(
         } else if format == "cube" || format == "lumix" {
             writeln!(file, "TITLE \"{}\"", title.replace(['\n', '\r', '"'], " "))?;
             if format == "lumix" {
-                if ![17, 33, 65].contains(&size) {
-                    return Err(std::io::Error::other(
-                        "Lumix resolution must be 17, 33 or 65",
-                    ));
-                }
-                let tag = match space(input).map(|s| s.tag) {
-                    Ok("vlog") => "VLOG",
-                    _ => {
-                        return Err(std::io::Error::other("Lumix input must be Panasonic V-Log"));
-                    }
-                };
-                writeln!(file, "#LUMIXPHOTOSTYLE {tag}")?;
+                writeln!(file, "#LUMIXPHOTOSTYLE VLOG")?;
             }
             writeln!(
                 file,

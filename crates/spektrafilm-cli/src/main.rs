@@ -285,13 +285,19 @@ fn cmd_process(
     let total_start = Instant::now();
 
     // Load params (defaults + optional overrides)
-    let mut params = if let Some(pf) = params_file {
+    let (mut params, input_overrides) = if let Some(pf) = params_file {
         let f = std::fs::File::open(pf)
             .with_context(|| format!("opening params file: {}", pf.display()))?;
-        serde_json::from_reader(std::io::BufReader::new(f))
-            .with_context(|| "parsing params file")?
+        let value: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(f))
+            .with_context(|| "parsing params file")?;
+        let overrides =
+            ["input_color_space", "input_cctf_decoding"].map(|key| value["io"].get(key).is_some());
+        (
+            serde_json::from_value(value).context("parsing params file")?,
+            overrides,
+        )
     } else {
-        RuntimeParams::default()
+        (RuntimeParams::default(), [false; 2])
     };
     params.io.scan_film |= scan_film;
     let scan_film = params.io.scan_film;
@@ -327,8 +333,10 @@ fn cmd_process(
             lens_database: lens_database.map(Path::to_path_buf),
         },
     )?;
-    if params_file.is_none() || spektrafilm_io::is_raw(input) {
+    if !input_overrides[0] {
         params.io.input_color_space = loaded.color_space;
+    }
+    if !input_overrides[1] {
         params.io.input_cctf_decoding = loaded.encoded;
     }
     let save_options = spektrafilm_io::SaveOptions {
@@ -491,20 +499,26 @@ fn cmd_export_lut(
         params,
     };
     if let Some(topology) = topology {
+        let staged = spektrafilm_core::bundle_output::OutputDirectory::new(output)
+            .map_err(anyhow::Error::msg)?;
         let meta = spektrafilm_core::lut_bundle::write_bundle(
             &options,
             data_dir,
-            output,
+            staged.path(),
             topology,
             format,
             combinations,
         )
         .map_err(anyhow::Error::msg)?;
         if qa {
-            let quality = spektrafilm_core::lut_quality::assess(&options, data_dir, &meta, output)
+            let quality =
+                spektrafilm_core::lut_quality::assess(&options, data_dir, &meta, staged.path())
+                    .map_err(anyhow::Error::msg)?;
+            quality
+                .write_report(staged.path())
                 .map_err(anyhow::Error::msg)?;
-            quality.write_report(output).map_err(anyhow::Error::msg)?;
         }
+        staged.commit().map_err(anyhow::Error::msg)?;
         return Ok(());
     }
     if qa {

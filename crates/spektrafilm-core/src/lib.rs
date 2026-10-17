@@ -1,3 +1,4 @@
+pub mod bundle_output;
 pub mod calibration;
 pub mod color_reference;
 pub mod data;

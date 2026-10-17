@@ -63,7 +63,7 @@ Changes from the original Rust fork's v0.1.2 baseline,
   optional LibRaw with Auto fallback, built-in Lensfun, automatic database
   download/cache, corrected RGB vignetting handling and clearer load errors.
 - **GUI and previews:** project/default persistence, Python GUI state import,
-  rotation, layer/comparison controls and paper animation; cached previews with
+  rotation, contextual hover help, layer/comparison controls and paper animation; cached previews with
   adjustable resolution, smaller interactive frames and background workers.
 - **Reference validation:** Python v0.3.4 fixtures, f32/f64 checks and GPU
   accuracy audits, with measured numerical tolerances and documented remaining
@@ -84,14 +84,20 @@ The GUI exposes film/paper, exposure, optical effects, layered grain, color,
 crop/resize, RAW development and output controls. Project files preserve these
 settings; Python GUI state JSON can be imported. Loading and rendering run in
 background workers, with progress and errors in the bottom status bar.
+Hover over control labels, section headings or dropdown entries for a short explanation.
+Slider tracks and numeric editors do not show the control’s explanation.
 Set **Preview long edge (px)** in the right sidebar to change preview size.
 This is independent of the simplified-effect preview mode: the default is 2048
 pixels on the long edge, dropping to at most 640 while dragging a control.
 Scaled inputs are cached, and releasing the control refines the preview.
 Auto preview can be disabled for manual rendering. RAW decoder, white-balance
 and lens settings take effect with **Reload RAW with these settings**. Lens
-correction uses **Database: automatic** by default; its first download requires
-internet access, and subsequent loads use the cached database offline.
+correction reports whether the database is downloaded, installed locally or not
+downloaded yet. Hover over an available database's status to see its location.
+The first download requires internet access; subsequent loads use the cache offline.
+Projects retain the RAW settings that produced the loaded image; pending RAW
+edits become part of the project after Reload. Image paths remain valid when
+the project is saved in another folder.
 
 **Save preview** writes the bounded preview. **Export** renders the original at
 full resolution on the GPU; disable GPU export under File export for the f64
@@ -103,6 +109,10 @@ Project/default files use the platform's application configuration directory.
 PNG/JPEG quantize and clip; float TIFF/EXR preserve
 negative values and highlights above 1. Preview and saving color spaces are
 independent; output files are converted to the saving space before encoding.
+EXR always stores linear values with RGB chromaticities. Untagged EXR uses
+linear sRGB; unsupported custom primaries produce an explicit error. Embedded
+RGB ICC profiles are recognized or converted to linear sRGB during loading.
+Failed image or LUT writes preserve the previous output file.
 
 ## CLI
 
@@ -144,10 +154,15 @@ and TIFF/EXR bit depth are configurable.
 ```
 
 Supported formats: `--format cube|3dl|lumix|hald_png`. Lumix requires V-Log and
-17/33/65 samples per axis; Hald requires a square resolution such as 16 or 64.
+17/33/65 samples per axis and a single-stage bundle; Hald requires a square
+resolution such as 16 or 64.
 Bundles support 1/2/3/4-stage topologies, multiple papers, ZIP, wire metadata,
 optional OCIO, and native scientific QA reports (`--qa` on bundle export).
 Spatial effects, grain, glare and automatic exposure are disabled for baking.
+Bundles are built in a temporary directory before replacing the previous
+bundle, removing stale QA and LUT files. Use an empty folder or an existing
+bundle folder; unrelated files cause an error and are preserved. ZIP delivery
+includes only the newly built bundle.
 
 Example `bundle.toml`:
 

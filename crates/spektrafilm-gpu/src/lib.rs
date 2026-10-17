@@ -199,8 +199,6 @@ pub trait ComputeBackend: Send + Sync {
 pub struct FilmChainParams<'a> {
     pub image: &'a ImageBuf,
     pub input_transfer: spektrafilm_math::transfer::Transfer,
-    /// Autoexposure scales encoded input before the transfer is decoded.
-    pub input_scale: f64,
     pub output_transfer: spektrafilm_math::transfer::Transfer,
     /// RGB → film-raw front pass (the configured upsampler).
     pub front: FrontPass<'a>,

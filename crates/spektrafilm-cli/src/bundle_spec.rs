@@ -4,10 +4,7 @@ use spektrafilm_core::{
     lut_export::{self, BakeOptions},
     params::{InputGamutCompressParams, OutputGamutCompressParams, RuntimeParams},
 };
-use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[derive(Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct Spec {
@@ -206,7 +203,7 @@ pub fn build(
         serde_json::from_value(spec.output_gamut_compress.clone())?
     };
     params.validate().map_err(anyhow::Error::msg)?;
-    let root = if spec.name.is_empty() {
+    let destination = if spec.name.is_empty() {
         output.to_path_buf()
     } else {
         if spec.name.contains(['/', '\\']) || spec.name == ".." {
@@ -214,12 +211,16 @@ pub fn build(
         }
         output.join(&spec.name)
     };
+    let destination = std::path::absolute(destination)?;
+    let staged = spektrafilm_core::bundle_output::OutputDirectory::new(&destination)
+        .map_err(anyhow::Error::msg)?;
+    let root = staged.path();
     for (index, paper) in spec.print_profiles.iter().enumerate() {
         if paper.contains(['/', '\\']) || paper == ".." {
             bail!("print profile must be a stock identifier");
         }
         let directory = if spec.print_profiles.len() == 1 {
-            root.clone()
+            root.to_path_buf()
         } else {
             root.join(paper)
         };
@@ -262,14 +263,21 @@ pub fn build(
         std::fs::copy(license, root.join("SPEKTRAFILM_LICENSE.txt"))?;
     }
     if spec.container == "zip" {
-        let archive = root.with_extension("zip");
-        let file = std::fs::File::create(&archive)?;
+        let archive = destination.with_extension("zip");
+        let parent = archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let file = temporary.reopen()?;
         let mut writer = zip::ZipWriter::new(file);
-        archive_directory(&mut writer, &root, &root)?;
-        writer.finish()?;
+        archive_directory(&mut writer, root, root)?;
+        writer.finish()?.sync_all()?;
+        staged.commit().map_err(anyhow::Error::msg)?;
+        temporary.persist(&archive)?;
         Ok(archive)
     } else {
-        Ok(root)
+        staged.commit().map_err(anyhow::Error::msg)
     }
 }
 fn archive_directory(
@@ -290,9 +298,7 @@ fn archive_directory(
                 zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated),
             )?;
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)?.read_to_end(&mut bytes)?;
-            writer.write_all(&bytes)?;
+            std::io::copy(&mut std::fs::File::open(path)?, writer)?;
         }
     }
     Ok(())

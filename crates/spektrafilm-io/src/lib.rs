@@ -1,4 +1,5 @@
 //! Shared application image I/O. Quantization and clipping happen only here.
+mod color;
 mod lens;
 mod lens_api;
 pub mod lens_database;
@@ -25,7 +26,7 @@ pub struct LoadedImage {
     pub encoded: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RawOptions {
     pub decoder: String,
@@ -153,10 +154,11 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
                 ]);
             },
         )?;
+        let color_space = color::exr_color_space(img.attributes.chromaticities)?;
         return Ok(LoadedImage {
             pixels: img.layer_data.channel_data.pixels,
             metadata: Metadata::default(),
-            color_space: "ProPhoto RGB".into(),
+            color_space: color_space.into(),
             encoded: false,
         });
     }
@@ -191,7 +193,11 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
     let mut image = image::DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
     let default_encoded = matches!(extension(path).as_str(), "png" | "jpg" | "jpeg");
-    let tagged = embedded_icc.as_deref().and_then(identify_icc);
+    let mut rgb = image.to_rgb32f();
+    let tagged = embedded_icc
+        .as_deref()
+        .map(|profile| color::apply_icc(&mut rgb, profile))
+        .transpose()?;
     let (color_space, encoded) = tagged.unwrap_or((
         if default_encoded {
             "sRGB"
@@ -200,10 +206,9 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
         },
         default_encoded,
     ));
-    let rgb = image.to_rgb32f();
     let (w, h) = (rgb.width(), rgb.height());
-    // Standard raster input stays encoded, so a caller's input-space selection
-    // is respected and the core decodes exactly once.
+    // Recognized raster profiles retain their transport; other ICC profiles
+    // have already been converted to linear sRGB by the CMS.
     Ok(LoadedImage {
         pixels: ImageBuf::from_data(
             w,
@@ -228,7 +233,7 @@ fn raw_fallback_error(rawler_error: anyhow::Error, libraw_error: anyhow::Error) 
          For newer cameras, install a current LibRaw and select Auto, or set SPEKTRAFILM_LIBRAW_LIBRARY to its library path."
     )
 }
-fn identify_icc(profile: &[u8]) -> Option<(&'static str, bool)> {
+pub(crate) fn identify_icc(profile: &[u8]) -> Option<(&'static str, bool)> {
     let known: &[(&[u8], &str, bool)] = &[
         (
             include_bytes!("../../../data/icc/ellelstone/sRGB-elle-V2-srgbtrc.icc").as_slice(),
@@ -372,7 +377,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         h as u32,
         data.into_iter().map(|v| from_f64(v as f64)).collect(),
     );
-    if options.tint != 1. {
+    if options.white_balance == "custom" && options.tint != 1. {
         for p in pixels.data.chunks_exact_mut(3) {
             p[1] *= from_f64(options.tint);
         }
@@ -380,6 +385,10 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
     if options.lens_correction {
         lens::correct(&mut pixels, path, options.lens_database.as_deref())?;
     }
+    // RawDevelop crops and demosaics in sensor coordinates but does not apply
+    // the orientation tag. Transform after lens correction, before the GUI
+    // sees the pixels or saving normalizes the exported orientation to 1.
+    let pixels = orient_raw(pixels, raw.orientation);
     Ok(LoadedImage {
         pixels,
         metadata: Metadata {
@@ -396,6 +405,33 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         color_space: "sRGB".into(),
         encoded: false,
     })
+}
+
+fn orient_raw(image: ImageBuf, orientation: rawler::decoders::Orientation) -> ImageBuf {
+    use rayon::prelude::*;
+    let (transpose, flip_x, flip_y) = orientation.to_flips();
+    if !transpose && !flip_x && !flip_y {
+        return image;
+    }
+    let (width, height) = if transpose {
+        (image.height, image.width)
+    } else {
+        (image.width, image.height)
+    };
+    let mut output = ImageBuf::new(width, height);
+    output.par_rows_mut().enumerate().for_each(|(y, row)| {
+        for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+            let (x, y) = if transpose {
+                (y as u32, x as u32)
+            } else {
+                (x as u32, y as u32)
+            };
+            let sx = if flip_x { image.width - 1 - x } else { x };
+            let sy = if flip_y { image.height - 1 - y } else { y };
+            pixel.copy_from_slice(&image.get(sx, sy));
+        }
+    });
+    output
 }
 
 fn icc(data_dir: &Path, options: &SaveOptions) -> Option<Vec<u8>> {
@@ -450,25 +486,32 @@ fn save_pixels(
     let w = image.width;
     let h = image.height;
     if ext == "exr" {
-        // Float EXR deliberately keeps negative values and highlights above 1.
+        use exr::prelude::{Image, SpecificChannels, Vec2, WritableImage};
+        let chromaticities = color::exr_chromaticities(&options.color_space)?;
         if options.bit_depth == 16 {
-            exr::prelude::write_rgb_file(path, w as usize, h as usize, |x, y| {
+            let channels = SpecificChannels::rgb(|Vec2(x, y)| {
                 let i = (y * w as usize + x) * 3;
                 (
                     exr::prelude::f16::from_f32(image.data[i] as f32),
                     exr::prelude::f16::from_f32(image.data[i + 1] as f32),
                     exr::prelude::f16::from_f32(image.data[i + 2] as f32),
                 )
-            })?;
+            });
+            let mut exr = Image::from_channels((w as usize, h as usize), channels);
+            exr.attributes.chromaticities = Some(chromaticities);
+            exr.write().to_file(path)?;
         } else if options.bit_depth == 32 {
-            exr::prelude::write_rgb_file(path, w as usize, h as usize, |x, y| {
+            let channels = SpecificChannels::rgb(|Vec2(x, y)| {
                 let i = (y * w as usize + x) * 3;
                 (
                     image.data[i] as f32,
                     image.data[i + 1] as f32,
                     image.data[i + 2] as f32,
                 )
-            })?;
+            });
+            let mut exr = Image::from_channels((w as usize, h as usize), channels);
+            exr.attributes.chromaticities = Some(chromaticities);
+            exr.write().to_file(path)?;
         } else {
             bail!("EXR bit depth must be 16 or 32");
         }
@@ -542,6 +585,7 @@ fn save_pixels(
         )),
         _ => bail!("unsupported output format: {ext}"),
     }
+    std::io::Write::flush(&mut writer)?;
     Ok(())
 }
 
@@ -565,7 +609,11 @@ pub fn convert_color(
     if source == destination && source_encoded == destination_encoded {
         return Ok(image.clone());
     }
-    let matrix = spektrafilm_math::transfer::rgb_matrix(source, destination);
+    let matrix = if source == destination {
+        [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]
+    } else {
+        spektrafilm_math::transfer::rgb_matrix(source, destination)
+    };
     let mut out = image.clone();
     out.data.par_chunks_exact_mut(3).for_each(|p| {
         let linear = std::array::from_fn::<_, 3, _>(|c| {
@@ -595,8 +643,12 @@ pub fn save_converted(
     metadata: &Metadata,
     data_dir: &Path,
 ) -> Result<()> {
+    let mut options = options.clone();
+    if extension(path) == "exr" {
+        options.encoded = false;
+    }
     if source == options.color_space && source_encoded == options.encoded {
-        return save(image, path, options, metadata, data_dir);
+        return save(image, path, &options, metadata, data_dir);
     }
     let image = convert_color(
         image,
@@ -605,12 +657,53 @@ pub fn save_converted(
         &options.color_space,
         options.encoded,
     )?;
-    save(&image, path, options, metadata, data_dir)
+    save(&image, path, &options, metadata, data_dir)
 }
 
 /// Save pixels, then merge source descriptive tags into the output's own IFDs.
 /// Structural TIFF/thumbnail offsets are never transplanted from the source.
 pub fn save(
+    image: &ImageBuf,
+    path: &Path,
+    options: &SaveOptions,
+    metadata: &Metadata,
+    data_dir: &Path,
+) -> Result<()> {
+    let ext = extension(path);
+    match ext.as_str() {
+        "tif" | "tiff" if ![8, 16, 32].contains(&options.bit_depth) => {
+            bail!("TIFF bit depth must be 8, 16, or 32")
+        }
+        "exr" if ![16, 32].contains(&options.bit_depth) => bail!("EXR bit depth must be 16 or 32"),
+        "tif" | "tiff" | "exr" | "png" | "jpg" | "jpeg" => {}
+        _ => bail!("unsupported output format: {ext}"),
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .suffix(&format!(".{ext}"))
+        .tempfile_in(parent)?;
+    if ext == "exr" && options.encoded {
+        let linear = convert_color(
+            image,
+            &options.color_space,
+            true,
+            &options.color_space,
+            false,
+        )?;
+        let mut options = options.clone();
+        options.encoded = false;
+        save_file(&linear, temporary.path(), &options, metadata, data_dir)?;
+    } else {
+        save_file(image, temporary.path(), options, metadata, data_dir)?;
+    }
+    temporary.persist(path).context("publishing output image")?;
+    Ok(())
+}
+
+fn save_file(
     image: &ImageBuf,
     path: &Path,
     options: &SaveOptions,

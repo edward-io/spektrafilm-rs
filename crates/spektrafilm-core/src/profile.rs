@@ -90,7 +90,9 @@ fn default_d50() -> String {
 pub struct ProfileData {
     #[serde(default)]
     pub wavelengths: Vec<f64>,
-    #[serde(default, deserialize_with = "deser_zero_matrix")]
+    // Missing logarithmic sensitivity must remain NaN: linearization maps
+    // 10^NaN to zero. Substituting log-sensitivity 0 would invent sensitivity 1.
+    #[serde(default, deserialize_with = "deser_nullable_matrix")]
     pub log_sensitivity: Vec<Vec<f64>>,
     #[serde(default, deserialize_with = "deser_zero_vec")]
     pub hanatos2025_adaptation_window_params: Vec<f64>,
@@ -159,7 +161,7 @@ impl DensityCurvesModel {
     }
 }
 
-/// Deserialize with null → 0.0 (for data that must be finite: sensitivity, density curves).
+/// Deserialize with null → 0.0 (for density curves and adaptation parameters).
 /// Whole-field `null` (B&W profiles null out unused fields) reads as empty.
 fn deser_zero_vec<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
 where
@@ -437,8 +439,7 @@ pub fn resolve_for_render(mut profile: Profile, development_time: Option<f64>) -
         model.sigmas = pick(&model.sigmas);
     }
     // Layers are n_le × n_layers × n_times on B&W families (upstream slices
-    // `[:, :, idx]`). Unconsumed by the runtime today, but collapse anyway so
-    // no future consumer reads the stale family.
+    // `[:, :, idx]`). Select the same development time as the total curves.
     for layer_row in &mut d.density_curves_layers {
         for layer in layer_row.iter_mut() {
             let i = idx.min(layer.len().saturating_sub(1));
@@ -458,6 +459,12 @@ pub fn resolve_for_render(mut profile: Profile, development_time: Option<f64>) -
     for row in &mut d.density_curves {
         let v = row.first().copied().unwrap_or(0.0);
         *row = vec![v, v, v];
+    }
+    for row in &mut d.density_curves_layers {
+        for layer in row {
+            let v = layer[0];
+            *layer = vec![v, v, v];
+        }
     }
     for row in &mut d.channel_density {
         let c = row.first().copied().unwrap_or(f64::NAN);
@@ -485,6 +492,26 @@ fn validate_profile(profile: &Profile) -> Result<(), ProfileError> {
         return Err(ProfileError::Validation(
             "density_curves length must match log_exposure length".into(),
         ));
+    }
+    // The grain kernels consume three physical layers per channel. B&W
+    // profiles store development times in the channel axis until resolved.
+    // Missing layer data is supported through the simple-grain fallback.
+    let layer_channels = if profile.is_bw() {
+        data.development_time.len().max(1)
+    } else {
+        3
+    };
+    if !data.density_curves_layers.is_empty()
+        && (data.density_curves_layers.len() != data.log_exposure.len()
+            || data
+                .density_curves_layers
+                .iter()
+                .any(|row| row.len() != 3 || row.iter().any(|layer| layer.len() != layer_channels)))
+    {
+        return Err(ProfileError::Validation(format!(
+            "density_curves_layers must have shape [{}, 3, {layer_channels}] (exposure samples, physical layers, channels or development times)",
+            data.log_exposure.len()
+        )));
     }
     if profile.is_bw() {
         // B&W: one sensitivity/dye channel; density-curve columns index the
@@ -532,6 +559,18 @@ pub enum ProfileError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_bw_log_sensitivity_stays_missing_until_linearization() {
+        for stock in ["kodak_doublex", "kodak_trix", "kodak_2302"] {
+            let p = data_profile(stock).expect("bundled B&W profile");
+            // The first wavelength is unmeasured in all three source JSONs.
+            assert!(p.data.log_sensitivity[0][0].is_nan(), "{stock}");
+            let resolved = resolve_for_render(p, None);
+            assert!(resolved.log_sensitivity_f64()[0].iter().all(|v| v.is_nan()));
+            assert!(resolved.log_sensitivity_f32()[0].iter().all(|v| v.is_nan()));
+        }
+    }
+
     fn data_profile(name: &str) -> Option<Profile> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -577,12 +616,12 @@ mod tests {
         let want_curve: Vec<f64> = p.data.density_curves.iter().map(|r| r[3]).collect();
         let r = resolve_for_render(p, Some(10.0));
         assert_eq!(r.data.development_time, vec![9.0]);
-        assert!(
-            r.data
-                .log_sensitivity
-                .iter()
-                .all(|row| row.len() == 3 && row[0] == row[1] && row[1] == row[2])
-        );
+        assert!(r.data.log_sensitivity.iter().all(|row| {
+            row.len() == 3
+                && row
+                    .iter()
+                    .all(|v| *v == row[0] || (v.is_nan() && row[0].is_nan()))
+        }));
         for (row, want) in r.data.density_curves.iter().zip(&want_curve) {
             assert_eq!(row.len(), 3);
             assert_eq!(row[0], *want);
@@ -600,6 +639,83 @@ mod tests {
         let model = r.data.density_curves_model.as_ref().unwrap();
         assert_eq!(model.n_channels(), 3);
         assert_eq!(model.centers[0], model.centers[1]);
+    }
+
+    #[test]
+    fn resolve_bw_grain_layers_selects_time_and_broadcasts() {
+        for stock in ["kodak_doublex", "kodak_trix", "kodak_2302"] {
+            let p = data_profile(stock).expect("bundled B&W profile");
+            for requested in [None, Some(4.0), Some(10.0), Some(12.0)] {
+                let idx = development_time_index(&p.data.development_time, requested);
+                let resolved = resolve_for_render(p.clone(), requested);
+                assert_eq!(
+                    resolved.data.density_curves_layers.len(),
+                    resolved.data.density_curves.len()
+                );
+                for (source, row) in p
+                    .data
+                    .density_curves_layers
+                    .iter()
+                    .zip(&resolved.data.density_curves_layers)
+                {
+                    assert_eq!(row.len(), 3, "{stock}: physical layers");
+                    for (original_layer, layer) in source.iter().zip(row) {
+                        assert_eq!(
+                            layer,
+                            &vec![original_layer[idx]; 3],
+                            "{stock}: grain must use the selected development time in all RGB lanes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_grain_layers_but_allows_missing_layers() {
+        for stock in ["kodak_doublex", "kodak_trix", "kodak_gold_200"] {
+            let p = data_profile(stock).expect("bundled profile");
+            for dimension in 0..3 {
+                let mut invalid = p.clone();
+                match dimension {
+                    0 => {
+                        invalid.data.density_curves_layers.pop();
+                    }
+                    1 => {
+                        invalid.data.density_curves_layers[0].pop();
+                    }
+                    _ => {
+                        invalid.data.density_curves_layers[0][0].pop();
+                    }
+                }
+                let error = validate_profile(&invalid).unwrap_err().to_string();
+                assert!(error.contains("density_curves_layers must have shape"));
+            }
+            let mut without_layers = p;
+            without_layers.data.density_curves_layers.clear();
+            validate_profile(&without_layers).unwrap();
+        }
+    }
+
+    #[test]
+    fn all_bundled_profiles_have_valid_grain_layouts() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/profiles");
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let loaded = load_profile(&path).unwrap();
+                let resolved = resolve_for_render(loaded, None);
+                assert!(
+                    resolved
+                        .data
+                        .density_curves_layers
+                        .iter()
+                        .all(|row| { row.len() == 3 && row.iter().all(|layer| layer.len() == 3) }),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Colour profiles pass through `resolve_for_render` untouched.

@@ -25,6 +25,7 @@ ureq = "3.3"
 bzip2 = "0.6"
 tar = "0.4"
 tempfile = "3"
+moxcms = { version = "0.8.1", features = ["extended_range"] }
 
 [dev-dependencies]
 serde_json.workspace = true

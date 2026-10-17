@@ -9,14 +9,14 @@ fn python_reference_cases() {
     for case in fixture["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let params: RuntimeParams = serde_json::from_value(case["params"].clone()).unwrap();
-        let p = Pipeline::new_with_spectral(
+        let mut p = Pipeline::new_with_spectral(
             load_profile_by_name(&dir, "kodak_portra_400").unwrap(),
             load_profile_by_name(&dir, "kodak_portra_endura").unwrap(),
             params,
             &dir,
         )
         .unwrap();
-        let image = ImageBuf::from_data(
+        let mut image = ImageBuf::from_data(
             case["width"].as_u64().unwrap() as u32,
             case["height"].as_u64().unwrap() as u32,
             case["input"]
@@ -26,6 +26,31 @@ fn python_reference_cases() {
                 .map(|v| from_f64(v.as_f64().unwrap()))
                 .collect(),
         );
+        if p.params.camera.auto_exposure
+            && p.params.io.input_cctf_decoding
+            && p.params.taps.inject.as_deref().unwrap_or("rgb_in") == "rgb_in"
+            && p.params.taps.collect.as_deref() != Some("rgb_in")
+        {
+            // These source fixtures scale encoded RGB. Keep their stage oracle;
+            // autoexposure_encoding.rs independently checks the corrected light gain.
+            let curve = spektrafilm_math::transfer::get(&p.params.io.input_color_space)
+                .unwrap()
+                .transfer;
+            let matrix = spektrafilm_core::stages::filming::input_colorspace_to_xyz(
+                &p.params.io.input_color_space,
+            );
+            let ev = spektrafilm_core::stages::filming::measure_autoexposure_ev_with_transfer(
+                &image,
+                &matrix,
+                &p.params.camera.auto_exposure_method,
+                Some(curve),
+            );
+            let scale = from_f64(2f64.powf(ev as f64));
+            for v in &mut image.data {
+                *v *= scale;
+            }
+            p.params.camera.auto_exposure = false;
+        }
         let out = p.process(image, &spektrafilm_gpu::cpu_backend::CpuBackend);
         assert_eq!(
             out.width as u64,

@@ -66,6 +66,31 @@ pub fn write_bundle(
     format: &str,
     combinations: bool,
 ) -> Result<BundleMeta, String> {
+    lut_export::validate_format(options.size, format, options.input)?;
+    if format == "lumix" && topology != "1lut" {
+        return Err("Lumix delivery requires topology='1lut'".into());
+    }
+    let output = crate::bundle_output::OutputDirectory::new(destination)?;
+    let meta = write_bundle_contents(
+        options,
+        data_dir,
+        output.path(),
+        topology,
+        format,
+        combinations,
+    )?;
+    output.commit()?;
+    Ok(meta)
+}
+
+fn write_bundle_contents(
+    options: &BakeOptions<'_>,
+    data_dir: &Path,
+    destination: &Path,
+    topology: &str,
+    format: &str,
+    combinations: bool,
+) -> Result<BundleMeta, String> {
     let taps: &[&str] = match topology {
         "1lut" => &["rgb_in", "rgb_out"],
         "2lut" => &["rgb_in", "cmy_film", "rgb_out"],

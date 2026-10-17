@@ -574,8 +574,7 @@ impl Pipeline {
                 return output;
             }
         }
-        // Preprocess meters the original frame before crop/rescale, and scales
-        // encoded input before the filming stage decodes it, like Python.
+        // Meter the original frame before crop/rescale; exposure is a linear-light gain.
         if inject == "rgb_in" && self.params.camera.auto_exposure {
             let mut p = self.clone();
             let transfer = if p.params.io.input_cctf_decoding {
@@ -594,10 +593,14 @@ impl Pipeline {
                 &p.params.camera.auto_exposure_method,
                 transfer,
             );
-            let scale = spektrafilm_math::precision::from_f64(2f64.powf(ev as f64));
+            let scale = 2f64.powf(ev as f64);
             let mut image = image;
             for v in &mut image.data {
-                *v *= scale;
+                let value = *v as f64;
+                *v = spektrafilm_math::precision::from_f64(match transfer {
+                    Some(curve) => curve.encode(curve.decode(value) * scale),
+                    None => value * scale,
+                });
             }
             p.params.camera.auto_exposure = false;
             return p.process(image, backend);
@@ -881,7 +884,6 @@ impl Pipeline {
         } else {
             spektrafilm_math::transfer::Transfer::Linear
         };
-        let mut input_scale = 1.0f64;
         let mut exposure_scale_f64 = 1.0f64;
         if self.params.camera.auto_exposure {
             // Borrow back the f32 matrix shape that the CPU metering
@@ -894,12 +896,7 @@ impl Pipeline {
                 &self.params.camera.auto_exposure_method,
                 self.params.io.input_cctf_decoding.then_some(input_transfer),
             );
-            let auto_scale = 2.0f64.powf(ae_ev as f64);
-            if self.params.io.input_cctf_decoding {
-                input_scale = auto_scale;
-            } else {
-                exposure_scale_f64 *= auto_scale;
-            }
+            exposure_scale_f64 *= 2.0f64.powf(ae_ev as f64);
         }
         if self.params.camera.exposure_compensation_ev != 0.0 {
             exposure_scale_f64 *= 2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
@@ -1414,7 +1411,6 @@ impl Pipeline {
             image,
             front,
             input_transfer,
-            input_scale,
             output_transfer: spektrafilm_math::transfer::get(&self.params.io.output_color_space)
                 .ok()?
                 .transfer,

@@ -95,6 +95,15 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
         };
         check(open(raw, filename.as_ptr()), "open")?;
         check(unpack(raw), "unpack")?;
+        // LibRaw 0.22 exposes the vendor crop through its stable C API.
+        // Apply it after unpack (masked-area black levels are already read)
+        // and before processing; otherwise newer Sony ARWs include padding.
+        // Older libraries have no C entry point and keep their native crop.
+        if let Ok(adjust_crop) = lib
+            .get::<unsafe extern "C" fn(Ptr, u32, f32) -> i32>(b"libraw_adjust_to_raw_inset_crop\0")
+        {
+            adjust_crop(raw, 1, 0.55);
+        }
         output_color(raw, 6);
         bps(raw, 16);
         no_bright(raw, 1);

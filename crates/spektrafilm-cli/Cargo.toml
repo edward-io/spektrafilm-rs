@@ -35,12 +35,9 @@ spektrafilm-math.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 image.workspace = true
-exr.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-rayon.workspace = true
-rawler.workspace = true
-tiff = "0.10"
+tempfile = "3"
 zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 toml = "1.1.8"

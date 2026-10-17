@@ -26,8 +26,27 @@ fn saving_transport_matches_colour_and_preserves_icc() {
             case["destination_encoded"].as_bool().unwrap(),
         )
         .unwrap();
-        for (got, want) in image.data.iter().zip(case["expected"].as_array().unwrap()) {
-            assert!((*got as f64 - want.as_f64().unwrap()).abs() < 2e-6);
+        for (channel, (got, want)) in image
+            .data
+            .iter()
+            .zip(case["expected"].as_array().unwrap())
+            .enumerate()
+        {
+            // Same-space decoding must not introduce the fixture's rounded RGB matrix.
+            let expected = if case["source"] == "sRGB" && case["destination"] == "sRGB" {
+                let value = case["input"][channel].as_f64().unwrap();
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            } else {
+                want.as_f64().unwrap()
+            };
+            assert!(
+                (*got as f64 - expected).abs() < 2e-6,
+                "case {i}, channel {channel}: {got} / {expected}"
+            );
         }
         let options = SaveOptions {
             bit_depth: 32,

@@ -1137,14 +1137,13 @@ impl WgpuBackend {
         let input_transfer_state = if !matches!(
             p.input_transfer,
             spektrafilm_math::transfer::Transfer::Linear
-        ) || p.input_scale != 1.
-        {
+        ) {
             Some(color_transfer::build(
                 self,
                 n_pixels,
                 p.input_transfer,
                 false,
-                p.input_scale,
+                1.,
                 &buf_a,
             ))
         } else {
