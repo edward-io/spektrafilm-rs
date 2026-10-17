@@ -73,6 +73,11 @@ Changes from the original Rust fork's v0.1.2 baseline,
 - **RAW and lenses:** shared GUI/CLI I/O, rawler 0.8 with Sony ILCE-7M5 support,
   optional LibRaw with Auto fallback, built-in Lensfun, automatic database
   download/cache, corrected RGB vignetting handling and clearer load errors.
+- **Lightroom catalogs:** read-only `.lrcat` browsing with background thumbnails,
+  pick flags, virtual copies and keyboard navigation; crop, straighten, rotation
+  and flips carried through previews, saved projects and GPU/CPU exports.
+  Navigation preserves current workflow settings and caches recently developed
+  images. Lightroom tonal edits and Adobe lens/perspective corrections are not imported.
 - **GUI and previews:** project/default persistence, Python GUI state import,
   rotation, contextual hover help, layer/comparison controls and paper animation;
   cached pipelines, scaled inputs and exposure-meter results, with adjustable
