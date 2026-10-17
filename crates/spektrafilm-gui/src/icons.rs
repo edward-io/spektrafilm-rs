@@ -3,11 +3,20 @@ use eframe::egui::{self, Response, Ui, Widget};
 
 pub struct RotateButton {
     clockwise: bool,
+    compact: bool,
 }
 
 impl RotateButton {
     pub fn new(clockwise: bool) -> Self {
-        Self { clockwise }
+        Self {
+            clockwise,
+            compact: false,
+        }
+    }
+    /// Icon only, for toolbars.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 }
 
@@ -17,10 +26,15 @@ impl Widget for RotateButton {
         let icon_size = ui.spacing().icon_width;
         let gap = ui.spacing().item_spacing.x;
         let text = ui.painter().layout_no_wrap(
-            "Rotate".into(),
+            if self.compact {
+                String::new()
+            } else {
+                "Rotate".into()
+            },
             egui::TextStyle::Button.resolve(ui.style()),
             ui.visuals().text_color(),
         );
+        let gap = if self.compact { 0.0 } else { gap };
         let size = egui::vec2(
             text.size().x + icon_size + gap + padding.x * 2.0,
             text.size().y.max(icon_size) + padding.y * 2.0,

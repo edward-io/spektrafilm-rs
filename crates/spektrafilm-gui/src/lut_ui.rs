@@ -35,7 +35,8 @@ impl Default for Settings {
 }
 impl App {
     pub(crate) fn lut_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CollapsingHeader::new("LUT export")
+        egui::CollapsingHeader::new(crate::inspector::title("LUT export").size(14.0))
+            .id_salt("LUT export")
             .show(ui, |ui| {
                 ui.label(tooltips::LUT_SETTINGS_NOTE);
                 for (id, label, selected, input_role) in [
@@ -66,7 +67,7 @@ impl App {
                 ui.label("File format")
                     .on_hover_text(tooltips::MENU_LUT_FORMAT);
                 egui::ComboBox::from_id_salt("lut_format")
-                    .selected_text(&self.lut.format)
+                    .selected_text(crate::names::label(&self.lut.format))
                     .show_ui(ui, |ui| {
                         for (id, name) in [
                             ("cube", "CUBE"),
@@ -111,10 +112,10 @@ impl App {
                     ui.label("Stage layout")
                         .on_hover_text(tooltips::MENU_LUT_TOPOLOGY);
                     egui::ComboBox::from_id_salt("lut_topology")
-                        .selected_text(&self.lut.topology)
+                        .selected_text(crate::names::label(&self.lut.topology))
                         .show_ui(ui, |ui| {
                             for value in ["1lut", "2lut", "3lut", "4lut"] {
-                                ui.selectable_value(&mut self.lut.topology, value.into(), value)
+                                ui.selectable_value(&mut self.lut.topology, value.into(), crate::names::label(value))
                                     .on_hover_text(tooltips::option(value));
                             }
                         });

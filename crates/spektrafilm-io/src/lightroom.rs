@@ -307,6 +307,9 @@ fn develop_fields(text: &str) -> Vec<(&str, &str)> {
 }
 
 /// Camera previews are used only for catalog thumbnails, never for film development.
+/// Longest edge of browser thumbnails; sharp at roughly 80 pt on a 2× display.
+pub const THUMBNAIL_PX: u32 = 160;
+
 pub fn thumbnail(path: &Path, orientation: u16) -> Result<image::RgbaImage> {
     let mut image = if super::is_raw(path) {
         let source = rawler::rawsource::RawSource::new(path)?;
@@ -322,7 +325,7 @@ pub fn thumbnail(path: &Path, orientation: u16) -> Result<image::RgbaImage> {
             .with_guessed_format()?
             .decode()?
     };
-    image = image.thumbnail(96, 96);
+    image = image.thumbnail(THUMBNAIL_PX, THUMBNAIL_PX);
     if let Some(orientation) = image::metadata::Orientation::from_exif(orientation as u8) {
         image.apply_orientation(orientation);
     }

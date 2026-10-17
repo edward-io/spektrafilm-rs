@@ -19,6 +19,8 @@ pub struct DisplayParams {
     pub split_position: f32,
     pub white_padding: f32,
     pub output_interpolation: String,
+    /// Reveal expert parameters in the inspector.
+    pub show_advanced: bool,
 }
 impl Default for DisplayParams {
     fn default() -> Self {
@@ -36,6 +38,7 @@ impl Default for DisplayParams {
             split_position: 0.5,
             white_padding: 0.03,
             output_interpolation: "linear".into(),
+            show_advanced: false,
         }
     }
 }

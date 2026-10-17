@@ -1,39 +1,156 @@
-//! Short explanations shared by dropdown controls and their menu items.
+//! Short explanations shared by dropdown controls and their menu items, plus
+//! the inspector row helpers that lay controls out as label | value columns.
 
-use eframe::egui::{self, Label, Response, Sense, TextWrapMode, Ui, Widget, WidgetText};
+use crate::{inspector, theme};
+use eframe::egui::{
+    self, Align, Label, Layout, Response, RichText, Sense, TextWrapMode, Ui, Widget, WidgetText,
+};
 
-/// Keep explanatory help on a separate text label, never on the value editor.
+/// Width of the caption column, so every control's value starts on one edge.
+fn caption_width(ui: &Ui) -> f32 {
+    (ui.available_width() * 0.42).clamp(96.0, 176.0)
+}
+
+/// Split a caption such as `Lens blur (µm)` or `Tail weight: ` into the name
+/// and a unit hint drawn in a weaker tone.
+fn caption_parts(text: &str) -> (&str, Option<&str>) {
+    let text = text.trim_end().trim_end_matches(':').trim_end();
+    match text.rfind(" (") {
+        Some(at) if text.ends_with(')') => (&text[..at], Some(&text[at + 2..text.len() - 1])),
+        _ => (text, None),
+    }
+}
+
+/// The caption cell: a change-marker gutter plus the name.
+struct Caption {
+    response: Response,
+    marker: egui::Pos2,
+}
+
+impl Caption {
+    fn paint_marker(&self, ui: &Ui, modified: bool) {
+        if modified {
+            ui.painter().circle_filled(self.marker, 2.5, theme::ACCENT);
+        }
+    }
+}
+
+fn caption(ui: &mut Ui, text: &str, width: f32, sense: Sense) -> Caption {
+    let (name, unit) = caption_parts(text);
+    let height = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(6.0, height), Sense::hover());
+            let mut job = egui::text::LayoutJob::default();
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            job.append(
+                name,
+                0.0,
+                egui::TextFormat::simple(body.clone(), theme::TEXT_CAPTION),
+            );
+            if let Some(unit) = unit {
+                job.append(unit, 5.0, egui::TextFormat::simple(body, theme::TEXT_FAINT));
+            }
+            let response = ui.add(Label::new(job).selectable(false).truncate().sense(sense));
+            Caption {
+                response,
+                marker: dot.center(),
+            }
+        },
+    )
+    .inner
+}
+
+/// The caption's context menu offers "Reset to stock default"; true when chosen.
+fn reset_requested(label: &Response) -> bool {
+    let mut chosen = false;
+    label.context_menu(|ui| {
+        if ui.button("Reset to stock default").clicked() {
+            chosen = true;
+            ui.close_menu();
+        }
+    });
+    chosen
+}
+
+/// Hover help, with the reset gesture spelled out once the row has changed.
+fn attach_help(label: Response, help: &str, modified: bool, double_click_reset: bool) {
+    if modified {
+        let hint = if double_click_reset {
+            "Changed from the stock default. Double-click the name to reset."
+        } else {
+            "Changed from the stock default. Right-click the name to reset."
+        };
+        label
+            .on_hover_text(format!("{help}\n\n{hint}"))
+            .on_disabled_hover_text(help);
+    } else {
+        label.on_hover_text(help).on_disabled_hover_text(help);
+    }
+}
+
+/// One inspector row: caption on the left, the value editor filling the rest.
+/// Help lives on the caption, never on the value editor. Double-clicking the
+/// caption restores the stock value once the row is known to differ from it.
 pub fn labeled(
     ui: &mut Ui,
     widget: impl Widget,
     text: impl Into<WidgetText>,
     help: &str,
 ) -> Response {
+    let text = text.into();
+    let id = inspector::row_id(text.text());
+    let learned_modified = inspector::row_modified(id);
     ui.horizontal(|ui| {
         // DragValue (including the slider's numeric editor) has its own hover
         // instructions; keep those off the editable area as well.
         ui.style_mut().explanation_tooltips = false;
-        let response = ui.add(widget);
-        let label = ui.add(
-            Label::new(text)
-                .selectable(false)
-                .wrap_mode(TextWrapMode::Extend),
-        );
-        let response = response.labelled_by(label.id);
-        label.on_hover_text(help).on_disabled_hover_text(help);
+        let width = caption_width(ui);
+        let label = caption(ui, text.text(), width, Sense::click());
+        let reset = label.response.double_clicked() || reset_requested(&label.response);
+        inspector::begin_row(reset);
+        if reset && inspector::row_stock_modified().is_none() {
+            inspector::request_row_reset(id);
+        }
+        // Sliders size from `slider_width`; leave room for their value box.
+        let spacing = ui.spacing().clone();
+        ui.spacing_mut().slider_width =
+            (ui.available_width() - spacing.interact_size.x - spacing.item_spacing.x - 2.0)
+                .max(48.0);
+        let response = ui.add(widget).labelled_by(label.response.id);
+        let modified = inspector::row_stock_modified().unwrap_or(learned_modified);
+        label.paint_marker(ui, modified);
+        attach_help(label.response, help, modified, true);
+        if response.changed() {
+            inspector::note_changed(id);
+        }
         response
     })
     .inner
 }
 
-/// Clicking the caption still toggles the checkbox, but only its text shows help.
+/// A full-width checkbox row. Clicking the caption still toggles the box, but
+/// only the caption shows help.
 pub fn checkbox(
     ui: &mut Ui,
     value: &mut bool,
     text: impl Into<WidgetText>,
     help: &str,
 ) -> Response {
+    let text = text.into();
+    let id = inspector::row_id(text.text());
+    let modified = inspector::row_modified(id);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let height = ui.spacing().interact_size.y;
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(6.0, height), Sense::hover());
+        if modified {
+            ui.painter().circle_filled(dot.center(), 2.5, theme::ACCENT);
+        }
         let mut response = ui.checkbox(value, "");
         let label = ui.add(
             Label::new(text)
@@ -46,16 +163,20 @@ pub fn checkbox(
             response.mark_changed();
             ui.ctx().request_repaint();
         }
-        let response = response.labelled_by(label.id);
-        label
-            .clone()
-            .on_hover_text(help)
-            .on_disabled_hover_text(help);
-        response.union(label)
+        let response = response.labelled_by(label.id).union(label.clone());
+        if reset_requested(&label) {
+            inspector::request_row_reset(id);
+        }
+        attach_help(label, help, modified, false);
+        if response.changed() {
+            inspector::note_changed(id);
+        }
+        response
     })
     .inner
 }
 
+/// A dropdown row: caption on the left, the combo filling the value column.
 pub fn combo<R>(
     ui: &mut Ui,
     combo: egui::ComboBox,
@@ -63,18 +184,197 @@ pub fn combo<R>(
     help: &str,
     contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    let text = text.into();
     ui.horizontal(|ui| {
+        let width = caption_width(ui);
+        let label = caption(ui, text.text(), width, Sense::hover()).response;
+        ui.spacing_mut().combo_width = ui.available_width().max(60.0);
         let mut response = combo.show_ui(ui, contents);
-        let label = ui.add(
-            Label::new(text)
-                .selectable(false)
-                .wrap_mode(TextWrapMode::Extend),
-        );
         response.response = response.response.labelled_by(label.id);
         label.on_hover_text(help).on_disabled_hover_text(help);
         response
     })
     .inner
+}
+
+/// Several values of one parameter on a single row — per-channel R/G/B,
+/// C/M/Y, X/Y, or sublayer values — each as a compact drag field.
+pub fn channels<T: egui::emath::Numeric, const N: usize>(
+    ui: &mut Ui,
+    text: impl Into<WidgetText>,
+    help: &str,
+    names: [&str; N],
+    values: [&mut T; N],
+    range: std::ops::RangeInclusive<T>,
+    speed: f64,
+) -> Response {
+    let text = text.into();
+    let id = inspector::row_id(text.text());
+    let modified = inspector::row_modified(id);
+    ui.horizontal(|ui| {
+        ui.style_mut().explanation_tooltips = false;
+        let width = caption_width(ui);
+        let label = caption(ui, text.text(), width, Sense::click());
+        label.paint_marker(ui, modified);
+        if modified && label.response.double_clicked() || reset_requested(&label.response) {
+            inspector::request_row_reset(id);
+        }
+        let label = label.response;
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let gap = ui.spacing().item_spacing.x;
+        let tag = 10.0;
+        let lead = 4.0;
+        // Each channel is [lead space][tag][field], every item followed by `gap`.
+        let per_channel = lead + tag + 3.0 * gap;
+        let field =
+            ((ui.available_width() - per_channel * N as f32) / N as f32 - 1.0).clamp(28.0, 72.0);
+        // DragValue's minimum width is `interact_size.x`; let it fit the column.
+        ui.spacing_mut().interact_size.x = field;
+        let mut response: Option<Response> = None;
+        for (name, value) in names.into_iter().zip(values) {
+            ui.add_space(lead);
+            ui.add_sized(
+                [tag, ui.spacing().interact_size.y],
+                Label::new(RichText::new(name).small().color(channel_color(name)))
+                    .selectable(false),
+            );
+            let r = ui.add_sized(
+                [field, ui.spacing().interact_size.y],
+                egui::DragValue::new(value)
+                    .range(range.clone())
+                    .speed(speed),
+            );
+            response = Some(match response {
+                Some(prev) => prev.union(r),
+                None => r,
+            });
+        }
+        let response = response
+            .expect("at least one channel")
+            .labelled_by(label.id);
+        attach_help(label, help, modified, true);
+        if response.changed() {
+            inspector::note_changed(id);
+        }
+        response
+    })
+    .inner
+}
+
+/// A slider that knows its stock default: it draws a tick at that value,
+/// reports whether the current value differs, and restores it when the row's
+/// caption asks for a reset. Built like `egui::Slider`.
+pub struct StockSlider<'a, N: egui::emath::Numeric> {
+    value: &'a mut N,
+    range: std::ops::RangeInclusive<N>,
+    stock: Option<N>,
+    logarithmic: bool,
+    step: Option<f64>,
+}
+
+pub fn slider<N: egui::emath::Numeric>(
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+) -> StockSlider<'_, N> {
+    StockSlider {
+        value,
+        range,
+        stock: None,
+        logarithmic: false,
+        step: None,
+    }
+}
+
+impl<N: egui::emath::Numeric> StockSlider<'_, N> {
+    pub fn stock(mut self, stock: N) -> Self {
+        self.stock = Some(stock);
+        self
+    }
+    pub fn logarithmic(mut self, logarithmic: bool) -> Self {
+        self.logarithmic = logarithmic;
+        self
+    }
+    pub fn step_by(mut self, step: f64) -> Self {
+        self.step = Some(step);
+        self
+    }
+    /// Where `value` sits along the track, 0–1, matching `egui::Slider`.
+    fn normalized(&self, value: f64) -> f32 {
+        let (min, max) = (self.range.start().to_f64(), self.range.end().to_f64());
+        let t = if self.logarithmic && min > 0.0 && max > min {
+            (value.max(min).ln() - min.ln()) / (max.ln() - min.ln())
+        } else if max > min {
+            (value - min) / (max - min)
+        } else {
+            0.0
+        };
+        t.clamp(0.0, 1.0) as f32
+    }
+}
+
+impl<N: egui::emath::Numeric> Widget for StockSlider<'_, N> {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let reset = inspector::take_row_reset()
+            && self
+                .stock
+                .is_some_and(|stock| stock.to_f64() != self.value.to_f64());
+        if reset {
+            *self.value = self.stock.expect("checked above");
+        }
+        let mut inner =
+            egui::Slider::new(&mut *self.value, self.range.clone()).logarithmic(self.logarithmic);
+        if let Some(step) = self.step {
+            inner = inner.step_by(step);
+        }
+        let track_width = ui.spacing().slider_width;
+        // Reserve a slot beneath the slider so the tick sits behind the handle:
+        // hidden at the stock value, visible once the value moves away.
+        let tick_slot = ui.painter().add(egui::Shape::Noop);
+        let mut response = ui.add(inner);
+        if reset {
+            response.mark_changed();
+        }
+        let Some(stock) = self.stock else {
+            return response;
+        };
+        let (value, stock) = (self.value.to_f64(), stock.to_f64());
+        let tolerance = 1e-9 * stock.abs().max(1.0);
+        inspector::set_row_modified((value - stock).abs() > tolerance);
+        if ui.is_rect_visible(response.rect) {
+            // Same geometry as egui's slider: the handle travels within the
+            // track inset by its radius (track height / 2.5).
+            let height = ui
+                .text_style_height(&egui::TextStyle::Body)
+                .max(ui.spacing().interact_size.y);
+            let radius = height / 2.5;
+            let left = response.rect.left() + radius;
+            let x = left + self.normalized(stock) * (track_width - 2.0 * radius);
+            let y = response.rect.center().y;
+            ui.painter().set(
+                tick_slot,
+                egui::Shape::line_segment(
+                    [egui::pos2(x, y - 6.0), egui::pos2(x, y + 6.0)],
+                    egui::Stroke::new(2.0, theme::TEXT_WEAK),
+                ),
+            );
+        }
+        response
+    }
+}
+
+pub const RGB: [&str; 3] = ["R", "G", "B"];
+pub const CMY: [&str; 3] = ["C", "M", "Y"];
+
+fn channel_color(name: &str) -> egui::Color32 {
+    match name {
+        "R" => egui::Color32::from_rgb(232, 120, 112),
+        "G" => egui::Color32::from_rgb(132, 204, 120),
+        "B" => egui::Color32::from_rgb(120, 160, 236),
+        "C" => egui::Color32::from_rgb(110, 200, 214),
+        "M" => egui::Color32::from_rgb(214, 120, 196),
+        "Y" => egui::Color32::from_rgb(222, 200, 100),
+        _ => theme::TEXT_WEAK,
+    }
 }
 
 pub fn inhibition_receiver(donor: &str, receiver: usize) -> &'static str {
@@ -324,9 +624,6 @@ pub const CONTROL_GAMMA_FAST: &str =
     "Scale the contrast contribution of the faster print emulsion component.";
 pub const CONTROL_GAMMA_SLOW: &str =
     "Scale contrast in both the middle and slow print emulsion sublayers.";
-pub const CONTROL_GAMMA_R: &str = "Scale contrast in the print’s red-sensitive density curve.";
-pub const CONTROL_GAMMA_G: &str = "Scale contrast in the print’s green-sensitive density curve.";
-pub const CONTROL_GAMMA_B: &str = "Scale contrast in the print’s blue-sensitive density curve.";
 pub const CONTROL_DEVELOPER_EXHAUSTION: &str =
     "Change the paper’s highlight shoulder while preserving its midgray density.";
 pub const CONTROL_LENS_BLUR_SIGMA_PX: &str =
@@ -440,8 +737,6 @@ pub const CONTROL_INCLUDE_DIAGNOSTIC_REPORT: &str =
     "Generate a report measuring the baked LUT’s color behavior and interpolation accuracy.";
 pub const CONTROL_EXPORT_LUT: &str =
     "Bake the selected film and paper transform into a LUT file or stage bundle.";
-pub const SECTION_PROFILES: &str =
-    "Choose the measured film stock, print paper and available development time.";
 pub const SECTION_EXPOSURE: &str = "Control how much source light reaches the simulated film.";
 pub const SECTION_HALATION: &str =
     "Simulate light scattering inside the emulsion and reflecting back through the film.";
@@ -503,8 +798,6 @@ pub const EXPORT_IMAGE: &str =
 pub const SCAN_FOR_PRINT: &str = "Enable scanner white/black correction and disable glare, restoring prior settings when turned off.";
 pub const ENABLE_HALATION: &str =
     "Enable scattering and reflected-light halation in the film emulsion.";
-pub const EMULSION_CHANNEL: &str =
-    "Edit scattering and reflected-light parameters for this color-sensitive emulsion channel.";
 pub const ENABLE_DIR: &str =
     "Enable development-inhibitor couplers between the film’s color layers.";
 pub const DIR_SELF_INHIBITION: &str =
@@ -700,6 +993,66 @@ mod tests {
                 assert_eq!(shown, hover_label, "{editor:?}, label={hover_label}");
             }
         }
+    }
+
+    #[test]
+    fn double_clicking_a_changed_slider_caption_restores_its_stock_value() {
+        const STOCK: f32 = 0.25;
+        let ctx = egui::Context::default();
+        let mut value = 0.75f32;
+        let mut frame = |time: f64, events: Vec<egui::Event>, value: &mut f32| {
+            let mut changed = false;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        changed = labeled(ui, slider(value, 0.0..=1.0).stock(STOCK), CAPTION, HELP)
+                            .changed();
+                    });
+                },
+            );
+            (output, changed)
+        };
+        let (output, _) = frame(0.0, vec![], &mut value);
+        let caption = text_rect(&output, CAPTION).expect("caption must be painted");
+        let click = |pressed| egui::Event::PointerButton {
+            pos: caption.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            0.1,
+            vec![egui::Event::PointerMoved(caption.center())],
+            &mut value,
+        );
+        frame(0.2, vec![click(true), click(false)], &mut value);
+        let (_, changed) = frame(0.3, vec![click(true), click(false)], &mut value);
+        assert_eq!(value, STOCK);
+        assert!(
+            changed,
+            "the reset must be reported so the preview re-renders"
+        );
+    }
+
+    #[test]
+    fn stock_tick_follows_slider_scale() {
+        let mut v = 1.0f64;
+        let linear = slider(&mut v, 0.0..=4.0);
+        assert_eq!(linear.normalized(1.0), 0.25);
+        let mut v = 1.0f64;
+        let log = slider(&mut v, 0.1..=10.0).logarithmic(true);
+        assert!((log.normalized(1.0) - 0.5).abs() < 1e-6);
+        let mut v = 1.0f64;
+        assert_eq!(slider(&mut v, 0.0..=4.0).normalized(9.0), 1.0);
     }
 
     #[test]

@@ -25,15 +25,36 @@ impl App {
         ])
         .to_string()
     }
+    /// Scanned-negative calibrations, shown with the scan conversion controls.
     pub(super) fn calibration_controls(&mut self, ui: &mut egui::Ui) {
+        self.calibration_buttons(ui, &[
+            ("Detect base",Action::Base,"Fit the film base and scan exposure from the brightest clear-film pixels."),
+            ("Blind calibration",Action::Device,"Fit a device matrix using the film dye gamut; a colorful frame gives the strongest fit."),
+        ]);
+    }
+    /// Enlarger filtration solve, shown with the enlarger controls.
+    pub(super) fn print_balance_controls(&mut self, ui: &mut egui::Ui) {
+        self.calibration_buttons(
+            ui,
+            &[(
+                "Neutral print balance",
+                Action::Printer,
+                "Solve enlarger magenta and yellow shifts so this film's midgray prints neutral.",
+            )],
+        );
+    }
+    fn calibration_buttons(&mut self, ui: &mut egui::Ui, actions: &[(&str, Action, &str)]) {
         ui.horizontal_wrapped(|ui| {
-            for (label,action,help) in [
-                ("Detect base",Action::Base,"Fit the film base and scan exposure from the brightest clear-film pixels."),
-                ("Blind calibration",Action::Device,"Fit a device matrix using the film dye gamut; a colorful frame gives the strongest fit."),
-                ("Neutral print balance",Action::Printer,"Solve enlarger magenta and yellow shifts so this film's midgray prints neutral."),
-            ] {
-                let enabled=self.calibration_job.is_none() && (matches!(action,Action::Printer) || self.image.is_some());
-                if ui.add_enabled(enabled,egui::Button::new(label)).on_hover_text(help).clicked() {self.start_calibration(action);}
+            for &(label, action, help) in actions {
+                let enabled = self.calibration_job.is_none()
+                    && (matches!(action, Action::Printer) || self.image.is_some());
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(help)
+                    .clicked()
+                {
+                    self.start_calibration(action);
+                }
             }
         });
         if self.calibration_job.is_some() {

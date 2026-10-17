@@ -1,5 +1,8 @@
-use eframe::egui;
-use spektrafilm_io::lightroom::{Catalog, Photo};
+//! Read-only Lightroom Classic catalog browser: a thumbnail grid in the left
+//! panel that feeds the selected photo, with its crop, into the editor.
+use crate::{inspector, theme};
+use eframe::egui::{self, RichText};
+use spektrafilm_io::lightroom::{Catalog, Photo, THUMBNAIL_PX};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -50,7 +53,7 @@ impl Browser {
         ) else {
             return;
         };
-        let scale = (96. / preview.size[0].max(preview.size[1]) as f32).min(1.);
+        let scale = (THUMBNAIL_PX as f32 / preview.size[0].max(preview.size[1]) as f32).min(1.);
         let thumbnail = image::imageops::thumbnail(
             &image,
             (preview.size[0] as f32 * scale).round().max(1.) as u32,
@@ -200,113 +203,195 @@ impl Browser {
                 }),
             );
         }
-        ui.heading("Lightroom catalog");
-        ui.label(self.path.file_stem().unwrap_or_default().to_string_lossy())
-            .on_hover_text(self.path.display().to_string());
+        // ── Header: catalog name, refresh, close ────────────────────────
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.loading.is_none(), egui::Button::new("Refresh"))
-                .clicked()
-            {
-                self.refresh(ctx);
-            }
-            if ui.button("Close").clicked() {
-                action = Some(Action::Close);
-            }
+            ui.label(
+                inspector::title(&self.path.file_stem().unwrap_or_default().to_string_lossy())
+                    .size(14.0),
+            )
+            .on_hover_text(self.path.display().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Close the catalog")
+                    .clicked()
+                {
+                    action = Some(Action::Close);
+                }
+                if ui
+                    .add_enabled(self.loading.is_none(), egui::Button::new("⟳").small())
+                    .on_hover_text("Re-read the catalog, e.g. after reconnecting a drive")
+                    .clicked()
+                {
+                    self.refresh(ctx);
+                }
+            });
         });
+        let catalog_stats = self.catalog.as_ref().map(|catalog| {
+            let picks = catalog
+                .photos
+                .iter()
+                .filter(|p| p.flag == 1 && p.available)
+                .count();
+            let available = catalog.photos.iter().filter(|p| p.available).count();
+            let unavailable = catalog.photos.len() - available;
+            (available, picks, unavailable)
+        });
+        ui.label(
+            RichText::new(match catalog_stats {
+                Some((available, _, _)) => {
+                    format!("Lightroom Classic · {available} photos · read-only")
+                }
+                None => "Lightroom Classic · read-only".into(),
+            })
+            .small()
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(4.0);
+
+        // ── Filter ──────────────────────────────────────────────────────
+        if let Some((available, picks, _)) = catalog_stats {
+            let mut accepted_only = self.accepted_only;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let width = (ui.available_width() - 2.0) / 2.0;
+                for (value, text) in [
+                    (false, format!("All  {available}")),
+                    (true, format!("Picks  {picks}")),
+                ] {
+                    let response = ui.add_sized(
+                        [width, 22.0],
+                        egui::SelectableLabel::new(accepted_only == value, text),
+                    );
+                    if response.clicked() {
+                        response.surrender_focus();
+                        accepted_only = value;
+                    }
+                }
+            });
+            if accepted_only != self.accepted_only {
+                self.accepted_only = accepted_only;
+                self.filter();
+                if !self.selected.is_some_and(|i| self.visible.contains(&i)) {
+                    self.selected = None;
+                    action = self.select(0).or(Some(Action::Empty));
+                }
+            }
+        }
+
+        // ── Notices ─────────────────────────────────────────────────────
         if self.loading.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Reading catalog…");
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(
+                    RichText::new("Reading catalog…")
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                );
             });
         }
         if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        let response = ui.checkbox(&mut self.accepted_only, "Accepted only");
-        if response.changed() {
-            response.surrender_focus();
-            self.filter();
-            if !self.selected.is_some_and(|i| self.visible.contains(&i)) {
-                self.selected = None;
-                action = self.select(0).or(Some(Action::Empty));
-            }
+            notice(ui, ui.visuals().error_fg_color, error);
         }
         let Some(catalog) = &self.catalog else {
             return action;
         };
-        let accepted = catalog.photos.iter().filter(|p| p.flag == 1).count();
-        let rejected = catalog.photos.iter().filter(|p| p.flag == -1).count();
-        let unavailable = catalog.photos.iter().filter(|p| !p.available).count();
-        ui.small(format!(
-            "{} photos · {accepted} accepted · {rejected} rejected",
-            catalog.photos.len()
-        ));
+        let unavailable = catalog_stats.map_or(0, |(_, _, u)| u);
         if unavailable > 0 {
-            ui.small(format!("{unavailable} unavailable originals skipped"));
+            notice(
+                ui,
+                theme::TEXT_WEAK,
+                &format!(
+                    "{unavailable} photo{} skipped: original not found. Connect the drive, then ⟳.",
+                    if unavailable == 1 { "" } else { "s" }
+                ),
+            );
         }
-        ui.small("Read-only · RAW development in Spektrafilm");
+        if let Some(photo) = self.selected.and_then(|i| catalog.photos.get(i))
+            && photo.framing_warning
+        {
+            notice(
+                ui,
+                ui.visuals().warn_fg_color,
+                "Lightroom lens and perspective corrections aren't imported, so framing may differ.",
+            );
+        }
+        ui.add_space(2.0);
+
+        // ── Navigation ──────────────────────────────────────────────────
         let position = self
             .selected
             .and_then(|i| self.visible.iter().position(|v| *v == i));
+        // The list lives inside a scroll area whose bar takes width of its own;
+        // rows sized to the full panel overflow it and egui widens the panel.
+        let list_width = ui.available_width() - ui.spacing().scroll.allocated_width();
         let mut next_position = None;
-        ui.horizontal(|ui| {
-            let previous = ui.add_enabled(
-                position.is_some_and(|p| p > 0),
-                egui::Button::new("Previous"),
-            );
-            if previous.clicked() {
-                previous.surrender_focus();
-                next_position = position.map(|p| p - 1);
-            }
-            let next = ui.add_enabled(
-                position.is_some_and(|p| p + 1 < self.visible.len()),
-                egui::Button::new("Next"),
-            );
-            if next.clicked() {
-                next.surrender_focus();
-                next_position = position.map(|p| p + 1);
-            }
-        });
         if !ctx.wants_keyboard_input() {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)) {
+            let step =
+                |key: egui::Key| ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+            let last = self.visible.len().saturating_sub(1);
+            if step(egui::Key::ArrowLeft) || step(egui::Key::ArrowUp) {
                 next_position = position.and_then(|p| p.checked_sub(1));
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)) {
-                next_position = position.map(|p| p + 1).filter(|p| *p < self.visible.len());
+            if step(egui::Key::ArrowRight) || step(egui::Key::ArrowDown) {
+                next_position = position.map(|p| p + 1).filter(|p| *p <= last);
             }
         }
-        ui.small(format!(
-            "{} shown · Left / Right keys to browse",
-            self.visible.len()
-        ));
-        ui.separator();
-        if self.visible.is_empty() {
-            ui.label(if unavailable == catalog.photos.len() && unavailable > 0 {
-                "Originals are unavailable. Connect the photo drive, then Refresh."
-            } else {
-                "No available photos match this filter."
+
+        // ── Footer (drawn first so the grid can take the remaining height) ─
+        egui::TopBottomPanel::bottom("catalog-footer")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 6)))
+            .show_separator_line(true)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let weak = |s: String| RichText::new(s).small().color(theme::TEXT_WEAK);
+                    ui.label(weak(match position {
+                        Some(p) => format!("{} of {}", p + 1, self.visible.len()),
+                        None => format!("{} photos", self.visible.len()),
+                    }));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(weak("↑ ↓ to browse".into()));
+                    });
+                });
             });
-        }
-        if let Some(index) = self.selected {
-            let photo = &catalog.photos[index];
-            if photo.framing_warning {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Adobe lens/perspective corrections are not imported; framing may differ.",
+
+        // ── Thumbnail grid ──────────────────────────────────────────────
+        if self.visible.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(if unavailable == catalog.photos.len() && unavailable > 0 {
+                        "Originals are unavailable.\nConnect the photo drive, then ⟳."
+                    } else if self.accepted_only {
+                        "No picks in this catalog."
+                    } else {
+                        "No photos in this catalog."
+                    })
+                    .color(theme::TEXT_WEAK),
                 );
+            });
+            if let Some(position) = next_position {
+                action = self.select(position);
             }
+            return action;
         }
-        let row_height = 64.;
-        let mut scroll = egui::ScrollArea::vertical().id_salt("catalog-photos");
+        let gap = 6.0;
+        let frame = egui::vec2(list_width.floor(), (list_width * 2.0 / 3.0).floor());
+        let caption_height = 16.0;
+        let row_height = frame.y + caption_height;
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("catalog-photos")
+            .auto_shrink([false; 2]);
         if self.scroll_to_selected {
             if let Some(position) = position {
-                scroll = scroll.vertical_scroll_offset(
-                    position as f32 * (row_height + ui.spacing().item_spacing.y),
-                );
+                // Keep the selection one row below the top so its neighbour shows.
+                let offset = (position as f32 - 1.0).max(0.0) * (row_height + gap);
+                scroll = scroll.vertical_scroll_offset(offset);
             }
             self.scroll_to_selected = false;
         }
+        ui.spacing_mut().item_spacing.y = gap;
         scroll.show_rows(ui, row_height, self.visible.len(), |ui, range| {
             for position in range {
                 let index = self.visible[position];
@@ -323,31 +408,15 @@ impl Browser {
                         self.pending_thumbnails.insert(photo.id);
                     }
                 }
-                let (flag, color) = match photo.flag {
-                    1 => ("Accepted", egui::Color32::from_rgb(160, 232, 176)),
-                    -1 => ("Rejected", egui::Color32::from_rgb(255, 180, 170)),
-                    _ => ("Unflagged", ui.visuals().text_color()),
-                };
-                let name = photo.path.file_name().unwrap_or_default().to_string_lossy();
-                let copy = if photo.copy_name.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", photo.copy_name)
-                };
-                let text = egui::RichText::new(format!("{flag}\n{name}{copy}")).color(color);
-                let button = match self.thumbnails.get(&photo.id).and_then(Option::as_ref) {
-                    Some(texture) => egui::Button::image_and_text(
-                        egui::Image::new((texture.id(), texture.size_vec2()))
-                            .fit_to_exact_size(egui::vec2(56., 56.))
-                            .maintain_aspect_ratio(true),
-                        text,
-                    ),
-                    None => egui::Button::new(text),
-                }
-                .selected(self.selected == Some(index));
-                let response = ui
-                    .add_sized([ui.available_width(), row_height], button)
-                    .on_hover_text(photo.path.display().to_string());
+                let texture = self.thumbnails.get(&photo.id).and_then(Option::as_ref);
+                let response = thumbnail_cell(
+                    ui,
+                    photo,
+                    texture,
+                    frame,
+                    caption_height,
+                    self.selected == Some(index),
+                );
                 if response.clicked() {
                     response.surrender_focus();
                     next_position = Some(position);
@@ -361,9 +430,190 @@ impl Browser {
     }
 }
 
+/// A compact one-line notice with a coloured marker.
+fn notice(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("●").size(8.0).color(color));
+        ui.add(egui::Label::new(RichText::new(text).small().color(theme::TEXT_CAPTION)).wrap());
+    });
+}
+
+/// One list row: the thumbnail fitted into a 3:2 frame, its pick flag as a
+/// corner badge, rejects dimmed as in Lightroom, and the filename beneath.
+fn thumbnail_cell(
+    ui: &mut egui::Ui,
+    photo: &Photo,
+    texture: Option<&egui::TextureHandle>,
+    frame_size: egui::Vec2,
+    caption_height: f32,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        frame_size + egui::vec2(0.0, caption_height),
+        egui::Sense::click(),
+    );
+    let name = photo.path.file_name().unwrap_or_default().to_string_lossy();
+    let response = response.on_hover_text(if photo.copy_name.is_empty() {
+        photo.path.display().to_string()
+    } else {
+        format!(
+            "{}\nVirtual copy: {}",
+            photo.path.display(),
+            photo.copy_name
+        )
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    let frame = egui::Rect::from_min_size(rect.min, frame_size);
+    let fill = if response.hovered() {
+        egui::Color32::from_gray(44)
+    } else {
+        theme::WELL
+    };
+    painter.rect_filled(frame, 4.0, fill);
+    let inner = frame.shrink(4.0);
+    match texture {
+        Some(texture) => {
+            let size = texture.size_vec2();
+            let scale = (inner.width() / size.x).min(inner.height() / size.y);
+            let image_rect = egui::Rect::from_center_size(inner.center(), size * scale);
+            let tint = if photo.flag == -1 {
+                egui::Color32::from_white_alpha(90)
+            } else {
+                egui::Color32::WHITE
+            };
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint,
+            );
+        }
+        None => {
+            painter.rect_filled(
+                inner.shrink(inner.width() * 0.2),
+                2.0,
+                egui::Color32::from_gray(34),
+            );
+        }
+    }
+    if selected {
+        painter.rect_stroke(
+            frame,
+            4.0,
+            egui::Stroke::new(2.0, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let badge = match photo.flag {
+        1 => Some(egui::Color32::from_rgb(120, 200, 140)),
+        -1 => Some(egui::Color32::from_rgb(230, 110, 100)),
+        _ => None,
+    };
+    if let Some(color) = badge {
+        let c = frame.left_top() + egui::vec2(10.0, 10.0);
+        painter.circle(
+            c,
+            4.5,
+            color,
+            egui::Stroke::new(1.5, egui::Color32::from_black_alpha(160)),
+        );
+    }
+    if !photo.copy_name.is_empty() {
+        painter.text(
+            frame.right_top() + egui::vec2(-6.0, 4.0),
+            egui::Align2::RIGHT_TOP,
+            "VC",
+            egui::FontId::proportional(9.0),
+            theme::TEXT_CAPTION,
+        );
+    }
+    let caption = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), frame.bottom() + 2.0),
+        rect.right_bottom(),
+    );
+    let color = if selected {
+        theme::TEXT
+    } else {
+        theme::TEXT_WEAK
+    };
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name.into_owned(),
+        egui::FontId::proportional(10.5),
+        color,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(caption.width());
+    painter.galley(caption.left_top(), painter.layout_job(job), color);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn photos(count: usize) -> Vec<Photo> {
+        (0..count)
+            .map(|i| Photo {
+                id: i as i64,
+                path: PathBuf::from(format!("/roll/DSC_{i:04}.ARW")),
+                available: true,
+                copy_name: String::new(),
+                flag: 0,
+                geometry: Ok(spektrafilm_io::lightroom::Geometry {
+                    orientation: 1,
+                    crop: [0., 0., 1., 1.],
+                    angle: 0.,
+                }),
+                framing_warning: false,
+            })
+            .collect()
+    }
+
+    /// The panel must keep the width the user chose: list rows that overflow
+    /// the scroll area (e.g. by ignoring its scrollbar) make egui widen the
+    /// panel again on the next frame.
+    #[test]
+    fn catalog_panel_keeps_a_narrow_width_with_a_scrolling_list() {
+        for width in [210.0, 260.0, 333.0, 480.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let mut browser = Browser::open(PathBuf::from("/missing/catalog.lrcat"), &ctx);
+            browser.loading = None;
+            browser.catalog = Some(Catalog {
+                path: PathBuf::new(),
+                photos: photos(60),
+            });
+            browser.filter();
+            let mut panel_width = 0.0;
+            for frame in 0..6 {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 700.0),
+                        )),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        panel_width = egui::SidePanel::left("catalog")
+                            .exact_width(width)
+                            .show(ctx, |ui| browser.show(ui, ctx))
+                            .response
+                            .rect
+                            .width();
+                    },
+                );
+            }
+            assert!(
+                panel_width <= width + 0.5,
+                "panel set to {width} grew to {panel_width}"
+            );
+        }
+    }
     #[test]
     fn accepted_filter_and_navigation_use_catalog_flags() {
         let ctx = egui::Context::default();
@@ -409,6 +659,6 @@ mod tests {
         );
         let [width, height] = browser.thumbnails[&3].as_ref().unwrap().size();
         assert_eq!(width, 2 * height);
-        assert!(width <= 96);
+        assert!(width <= THUMBNAIL_PX as usize);
     }
 }

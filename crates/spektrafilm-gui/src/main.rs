@@ -7,10 +7,15 @@
 
 mod calibration_ui;
 mod catalog_ui;
+mod chrome;
+mod history;
 mod icons;
+mod inspector;
 mod lut_ui;
+mod names;
 mod paper_back;
 mod project;
+mod theme;
 mod tooltips;
 mod view;
 use std::path::{Path, PathBuf};
@@ -50,7 +55,9 @@ fn main() -> eframe::Result<()> {
     let initial_image = std::env::args().nth(1).map(PathBuf::from);
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([900.0, 560.0]),
         renderer: gui_renderer(),
         // egui's default device descriptor hardcodes
         // `max_texture_dimension_2d: 8192`, so uploading the preview of an
@@ -182,6 +189,8 @@ fn gui_renderer() -> eframe::Renderer {
 struct ProfileEntry {
     stock: String,
     display: String,
+    /// Picker group such as "Color negative" or "Photographic paper".
+    group: &'static str,
 }
 
 struct LensDatabaseStatus {
@@ -309,6 +318,21 @@ struct App {
     /// surfaces success/failure in `status` when the worker thread
     /// completes. Joined eagerly to release the thread.
     export_job: Option<ExportJob>,
+    /// Inspector stage tab shown in the sidebar.
+    tab: inspector::Tab,
+    history: history::History,
+    /// `params` serialized at the start of the frame (undo, change markers).
+    params_json: Arc<serde_json::Value>,
+    /// Stock-default params for the named film, typed and as JSON.
+    baseline: Option<(String, Arc<RuntimeParams>, Arc<serde_json::Value>)>,
+    /// Inspector rows mapped to the param pointers they edit, learned on change.
+    learned_rows: Arc<std::collections::HashMap<egui::Id, Vec<String>>>,
+    /// Show the unprocessed input instead of the render (held key or button).
+    compare_hold: bool,
+    before_button_held: bool,
+    /// `zoom` value at which one source pixel maps to one screen pixel.
+    view_actual_zoom: f32,
+    window_title: String,
 }
 
 struct LoadJob {
@@ -365,6 +389,7 @@ fn image_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
 /// plus the two timings the status bar shows.
 struct RenderJob {
     discard: bool,
+    started: Instant,
     rx: mpsc::Receiver<Result<RenderResult, String>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -407,7 +432,7 @@ impl App {
         backend: Arc<dyn ComputeBackend>,
         initial_image: Option<PathBuf>,
     ) -> Self {
-        let _ = cc;
+        theme::apply(&cc.egui_ctx);
 
         let data_dir = pick_data_dir();
         let (films, papers) = scan_profiles(&data_dir);
@@ -496,11 +521,20 @@ impl App {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             render_job: None,
-            status: String::from("Load an image to start."),
+            status: String::new(),
             dirty: false,
             #[cfg(target_os = "macos")]
             metal_colorspace_tagged: false,
             export_job: None,
+            tab: inspector::Tab::default(),
+            history: Default::default(),
+            params_json: Default::default(),
+            baseline: None,
+            learned_rows: Default::default(),
+            compare_hold: false,
+            before_button_held: false,
+            view_actual_zoom: 0.0,
+            window_title: String::new(),
         };
         if project::default_path().exists() {
             if let Err(e) = app.restore_project(&project::default_path(), false) {
@@ -1103,6 +1137,7 @@ impl App {
             .expect("OS thread spawn");
         self.render_job = Some(RenderJob {
             discard: false,
+            started: Instant::now(),
             rx,
             handle: Some(handle),
         });
@@ -1112,6 +1147,15 @@ impl App {
     /// cursor) and click-drag pan. Double-click resets to fit.
     /// `self.zoom = 1.0` means fit-to-panel; values >1 zoom in.
     fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui) {
+        // Holding "before" shows the unprocessed input in place of the render.
+        let held_display = self.compare_hold.then(|| {
+            let saved = self.display.clone();
+            self.display.show_input = true;
+            self.display.input_opacity = 1.0;
+            self.display.show_output = false;
+            self.display.compare_split = false;
+            saved
+        });
         let avail = ui.available_size();
         let source_size = self
             .canvas_input
@@ -1126,14 +1170,22 @@ impl App {
         let img_size = source_size.or(output_size).unwrap_or(egui::Vec2::splat(1.));
         let border = img_size.x.max(img_size.y) * self.display.white_padding;
         let paper_size = img_size + egui::Vec2::splat(2. * border);
-        let fit_scale = (avail.x / paper_size.x)
-            .min(avail.y / paper_size.y)
+        // Fit inside the margins and above the floating toolbar.
+        let area = Self::image_area(egui::Rect::from_min_size(egui::Pos2::ZERO, avail));
+        let fit_scale = (area.width() / paper_size.x)
+            .min(area.height() / paper_size.y)
             .min(1.0);
         let scale = fit_scale * self.zoom;
         let drawn_size = img_size * scale;
+        if let Some(image) = &self.image {
+            let ppp = ui.ctx().pixels_per_point();
+            self.view_actual_zoom = image.width.max(image.height) as f32
+                / (ppp * img_size.x.max(img_size.y) * fit_scale);
+        }
 
         let response = ui.allocate_response(avail, egui::Sense::click_and_drag());
         let rect = response.rect;
+        let fit_centre = rect.min + area.center().to_vec2();
 
         // Two zoom sources, never combined:
         //   1. trackpad pinch (`zoom_delta` — already a multiplier
@@ -1164,14 +1216,39 @@ impl App {
             self.zoom = (self.zoom * factor).clamp(0.1, 32.0);
             if let Some(cur) = cursor {
                 // Keep the image point under the cursor anchored.
-                let centre = rect.center() + self.pan;
+                let centre = fit_centre + self.pan;
                 let offset_from_centre = cur - centre;
                 let scale_ratio = self.zoom / old_zoom;
                 self.pan += offset_from_centre * (1.0 - scale_ratio);
             }
         }
 
-        if response.dragged() {
+        // In split view, dragging near the divider moves it instead of panning.
+        let split_rect = egui::Rect::from_center_size(fit_centre + self.pan, drawn_size);
+        let split_x = split_rect.left() + split_rect.width() * self.display.split_position;
+        let near_split =
+            |p: egui::Pos2| (p.x - split_x).abs() < 8.0 && split_rect.y_range().contains(p.y);
+        let split_id = response.id.with("split-drag");
+        let mut dragging_split = self.display.compare_split
+            && response.dragged()
+            && ui.data(|d| d.get_temp::<bool>(split_id)).unwrap_or(false);
+        if self.display.compare_split && response.drag_started() {
+            dragging_split = ui
+                .input(|i| i.pointer.press_origin())
+                .is_some_and(near_split);
+        }
+        if self.display.compare_split
+            && (dragging_split || response.hover_pos().is_some_and(near_split))
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        ui.data_mut(|d| d.insert_temp(split_id, dragging_split));
+        if dragging_split {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.display.split_position =
+                    ((p.x - split_rect.left()) / split_rect.width()).clamp(0.0, 1.0);
+            }
+        } else if response.dragged() {
             self.pan += response.drag_delta();
         }
         if response.double_clicked() {
@@ -1179,7 +1256,7 @@ impl App {
             self.pan = egui::Vec2::ZERO;
         }
 
-        let centre = rect.center() + self.pan;
+        let centre = fit_centre + self.pan;
         let source_rect = egui::Rect::from_center_size(centre, drawn_size);
         let out_size = output_size.unwrap_or(img_size);
         let out_scale = (drawn_size.x / out_size.x).min(drawn_size.y / out_size.y);
@@ -1187,8 +1264,23 @@ impl App {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         // Clip to the central panel so panned-off pixels don't leak.
         let painter = ui.painter_at(rect);
+        let paper_rect = if self.display.show_border {
+            source_rect.expand(border * scale)
+        } else {
+            source_rect
+        };
+        // Lift the print off the canvas.
+        painter.add(
+            egui::epaint::Shadow {
+                offset: [0, 6],
+                blur: 28,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(110),
+            }
+            .as_shape(paper_rect, 0.0),
+        );
         if self.display.show_border && border > 0. {
-            painter.rect_filled(source_rect.expand(border * scale), 0., egui::Color32::WHITE);
+            painter.rect_filled(paper_rect, 0., egui::Color32::WHITE);
         }
         if self.display.show_paper_back {
             if let (Some(canvas), Some(paper)) = (&self.canvas, &self.canvas_paper) {
@@ -1290,23 +1382,36 @@ impl App {
                 ],
                 egui::Stroke::new(1., egui::Color32::WHITE),
             );
+            painter.circle(
+                egui::pos2(x, draw_rect.center().y),
+                7.0,
+                egui::Color32::from_black_alpha(140),
+                egui::Stroke::new(1.5, egui::Color32::WHITE),
+            );
+            let top = draw_rect.top().max(rect.top()) + 10.0;
+            canvas_tag(
+                &painter,
+                egui::pos2(x - 8.0, top),
+                egui::Align2::RIGHT_TOP,
+                "Before",
+            );
+            canvas_tag(
+                &painter,
+                egui::pos2(x + 8.0, top),
+                egui::Align2::LEFT_TOP,
+                "After",
+            );
         }
-
-        // Zoom indicator + reset chip in the corner.
-        let pct = (self.zoom * fit_scale * 100.0).round() as i32;
-        let text = if (self.zoom - 1.0).abs() < 0.001 && self.pan.length_sq() < 1.0 {
-            "fit".to_string()
-        } else {
-            format!("{pct} %  (double-click to reset)")
-        };
-        let pos = rect.left_top() + egui::vec2(8.0, 8.0);
-        painter.text(
-            pos,
-            egui::Align2::LEFT_TOP,
-            text,
-            egui::FontId::monospace(12.0),
-            egui::Color32::from_rgba_premultiplied(220, 220, 220, 200),
-        );
+        if let Some(saved) = held_display {
+            self.display = saved;
+            let top = source_rect.top().max(rect.top()) + 10.0;
+            canvas_tag(
+                &painter,
+                egui::pos2(source_rect.left().max(rect.left()) + 10.0, top),
+                egui::Align2::LEFT_TOP,
+                "Before",
+            );
+        }
     }
 
     /// Called once per `update()`. If the in-flight render finished,
@@ -1415,12 +1520,9 @@ impl App {
                         self.display.output_interpolation == "nearest",
                     ));
                 }
-                self.status = format!(
-                    "Rendered {} × {} ({:.1} MP)",
-                    r.output.width,
-                    r.output.height,
-                    r.output.pixel_count() as f64 / 1e6
-                );
+                if self.status.starts_with("Rendering preview") {
+                    self.status.clear();
+                }
                 self.output_image = Some(r.output);
             }
             Err(msg) => {
@@ -1676,271 +1778,65 @@ impl App {
         };
     }
 
+    /// Apply a new film stock: its stock defaults, its paired paper, and the
+    /// route its type implies (slides scan directly, negatives print).
+    fn film_changed(&mut self) {
+        self.film_dev_times = Vec::new();
+        self.params.film_render.chemistry.development_time = None;
+        if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name) {
+            // Slide/positive stocks have no print paper — they are scanned
+            // directly. Negatives print onto their paired `target_print`.
+            // Auto-follow the film type so switching stocks doesn't leave a
+            // wrong (or, for a paperless slide, a failed) render.
+            if !self.params.converts_film() && self.params.route() != "input" {
+                self.params.io.scan_film = film.is_positive();
+                self.params.workflow.route = if film.is_positive() {
+                    "input > film > scan"
+                } else {
+                    "input > film > print > scan"
+                }
+                .into();
+            }
+            spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
+            self.film_dev_times = film.data.development_time.clone();
+            if let Some(target) = film.info.target_print.as_deref()
+                && self.papers.iter().any(|p| p.stock == target)
+                && self.print_name != target
+            {
+                self.print_name = target.to_string();
+                self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
+                self.params.print_render.chemistry.development_time = None;
+            }
+        }
+        self.dirty = true;
+    }
+
     fn controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use inspector::{Section, Tab};
         // Control captions are hover targets, not selectable text; the separate
         // status bar remains selectable for copying errors.
         ui.style_mut().interaction.selectable_labels = false;
-        ui.heading("spektrafilm");
-        ui.add_space(6.0);
-
-        // ── File ────────────────────────────────────────────────────────
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Open…")
-                .on_hover_text(tooltips::CONTROL_OPEN)
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(
-                        "Image",
-                        &[
-                            "png", "jpg", "jpeg", "tif", "tiff", "exr", // standard
-                            "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
-                            "rw2", "pef", "srw", "x3f", "iiq", "3fr", "crw", "rwl", "mrw", "mef",
-                            "kdc",
-                        ],
-                    )
-                    .pick_file()
-                {
-                    self.load_image_from_path(&path);
-                }
-            }
-            if ui
-                .button("Catalog…")
-                .on_hover_text("Browse a Lightroom Classic catalog read-only")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Lightroom Classic catalog", &["lrcat"])
-                    .pick_file()
-                {
-                    self.open_catalog(path);
-                }
-            }
-            let save_enabled = self.output_image.is_some()
-                && self.load_job.is_none()
-                && self.render_job.is_none()
-                && !self.dirty
-                && !self.pending_dirty;
-            if ui
-                .add_enabled(save_enabled, egui::Button::new("Save preview…"))
-                .on_hover_text(tooltips::CONTROL_SAVE_PREVIEW)
-                .on_disabled_hover_text("Render a preview first")
-                .clicked()
-            {
-                self.save_dialog();
-            }
-            let export_busy = self.export_job.is_some();
-            if export_busy {
-                if ui
-                    .button("Cancel")
-                    .on_hover_text(tooltips::CANCEL_EXPORT)
-                    .clicked()
-                {
-                    self.cancel_export();
-                }
-            } else {
-                let export_enabled = self.image_path.is_some() && self.load_job.is_none();
-                if ui
-                    .add_enabled(export_enabled, egui::Button::new("Export…"))
-                    .on_hover_text(tooltips::EXPORT_IMAGE)
-                    .on_disabled_hover_text("Load an image first")
-                    .clicked()
-                {
-                    self.export_dialog(ctx);
-                }
-            }
-        });
-        if let Some(p) = &self.image_path {
-            ui.label(
-                egui::RichText::new(p.file_name().and_then(|s| s.to_str()).unwrap_or("")).small(),
-            );
-        }
-        ui.add_space(4.0);
-
-        self.project_controls(ui);
-        self.lut_controls(ui, ctx);
-        ui.horizontal(|ui| {
-            tooltips::checkbox(
-                ui,
-                &mut self.auto_preview,
-                "Auto preview",
-                tooltips::CONTROL_AUTO_PREVIEW,
-            );
-            if ui
-                .add_enabled(self.image.is_some(), egui::Button::new("Render preview"))
-                .on_hover_text(tooltips::CONTROL_RENDER_PREVIEW)
-                .on_disabled_hover_text(tooltips::CONTROL_RENDER_PREVIEW)
-                .clicked()
-            {
-                self.render_requested = true;
-                self.dirty = true;
-                self.dirty_since = None;
-            }
-        });
-        let route = self.params.route().to_owned();
-        let mut selected = route.clone();
-        tooltips::combo(
-            ui,
-            egui::ComboBox::from_id_salt("workflow").selected_text(match selected.as_str() {
-                "input" => "Input only",
-                "input > film > scan" => "Film → scan",
-                "input > film > print > scan" => "Film → print → scan",
-                "input > convert-film > print > scan" => "Negative scan → print",
-                "input > convert-film > scan-minus-base" => "Negative scan → dyes",
-                _ => "Negative scan → scan",
-            }),
-            "Workflow",
-            "Choose whether to simulate film, convert a scanned negative, or pass the input through.",
-            |ui| {
-                for route in [
-                    "input",
-                    "input > film > scan",
-                    "input > film > print > scan",
-                    "input > convert-film > print > scan",
-                    "input > convert-film > scan-minus-base",
-                    "input > convert-film > scan",
-                ] {
-                    ui.selectable_value(&mut selected,route.to_owned(),route).on_hover_text(match route {
-                    "input"=>"Convert input to the output color space without film simulation.",
-                    "input > film > scan"=>"Expose and develop film, then scan it directly.",
-                    "input > film > print > scan"=>"Expose film, print it onto paper, then scan the print.",
-                    "input > convert-film > print > scan"=>"Recover dye densities from a scanned negative and print them.",
-                    "input > convert-film > scan-minus-base"=>"Recover film dye densities and scan them without the film base.",
-                    _=>"Recover film dye densities and scan them under the selected scan illuminant.",
-                });
-                }
-            },
-        );
-        if selected != route {
-            self.params.workflow.route = selected;
-            self.params.digest();
-            self.dirty = true;
-        }
-        // ── Profiles ────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Profiles")
-            .default_open(true)
-            .show(ui, |ui| {
-                let film_changed =
-                    profile_combo(ui, "film", "Film stock", &self.films, &mut self.film_name);
-                if film_changed {
-                    self.film_dev_times = Vec::new();
-                    self.params.film_render.chemistry.development_time = None;
-                    if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name)
-                    {
-                        // Slide/positive stocks have no print paper — they
-                        // are scanned directly. Negatives print onto their
-                        // paired `target_print`. Auto-follow the film type
-                        // so switching stocks doesn't leave a wrong (or, for
-                        // a paperless slide, a failed) render.
-                        if !self.params.converts_film() && self.params.route() != "input" {
-                            self.params.io.scan_film = film.is_positive();
-                            self.params.workflow.route = if film.is_positive() {
-                                "input > film > scan"
-                            } else {
-                                "input > film > print > scan"
-                            }
-                            .into();
-                        }
-                        spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
-                        self.film_dev_times = film.data.development_time.clone();
-                        if let Some(target) = film.info.target_print.as_deref()
-                            && self.papers.iter().any(|p| p.stock == target)
-                            && self.print_name != target
-                        {
-                            self.print_name = target.to_string();
-                            self.print_dev_times =
-                                profile_dev_times(&self.data_dir, &self.print_name);
-                            self.params.print_render.chemistry.development_time = None;
-                        }
-                    }
-                    self.dirty = true;
-                }
-                // B&W stocks are profiled at several development times —
-                // pick one (longer = more contrast). Hidden for the
-                // single-time / colour case.
-                if self.film_dev_times.len() > 1
-                    && dev_time_combo(
-                        ui,
-                        "film_dev_time",
-                        "Development time",
-                        &self.film_dev_times.clone(),
-                        &mut self.params.film_render.chemistry.development_time,
-                    )
-                {
-                    self.dirty = true;
-                }
-                // Slide films are scanned directly, so the print paper is
-                // unused — disable the picker and say why rather than
-                // letting it silently affect nothing.
-                if self.params.scans_film() {
-                    ui.label(
-                        egui::RichText::new("Film scanned directly (no print paper).")
-                            .italics()
-                            .small(),
-                    );
-                }
-                let paper_changed = ui
-                    .add_enabled_ui(!self.params.scans_film(), |ui| {
-                        profile_combo(
-                            ui,
-                            "paper",
-                            "Print paper",
-                            &self.papers,
-                            &mut self.print_name,
-                        )
-                    })
-                    .inner;
-                if paper_changed {
-                    self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
-                    self.params.print_render.chemistry.development_time = None;
-                    self.dirty = true;
-                }
-                if !self.params.scans_film()
-                    && self.print_dev_times.len() > 1
-                    && dev_time_combo(
-                        ui,
-                        "print_dev_time",
-                        "Print development time",
-                        &self.print_dev_times.clone(),
-                        &mut self.params.print_render.chemistry.development_time,
-                    )
-                {
-                    self.dirty = true;
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_PROFILES);
-
-        let mut scan_for_print = self.scan_for_print_restore.is_some();
-        if tooltips::checkbox(
-            ui,
-            &mut scan_for_print,
-            "Scan for print",
-            tooltips::SCAN_FOR_PRINT,
-        )
-        .changed()
-        {
-            if scan_for_print {
-                self.scan_for_print_restore = Some([
-                    self.params.scanner.white_correction,
-                    self.params.scanner.black_correction,
-                    self.params.print_render.glare.active,
-                ]);
-                self.params.scanner.white_correction = true;
-                self.params.scanner.black_correction = true;
-                self.params.print_render.glare.active = false;
-            } else if let Some([white, black, glare]) = self.scan_for_print_restore.take() {
-                self.params.scanner.white_correction = white;
-                self.params.scanner.black_correction = black;
-                self.params.print_render.glare.active = glare;
-            }
-            self.dirty = true;
-        }
+        let stages = inspector::Stages::of(&self.params);
+        let stock = self.stock_params();
+        let not_camera = if self.params.converts_film() {
+            "Not used: this workflow starts from a scanned negative."
+        } else {
+            "Not used: this workflow bypasses film simulation."
+        };
+        const NOT_FILM: &str = "Not used: this workflow bypasses film simulation.";
+        const NOT_PRINT: &str = "Not used: this workflow does not print.";
+        const NOT_SCAN: &str = "Not used: this workflow bypasses the scanner.";
 
         // ── Exposure ────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Exposure")
-            .default_open(true)
+        Section::new("Exposure", Tab::Input, tooltips::SECTION_EXPOSURE)
+            .used(stages.camera, not_camera)
+            .pointers(&[
+                "/camera/auto_exposure",
+                "/camera/auto_exposure_method",
+                "/camera/exposure_compensation_ev",
+                "/camera/film_format_mm",
+                "/camera/lens_blur_um",
+            ])
             .show(ui, |ui| {
                 let mut changed = false;
                 changed |= tooltips::checkbox(
@@ -1954,7 +1850,8 @@ impl App {
                     let method = &mut self.params.camera.auto_exposure_method;
                     tooltips::combo(
                         ui,
-                        egui::ComboBox::from_id_salt("Metering").selected_text(method.clone()),
+                        egui::ComboBox::from_id_salt("Metering")
+                            .selected_text(names::label(method)),
                         "Metering",
                         tooltips::MENU_METERING,
                         |ui| {
@@ -1968,7 +1865,7 @@ impl App {
                                 "highlight_weighted",
                             ] {
                                 changed |= ui
-                                    .selectable_value(method, opt.to_string(), opt)
+                                    .selectable_value(method, opt.to_string(), names::label(opt))
                                     .on_hover_text(tooltips::option(opt))
                                     .changed();
                             }
@@ -1977,7 +1874,8 @@ impl App {
                 }
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut self.params.camera.exposure_compensation_ev, -5.0..=5.0)
+                    tooltips::slider(&mut self.params.camera.exposure_compensation_ev, -5.0..=5.0)
+                        .stock(stock.camera.exposure_compensation_ev)
                         .step_by(0.1),
                     "EV compensation",
                     tooltips::CONTROL_EV_COMPENSATION,
@@ -1985,7 +1883,8 @@ impl App {
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut self.params.camera.film_format_mm, 4.0..=120.0)
+                    tooltips::slider(&mut self.params.camera.film_format_mm, 4.0..=120.0)
+                        .stock(stock.camera.film_format_mm)
                         .logarithmic(true),
                     "Film format (mm)",
                     tooltips::CONTROL_FILM_FORMAT_MM,
@@ -1993,7 +1892,8 @@ impl App {
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut self.params.camera.lens_blur_um, 0.0..=100.0),
+                    tooltips::slider(&mut self.params.camera.lens_blur_um, 0.0..=100.0)
+                        .stock(stock.camera.lens_blur_um),
                     "Lens blur (µm)",
                     tooltips::CONTROL_LENS_BLUR_UM,
                 )
@@ -2001,57 +1901,273 @@ impl App {
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_EXPOSURE);
+            });
+
+        // ── Diffusion filter (lens) ─────────────────────────────────────
+        let toggled = Section::new(
+            "Diffusion filter (lens)",
+            Tab::Input,
+            tooltips::SECTION_DIFFUSION_FILTER_LENS,
+        )
+        .active(
+            self.params.camera.diffusion_filter.active,
+            tooltips::ENABLE_DIFFUSION,
+        )
+        .used(stages.camera, not_camera)
+        .pointers(&["/camera/diffusion_filter"])
+        .show(ui, |ui| {
+            let df = &mut self.params.camera.diffusion_filter;
+            let mut changed = false;
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("Family")
+                    .selected_text(names::label(&df.filter_family)),
+                "Family",
+                tooltips::MENU_FAMILY,
+                |ui| {
+                    for fam in ["black_pro_mist", "glimmerglass", "pro_mist", "cinebloom"] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut df.filter_family,
+                                fam.to_string(),
+                                names::label(fam),
+                            )
+                            .on_hover_text(tooltips::option(fam))
+                            .changed();
+                    }
+                },
+            );
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.strength, 0.0..=2.0)
+                    .stock(stock.camera.diffusion_filter.strength),
+                "Strength",
+                tooltips::CONTROL_STRENGTH,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.spatial_scale, 0.1..=3.0)
+                    .stock(stock.camera.diffusion_filter.spatial_scale),
+                "Spatial scale",
+                tooltips::CONTROL_SPATIAL_SCALE,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.halo_warmth, -1.5..=1.5)
+                    .stock(stock.camera.diffusion_filter.halo_warmth),
+                "Halo warmth",
+                tooltips::CONTROL_HALO_WARMTH,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.core_intensity, 0.0..=2.0)
+                    .stock(stock.camera.diffusion_filter.core_intensity),
+                "Core intensity",
+                tooltips::CONTROL_CORE_INTENSITY,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.halo_intensity, 0.0..=2.0)
+                    .stock(stock.camera.diffusion_filter.halo_intensity),
+                "Halo intensity",
+                tooltips::CONTROL_HALO_INTENSITY,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.bloom_intensity, 0.0..=2.0)
+                    .stock(stock.camera.diffusion_filter.bloom_intensity),
+                "Bloom intensity",
+                tooltips::CONTROL_BLOOM_INTENSITY,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.halo_size, 0.1..=3.0)
+                    .stock(stock.camera.diffusion_filter.halo_size),
+                "Halo size",
+                tooltips::CONTROL_HALO_SIZE,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut df.bloom_size, 0.1..=3.0)
+                    .stock(stock.camera.diffusion_filter.bloom_size),
+                "Bloom size",
+                tooltips::CONTROL_BLOOM_SIZE,
+            )
+            .changed();
+            if changed {
+                self.dirty = true;
+            }
+        });
+        if toggled {
+            self.params.camera.diffusion_filter.active ^= true;
+            self.dirty = true;
+        }
+
+        Section::new(
+            "Taking filter",
+            Tab::Input,
+            "Measured transmission of a filter placed in front of the taking lens.",
+        )
+        .closed()
+        .used(stages.camera, not_camera)
+        .pointers(&["/camera/color_filter"])
+        .show(ui, |ui| {
+            let mut changed = false;
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("taking_filter")
+                    .selected_text(names::label(&self.params.camera.color_filter)),
+                "Color filter",
+                "Measured transmission of a filter placed in front of the taking lens.",
+                |ui| {
+                    for name in [
+                        "none", "hoya_x0", "hoya_x1", "hoya_y2", "hoya_ya3", "hoya_r1",
+                    ] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.camera.color_filter,
+                                name.into(),
+                                names::label(name),
+                            )
+                            .changed();
+                    }
+                },
+            );
+            if changed {
+                self.dirty = true;
+            }
+        });
+
+        Section::new(
+            "Scan conversion",
+            Tab::Input,
+            "Recover film dye densities from a scanned negative before printing or rescanning.",
+        )
+        .used(stages.convert, "Used only by the scanned-negative workflows.")
+        .pointers(&["/film_render/convert"])
+        .show(ui, |ui| {
+            let p = &mut self.params.film_render.convert;
+            let mut changed = false;
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("scan_illuminant").selected_text(&p.scan_illuminant),
+                "Scan illuminant",
+                "The physical light used to capture the scanned negative.",
+                |ui| {
+                    for name in spektrafilm_math::illuminants::names() {
+                        changed |= ui
+                            .selectable_value(&mut p.scan_illuminant, name.into(), name)
+                            .changed();
+                    }
+                },
+            );
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut p.exposure_compensation_ev, -8. ..=8.).stock(stock.film_render.convert.exposure_compensation_ev),
+                "Scan exposure EV",
+                "Align the scanned input's level to the physical scan model before inversion.",
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut p.base_percentile, 90. ..=100.).stock(stock.film_render.convert.base_percentile),
+                "Base percentile",
+                "Use the brightest pixels above this luminance percentile to estimate clear film base.",
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                egui::TextEdit::singleline(&mut p.calibration).desired_width(f32::INFINITY),
+                "Device matrix",
+                "Nine row-major numbers correcting the scanner or camera color response before inversion.",
+            )
+            .changed();
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.use_convert_lut,
+                "Conversion LUT",
+                "Cache the inverse scan model in a 3D tetrahedral LUT for faster repeated previews.",
+            )
+            .changed();
+            if self.params.settings.use_convert_lut {
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut self.params.settings.convert_lut_resolution, 9..=65).stock(stock.settings.convert_lut_resolution),
+                    "Conversion LUT resolution",
+                    "Samples per RGB axis of the cached inverse scan model.",
+                )
+                .changed();
+            }
+            if changed {
+                self.dirty = true;
+            }
+            self.calibration_controls(ui);
+        });
+
+        self.raw_controls(ui);
 
         // ── Halation ────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Halation")
-            .default_open(true)
+        let toggled = Section::new("Halation", Tab::Film, tooltips::SECTION_HALATION)
+            .active(
+                self.params.film_render.halation.active,
+                tooltips::ENABLE_HALATION,
+            )
+            .used(stages.camera, not_camera)
+            .pointers(&["/film_render/halation"])
             .show(ui, |ui| {
                 let h = &mut self.params.film_render.halation;
                 let mut changed = false;
-                changed |=
-                    tooltips::checkbox(ui, &mut h.active, "Active", tooltips::ENABLE_HALATION)
-                        .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.halation_amount, 0.0..=3.0),
+                    tooltips::slider(&mut h.halation_amount, 0.0..=3.0)
+                        .stock(stock.film_render.halation.halation_amount),
                     "Halation amount",
                     tooltips::CONTROL_HALATION_AMOUNT,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.halation_spatial_scale, 0.1..=5.0),
+                    tooltips::slider(&mut h.halation_spatial_scale, 0.1..=5.0)
+                        .stock(stock.film_render.halation.halation_spatial_scale),
                     "Halation scale",
                     tooltips::CONTROL_HALATION_SCALE,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.scatter_amount, 0.0..=3.0),
+                    tooltips::slider(&mut h.scatter_amount, 0.0..=3.0)
+                        .stock(stock.film_render.halation.scatter_amount),
                     "Scatter amount",
                     tooltips::CONTROL_SCATTER_AMOUNT,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.scatter_spatial_scale, 0.1..=5.0),
+                    tooltips::slider(&mut h.scatter_spatial_scale, 0.1..=5.0)
+                        .stock(stock.film_render.halation.scatter_spatial_scale),
                     "Scatter scale",
                     tooltips::CONTROL_SCATTER_SCALE,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.halation_n_bounces, 1..=5),
+                    tooltips::slider(&mut h.halation_n_bounces, 1..=5)
+                        .stock(stock.film_render.halation.halation_n_bounces),
                     "Bounces",
                     tooltips::CONTROL_BOUNCES,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut h.halation_bounce_decay, 0.0..=1.0),
+                    tooltips::slider(&mut h.halation_bounce_decay, 0.0..=1.0)
+                        .stock(stock.film_render.halation.halation_bounce_decay),
                     "Bounce decay",
                     tooltips::CONTROL_BOUNCE_DECAY,
                 )
@@ -2063,142 +2179,171 @@ impl App {
                     tooltips::CONTROL_RENORMALIZE,
                 )
                 .changed();
-                egui::CollapsingHeader::new("Physical emulsion parameters")
-                    .show(ui, |ui| {
-                        for c in 0..3 {
-                            let channel = ["Red", "Green", "Blue"][c];
-                            ui.label(channel).on_hover_text(tooltips::EMULSION_CHANNEL);
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut h.scatter_core_um[c])
-                                    .range(0.0..=1000.0)
-                                    .speed(0.1),
-                                "Scatter core µm: ",
-                                tooltips::CONTROL_SCATTER_CORE_UM,
-                            )
-                            .changed();
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut h.scatter_tail_um[c])
-                                    .range(0.0..=2000.0)
-                                    .speed(0.5),
-                                "Scatter tail µm: ",
-                                tooltips::CONTROL_SCATTER_TAIL_UM,
-                            )
-                            .changed();
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut h.scatter_tail_weight[c])
-                                    .range(0.0..=1.0)
-                                    .speed(0.01),
-                                "Tail weight: ",
-                                tooltips::CONTROL_TAIL_WEIGHT,
-                            )
-                            .changed();
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut h.halation_strength[c])
-                                    .range(0.0..=3.0)
-                                    .speed(0.001),
-                                "Halation strength: ",
-                                tooltips::CONTROL_HALATION_STRENGTH,
-                            )
-                            .changed();
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut h.halation_first_sigma_um[c])
-                                    .range(0.0..=2000.0)
-                                    .speed(0.5),
-                                "First bounce µm: ",
-                                tooltips::CONTROL_FIRST_BOUNCE_UM,
-                            )
-                            .changed();
-                        }
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::DragValue::new(&mut h.boost_ev)
-                                .range(0.0..=8.0)
-                                .speed(0.01),
-                            "Highlight boost EV: ",
-                            tooltips::CONTROL_HIGHLIGHT_BOOST_EV,
+                Section::nested(
+                    "Physical emulsion parameters",
+                    tooltips::SECTION_PHYSICAL_EMULSION_PARAMETERS,
+                )
+                .advanced()
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Values for the red-, green- and blue-sensitive layers.",
                         )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::DragValue::new(&mut h.boost_range)
-                                .range(0.0..=1.0)
-                                .speed(0.01),
-                            "Boost ramp (0–1): ",
-                            tooltips::CONTROL_BOOST_RAMP_0_1,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::DragValue::new(&mut h.protect_ev)
-                                .range(0.0..=16.0)
-                                .speed(0.01),
-                            "Protect EV: ",
-                            tooltips::CONTROL_PROTECT_EV,
-                        )
-                        .changed();
-                    })
-                    .header_response
-                    .on_hover_text(tooltips::SECTION_PHYSICAL_EMULSION_PARAMETERS);
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                    );
+                    changed |= tooltips::channels(
+                        ui,
+                        "Scatter core (µm)",
+                        tooltips::CONTROL_SCATTER_CORE_UM,
+                        tooltips::RGB,
+                        h.scatter_core_um.each_mut(),
+                        0.0..=1000.0,
+                        0.1,
+                    )
+                    .changed();
+                    changed |= tooltips::channels(
+                        ui,
+                        "Scatter tail (µm)",
+                        tooltips::CONTROL_SCATTER_TAIL_UM,
+                        tooltips::RGB,
+                        h.scatter_tail_um.each_mut(),
+                        0.0..=2000.0,
+                        0.5,
+                    )
+                    .changed();
+                    changed |= tooltips::channels(
+                        ui,
+                        "Tail weight",
+                        tooltips::CONTROL_TAIL_WEIGHT,
+                        tooltips::RGB,
+                        h.scatter_tail_weight.each_mut(),
+                        0.0..=1.0,
+                        0.01,
+                    )
+                    .changed();
+                    changed |= tooltips::channels(
+                        ui,
+                        "Halation strength",
+                        tooltips::CONTROL_HALATION_STRENGTH,
+                        tooltips::RGB,
+                        h.halation_strength.each_mut(),
+                        0.0..=3.0,
+                        0.001,
+                    )
+                    .changed();
+                    changed |= tooltips::channels(
+                        ui,
+                        "First bounce (µm)",
+                        tooltips::CONTROL_FIRST_BOUNCE_UM,
+                        tooltips::RGB,
+                        h.halation_first_sigma_um.each_mut(),
+                        0.0..=2000.0,
+                        0.5,
+                    )
+                    .changed();
+                    changed |= tooltips::labeled(
+                        ui,
+                        egui::DragValue::new(&mut h.boost_ev)
+                            .range(0.0..=8.0)
+                            .speed(0.01),
+                        "Highlight boost EV",
+                        tooltips::CONTROL_HIGHLIGHT_BOOST_EV,
+                    )
+                    .changed();
+                    changed |= tooltips::labeled(
+                        ui,
+                        egui::DragValue::new(&mut h.boost_range)
+                            .range(0.0..=1.0)
+                            .speed(0.01),
+                        "Boost ramp (0–1)",
+                        tooltips::CONTROL_BOOST_RAMP_0_1,
+                    )
+                    .changed();
+                    changed |= tooltips::labeled(
+                        ui,
+                        egui::DragValue::new(&mut h.protect_ev)
+                            .range(0.0..=16.0)
+                            .speed(0.01),
+                        "Protect EV",
+                        tooltips::CONTROL_PROTECT_EV,
+                    )
+                    .changed();
+                });
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_HALATION);
+            });
+        if toggled {
+            self.params.film_render.halation.active ^= true;
+            self.dirty = true;
+        }
 
         // ── DIR couplers ────────────────────────────────────────────────
-        egui::CollapsingHeader::new("DIR couplers")
-            .default_open(true)
+        let toggled = Section::new("DIR couplers", Tab::Film, tooltips::SECTION_DIR_COUPLERS)
+            .active(self.params.film_render.dir_couplers.active, tooltips::ENABLE_DIR)
+            .used(stages.camera, not_camera)
+            .pointers(&["/film_render/dir_couplers"])
             .show(ui, |ui| {
                 let d = &mut self.params.film_render.dir_couplers;
                 let mut changed = false;
-                changed |=
-                    tooltips::checkbox(ui, &mut d.active, "Active", tooltips::ENABLE_DIR).changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut d.amount, 0.0..=2.0),
+                    tooltips::slider(&mut d.amount, 0.0..=2.0).stock(stock.film_render.dir_couplers.amount),
                     "Amount",
                     tooltips::CONTROL_AMOUNT,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut d.diffusion_size_um, 0.0..=100.0),
+                    tooltips::slider(&mut d.diffusion_size_um, 0.0..=100.0).stock(stock.film_render.dir_couplers.diffusion_size_um),
                     "Diffusion size (µm)",
                     tooltips::CONTROL_DIFFUSION_SIZE_UM,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut d.diffusion_tail_um, 0.0..=400.0),
+                    tooltips::slider(&mut d.diffusion_tail_um, 0.0..=400.0).stock(stock.film_render.dir_couplers.diffusion_tail_um),
                     "Diffusion tail (µm)",
                     tooltips::CONTROL_DIFFUSION_TAIL_UM,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut d.diffusion_tail_weight, 0.0..=1.0),
+                    tooltips::slider(&mut d.diffusion_tail_weight, 0.0..=1.0).stock(stock.film_render.dir_couplers.diffusion_tail_weight),
                     "Tail weight",
                     tooltips::CONTROL_TAIL_WEIGHT_2,
                 )
                 .changed();
-                for c in 0..3 {
-                    changed|=tooltips::labeled(ui,egui::Slider::new(&mut d.langmuir_donor_k_rgb[c],0.01..=20.).logarithmic(true),format!("Donor knee {}",["R","G","B"][c]),"Negative-film inhibitor release knee as a fraction of maximum density; larger values approach a linear donor.").changed();
-                    changed|=tooltips::labeled(ui,egui::Slider::new(&mut d.langmuir_receiver_k_rgb[c],0.01..=20.).logarithmic(true),format!("Receiver knee {}",["R","G","B"][c]),"Reversal-film receiver saturation after diffusion, relative to its inhibitor ceiling.").changed();
-                }
-                egui::CollapsingHeader::new("Inhibition matrix")
+                changed |= tooltips::channels(
+                    ui,
+                    "Donor knee",
+                    "Negative-film inhibitor release knee as a fraction of maximum density; larger values approach a linear donor.",
+                    tooltips::RGB,
+                    d.langmuir_donor_k_rgb.each_mut(),
+                    0.01..=20.,
+                    0.01,
+                )
+                .changed();
+                changed |= tooltips::channels(
+                    ui,
+                    "Receiver knee",
+                    "Reversal-film receiver saturation after diffusion, relative to its inhibitor ceiling.",
+                    tooltips::RGB,
+                    d.langmuir_receiver_k_rgb.each_mut(),
+                    0.01..=20.,
+                    0.01,
+                )
+                .changed();
+                Section::nested("Inhibition matrix", tooltips::SECTION_INHIBITION_MATRIX)
+                    .advanced()
                     .show(ui, |ui| {
                         changed |= tooltips::labeled(
                             ui,
                             egui::DragValue::new(&mut d.inhibition_samelayer)
                                 .range(0.0..=4.0)
                                 .speed(0.01),
-                            "Same-layer scale: ",
+                            "Same-layer scale",
                             tooltips::CONTROL_SAME_LAYER_SCALE,
                         )
                         .changed();
@@ -2207,214 +2352,402 @@ impl App {
                             egui::DragValue::new(&mut d.inhibition_interlayer)
                                 .range(0.0..=4.0)
                                 .speed(0.01),
-                            "Inter-layer scale: ",
+                            "Inter-layer scale",
                             tooltips::CONTROL_INTER_LAYER_SCALE,
                         )
                         .changed();
-                        for c in 0..3 {
-                            changed |= tooltips::labeled(
-                                ui,
-                                egui::DragValue::new(&mut d.gamma_samelayer_rgb[c])
-                                    .range(0.0..=4.0)
-                                    .speed(0.001),
-                                format!("{} self: ", ["Red", "Green", "Blue"][c]),
-                                tooltips::DIR_SELF_INHIBITION,
-                            )
-                            .changed();
-                        }
+                        changed |= tooltips::channels(
+                            ui,
+                            "Self inhibition",
+                            tooltips::DIR_SELF_INHIBITION,
+                            tooltips::RGB,
+                            d.gamma_samelayer_rgb.each_mut(),
+                            0.0..=4.0,
+                            0.001,
+                        )
+                        .changed();
                         for (name, values) in [
                             ("Red → green / blue", &mut d.gamma_interlayer_r_to_gb),
                             ("Green → red / blue", &mut d.gamma_interlayer_g_to_rb),
                             ("Blue → red / green", &mut d.gamma_interlayer_b_to_rg),
                         ] {
-                            ui.label(name).on_hover_text(tooltips::DIR_DONOR);
-                            ui.horizontal(|ui| {
-                                for (receiver, v) in values.iter_mut().enumerate() {
-                                    changed |= tooltips::labeled(
-                                        ui,
-                                        egui::DragValue::new(v).range(0.0..=4.0).speed(0.001),
-                                        tooltips::inhibition_receiver(name, receiver),
-                                        tooltips::inhibition(name, receiver),
-                                    )
-                                    .changed();
-                                }
-                            });
-                        }
-                    })
-                    .header_response
-                    .on_hover_text(tooltips::SECTION_INHIBITION_MATRIX);
-                if changed {
-                    self.dirty = true;
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_DIR_COUPLERS);
-
-        // ── Diffusion filter (lens) ─────────────────────────────────────
-        egui::CollapsingHeader::new("Diffusion filter (lens)")
-            .default_open(true)
-            .show(ui, |ui| {
-                let df = &mut self.params.camera.diffusion_filter;
-                let mut changed = false;
-                changed |=
-                    tooltips::checkbox(ui, &mut df.active, "Active", tooltips::ENABLE_DIFFUSION)
-                        .changed();
-                tooltips::combo(
-                    ui,
-                    egui::ComboBox::from_id_salt("Family").selected_text(df.filter_family.clone()),
-                    "Family",
-                    tooltips::MENU_FAMILY,
-                    |ui| {
-                        for fam in ["black_pro_mist", "glimmerglass", "pro_mist", "cinebloom"] {
-                            changed |= ui
-                                .selectable_value(&mut df.filter_family, fam.to_string(), fam)
-                                .on_hover_text(tooltips::option(fam))
-                                .changed();
-                        }
-                    },
-                );
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.strength, 0.0..=2.0),
-                    "Strength",
-                    tooltips::CONTROL_STRENGTH,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.spatial_scale, 0.1..=3.0),
-                    "Spatial scale",
-                    tooltips::CONTROL_SPATIAL_SCALE,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.halo_warmth, -1.5..=1.5),
-                    "Halo warmth",
-                    tooltips::CONTROL_HALO_WARMTH,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.core_intensity, 0.0..=2.0),
-                    "Core intensity",
-                    tooltips::CONTROL_CORE_INTENSITY,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.halo_intensity, 0.0..=2.0),
-                    "Halo intensity",
-                    tooltips::CONTROL_HALO_INTENSITY,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.bloom_intensity, 0.0..=2.0),
-                    "Bloom intensity",
-                    tooltips::CONTROL_BLOOM_INTENSITY,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.halo_size, 0.1..=3.0),
-                    "Halo size",
-                    tooltips::CONTROL_HALO_SIZE,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut df.bloom_size, 0.1..=3.0),
-                    "Bloom size",
-                    tooltips::CONTROL_BLOOM_SIZE,
-                )
-                .changed();
-                if changed {
-                    self.dirty = true;
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_DIFFUSION_FILTER_LENS);
-
-        egui::CollapsingHeader::new("Taking filter").show(ui, |ui| {
-            let mut changed = false;
-            tooltips::combo(
-                ui,
-                egui::ComboBox::from_id_salt("taking_filter")
-                    .selected_text(&self.params.camera.color_filter),
-                "Color filter",
-                "Measured transmission of a filter placed in front of the taking lens.",
-                |ui| {
-                    for name in [
-                        "none", "hoya_x0", "hoya_x1", "hoya_y2", "hoya_ya3", "hoya_r1",
-                    ] {
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.params.camera.color_filter,
-                                name.into(),
+                            let [a, b] = values.each_mut();
+                            let receivers = [
+                                &tooltips::inhibition_receiver(name, 0)[..1],
+                                &tooltips::inhibition_receiver(name, 1)[..1],
+                            ];
+                            let help = format!(
+                                "{}\n\n{}\n{}",
+                                tooltips::DIR_DONOR,
+                                tooltips::inhibition(name, 0),
+                                tooltips::inhibition(name, 1)
+                            );
+                            changed |= tooltips::channels(
+                                ui,
                                 name,
+                                &help,
+                                receivers,
+                                [a, b],
+                                0.0..=4.0,
+                                0.001,
                             )
                             .changed();
-                    }
-                },
-            );
-            if changed {
-                self.dirty = true;
-            }
-        });
+                        }
+                    });
+                if changed {
+                    self.dirty = true;
+                }
+            });
+        if toggled {
+            self.params.film_render.dir_couplers.active ^= true;
+            self.dirty = true;
+        }
 
         // ── Grain ───────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Grain")
-            .default_open(true)
+        let toggled = Section::new("Grain", Tab::Film, tooltips::SECTION_GRAIN)
+            .active(self.params.film_render.grain.active, tooltips::ENABLE_GRAIN)
+            .used(stages.camera, not_camera)
+            .pointers(&["/film_render/grain"])
             .show(ui, |ui| {
                 let g = &mut self.params.film_render.grain;
                 let mut changed = false;
-                changed |= tooltips::checkbox(ui, &mut g.active, "Active", tooltips::ENABLE_GRAIN)
-                    .changed();
-                for c in 0..3 {
-                    changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.rms_granularity[c],0.1..=60.),format!("RMS granularity {}",["R","G","B"][c]),"Peak density noise in thousandths, measured with a 48 µm aperture; higher values give coarser grain.").changed();
-                }
-                changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.mult_usm_sigma,0. ..=3.),"Grain sharpening σ","Blur radius in pixels used by the multiplicative grain sharpen.").changed();
-                changed |= tooltips::labeled(ui,egui::Slider::new(&mut g.mult_usm_amount,0. ..=3.),"Grain sharpening amount","Sharpen absolute grain density while preserving each channel's mean density.").changed();
+                changed |= tooltips::channels(
+                    ui,
+                    "RMS granularity",
+                    "Peak density noise in thousandths, measured with a 48 µm aperture; higher values give coarser grain.",
+                    tooltips::RGB,
+                    g.rms_granularity.each_mut(),
+                    0.1..=60.,
+                    0.1,
+                )
+                .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut g.blur, 0.0..=3.0),
+                    tooltips::slider(&mut g.mult_usm_sigma, 0. ..=3.).stock(stock.film_render.grain.mult_usm_sigma),
+                    "Grain sharpening σ",
+                    "Blur radius in pixels used by the multiplicative grain sharpen.",
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut g.mult_usm_amount, 0. ..=3.).stock(stock.film_render.grain.mult_usm_amount),
+                    "Grain sharpening amount",
+                    "Sharpen absolute grain density while preserving each channel's mean density.",
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut g.blur, 0.0..=3.0).stock(stock.film_render.grain.blur),
                     "Post-blur σ",
                     tooltips::CONTROL_POST_BLUR_SIGMA,
                 )
                 .changed();
+                changed |= tooltips::channels(
+                    ui,
+                    "Layer particle scale",
+                    tooltips::LAYER_PARTICLE_SCALE,
+                    ["1", "2", "3"],
+                    g.particle_scale_sublayers.each_mut(),
+                    0.1..=5.0,
+                    0.01,
+                )
+                .changed();
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_GRAIN);
+            });
+        if toggled {
+            self.params.film_render.grain.active ^= true;
+            self.dirty = true;
+        }
+
+        // ── Print curves (s023 morph) ───────────────────────────────────
+        for (title, tab, m, used) in [
+            (
+                "Film chemistry",
+                Tab::Film,
+                &mut self.params.film_render.chemistry,
+                stages.film,
+            ),
+            (
+                "Print chemistry",
+                Tab::Print,
+                &mut self.params.print_render.chemistry,
+                stages.print,
+            ),
+        ] {
+            let sm = if tab == Tab::Film {
+                &stock.film_render.chemistry
+            } else {
+                &stock.print_render.chemistry
+            };
+            let pointers: &[&str] = if tab == Tab::Film {
+                &[
+                    "/film_render/chemistry/active",
+                    "/film_render/chemistry/gamma_factor",
+                    "/film_render/chemistry/gamma_factor_fast",
+                    "/film_render/chemistry/gamma_factor_slow",
+                    "/film_render/chemistry/gamma_factor_red",
+                    "/film_render/chemistry/gamma_factor_green",
+                    "/film_render/chemistry/gamma_factor_blue",
+                    "/film_render/chemistry/developer_exhaustion",
+                ]
+            } else {
+                &[
+                    "/print_render/chemistry/active",
+                    "/print_render/chemistry/gamma_factor",
+                    "/print_render/chemistry/gamma_factor_fast",
+                    "/print_render/chemistry/gamma_factor_slow",
+                    "/print_render/chemistry/gamma_factor_red",
+                    "/print_render/chemistry/gamma_factor_green",
+                    "/print_render/chemistry/gamma_factor_blue",
+                    "/print_render/chemistry/developer_exhaustion",
+                ]
+            };
+            let toggled = Section::new(
+                title,
+                tab,
+                "Morph the fitted development curves and physical emulsion layers together.",
+            )
+            .closed()
+            .active(m.active, tooltips::MORPH_PRINT_CURVES)
+            .used(
+                used,
+                if tab == Tab::Film {
+                    NOT_FILM
+                } else {
+                    NOT_PRINT
+                },
+            )
+            .pointers(pointers)
+            .show(ui, |ui| {
+                let mut changed = false;
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut m.gamma_factor, 0.5..=2.0).stock(sm.gamma_factor),
+                    "Gamma",
+                    tooltips::CONTROL_GAMMA,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut m.gamma_factor_fast, 0.5..=2.0)
+                        .stock(sm.gamma_factor_fast),
+                    "Gamma fast",
+                    tooltips::CONTROL_GAMMA_FAST,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut m.gamma_factor_slow, 0.5..=2.0)
+                        .stock(sm.gamma_factor_slow),
+                    "Gamma slow",
+                    tooltips::CONTROL_GAMMA_SLOW,
+                )
+                .changed();
+                changed |= tooltips::channels(
+                    ui,
+                    "Gamma per channel",
+                    "Scale contrast in the red-, green- and blue-sensitive density curves.",
+                    tooltips::RGB,
+                    [
+                        &mut m.gamma_factor_red,
+                        &mut m.gamma_factor_green,
+                        &mut m.gamma_factor_blue,
+                    ],
+                    0.5..=2.0,
+                    0.005,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut m.developer_exhaustion, 0.0..=1.0)
+                        .stock(sm.developer_exhaustion),
+                    "Developer exhaustion",
+                    tooltips::CONTROL_DEVELOPER_EXHAUSTION,
+                )
+                .changed();
+                if changed {
+                    self.dirty = true;
+                }
+            });
+            if toggled {
+                m.active ^= true;
+                self.dirty = true;
+            }
+        }
+
+        for (title, tab, base, film, used) in [
+            (
+                "Film base",
+                Tab::Film,
+                &mut self.params.film_render.base,
+                true,
+                stages.film,
+            ),
+            (
+                "Print base",
+                Tab::Print,
+                &mut self.params.print_render.base,
+                false,
+                stages.print,
+            ),
+        ] {
+            let sb = if film {
+                &stock.film_render.base
+            } else {
+                &stock.print_render.base
+            };
+            let toggled = Section::new(title, tab, "Tune the stock's base and fog density.")
+                .closed()
+                .active(
+                    base.active,
+                    "Enable changes to the stock's base and fog density.",
+                )
+                .used(used, if film { NOT_FILM } else { NOT_PRINT })
+                .pointers(if film {
+                    &["/film_render/base"]
+                } else {
+                    &["/print_render/base"]
+                })
+                .show(ui, |ui| {
+                    let mut changed = tooltips::labeled(
+                        ui,
+                        tooltips::slider(&mut base.scale, 0. ..=3.).stock(sb.scale),
+                        "Base scale",
+                        "Scale the stock's spectral base density.",
+                    )
+                    .changed();
+                    changed |= tooltips::channels(
+                        ui,
+                        "Base color scale",
+                        "Scale each color component of the spectral base density.",
+                        tooltips::CMY,
+                        [&mut base.cyan, &mut base.magenta, &mut base.yellow],
+                        0. ..=3.,
+                        0.005,
+                    )
+                    .changed();
+                    if film {
+                        changed |= tooltips::labeled(
+                            ui,
+                            tooltips::slider(&mut base.tilt, -1. ..=1.).stock(sb.tilt),
+                            "Base tilt",
+                            "Tilt the film base density across wavelength around 555 nm.",
+                        )
+                        .changed();
+                    }
+                    if changed {
+                        self.dirty = true;
+                    }
+                });
+            if toggled {
+                base.active ^= true;
+                self.dirty = true;
+            }
+        }
+
+        // ── Enlarger ────────────────────────────────────────────────────
+        Section::new("Enlarger", Tab::Print, tooltips::SECTION_ENLARGER)
+            .used(stages.print, NOT_PRINT)
+            .pointers(&[
+                "/enlarger/print_exposure",
+                "/enlarger/m_filter_shift",
+                "/enlarger/y_filter_shift",
+                "/enlarger/preflash_exposure",
+                "/enlarger/preflash_m_filter_shift",
+                "/enlarger/preflash_y_filter_shift",
+            ])
+            .show(ui, |ui| {
+                let e = &mut self.params.enlarger;
+                let mut changed = false;
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut e.print_exposure, 0.1..=5.0)
+                        .stock(stock.enlarger.print_exposure)
+                        .logarithmic(true),
+                    "Print exposure",
+                    tooltips::CONTROL_PRINT_EXPOSURE,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut e.m_filter_shift, -50.0..=50.0)
+                        .stock(stock.enlarger.m_filter_shift),
+                    "Magenta filter shift",
+                    tooltips::CONTROL_MAGENTA_FILTER_SHIFT,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut e.y_filter_shift, -50.0..=50.0)
+                        .stock(stock.enlarger.y_filter_shift),
+                    "Yellow filter shift",
+                    tooltips::CONTROL_YELLOW_FILTER_SHIFT,
+                )
+                .changed();
+                changed |= tooltips::labeled(
+                    ui,
+                    tooltips::slider(&mut e.preflash_exposure, 0.0..=0.5)
+                        .stock(stock.enlarger.preflash_exposure),
+                    "Preflash exposure",
+                    tooltips::PREFLASH,
+                )
+                .changed();
+                if e.preflash_exposure > 0.0 {
+                    changed |= tooltips::labeled(
+                        ui,
+                        tooltips::slider(&mut e.preflash_m_filter_shift, -50.0..=50.0)
+                            .stock(stock.enlarger.preflash_m_filter_shift),
+                        "Preflash magenta shift",
+                        tooltips::CONTROL_PREFLASH_MAGENTA_SHIFT,
+                    )
+                    .changed();
+                    changed |= tooltips::labeled(
+                        ui,
+                        tooltips::slider(&mut e.preflash_y_filter_shift, -50.0..=50.0)
+                            .stock(stock.enlarger.preflash_y_filter_shift),
+                        "Preflash yellow shift",
+                        tooltips::CONTROL_PREFLASH_YELLOW_SHIFT,
+                    )
+                    .changed();
+                }
+                if changed {
+                    self.dirty = true;
+                }
+                self.print_balance_controls(ui);
+            });
 
         // ── Glare ───────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Glare")
-            .default_open(false)
+        let toggled = Section::new("Glare", Tab::Print, tooltips::SECTION_GLARE)
+            .active(
+                self.params.print_render.glare.active,
+                tooltips::ENABLE_GLARE,
+            )
+            .used(stages.print, NOT_PRINT)
+            .pointers(&["/print_render/glare"])
             .show(ui, |ui| {
                 let g = &mut self.params.print_render.glare;
                 let mut changed = false;
-                changed |= tooltips::checkbox(ui, &mut g.active, "Active", tooltips::ENABLE_GLARE)
-                    .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut g.percent, 0.0..=0.2),
+                    tooltips::slider(&mut g.percent, 0.0..=0.2)
+                        .stock(stock.print_render.glare.percent),
                     "Percent",
                     tooltips::CONTROL_PERCENT,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut g.roughness, 0.0..=2.0),
+                    tooltips::slider(&mut g.roughness, 0.0..=2.0)
+                        .stock(stock.print_render.glare.roughness),
                     "Roughness",
                     tooltips::CONTROL_ROUGHNESS,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut g.blur, 0.0..=5.0),
+                    tooltips::slider(&mut g.blur, 0.0..=5.0).stock(stock.print_render.glare.blur),
                     "Blur σ (px)",
                     tooltips::CONTROL_BLUR_SIGMA_PX,
                 )
@@ -2422,156 +2755,50 @@ impl App {
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_GLARE);
-
-        // ── Print curves (s023 morph) ───────────────────────────────────
-        for (title, m) in [
-            ("Film chemistry", &mut self.params.film_render.chemistry),
-            ("Print chemistry", &mut self.params.print_render.chemistry),
-        ] {
-            egui::CollapsingHeader::new(title)
-                .default_open(false)
-                .show(ui, |ui| {
-                    let mut changed = false;
-                    changed |= tooltips::checkbox(
-                        ui,
-                        &mut m.active,
-                        "Active chemistry",
-                        tooltips::MORPH_PRINT_CURVES,
-                    )
-                    .changed();
-                    if m.active {
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor, 0.5..=2.0),
-                            "Gamma",
-                            tooltips::CONTROL_GAMMA,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor_fast, 0.5..=2.0),
-                            "Gamma fast",
-                            tooltips::CONTROL_GAMMA_FAST,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor_slow, 0.5..=2.0),
-                            "Gamma slow",
-                            tooltips::CONTROL_GAMMA_SLOW,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor_red, 0.5..=2.0),
-                            "Gamma R",
-                            tooltips::CONTROL_GAMMA_R,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor_green, 0.5..=2.0),
-                            "Gamma G",
-                            tooltips::CONTROL_GAMMA_G,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.gamma_factor_blue, 0.5..=2.0),
-                            "Gamma B",
-                            tooltips::CONTROL_GAMMA_B,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut m.developer_exhaustion, 0.0..=1.0),
-                            "Developer exhaustion",
-                            tooltips::CONTROL_DEVELOPER_EXHAUSTION,
-                        )
-                        .changed();
-                    }
-                    if changed {
-                        self.dirty = true;
-                    }
-                })
-                .header_response
-                .on_hover_text(
-                    "Morph the fitted development curves and physical emulsion layers together.",
-                );
-        }
-
-        for (title, base, film) in [
-            ("Film base", &mut self.params.film_render.base, true),
-            ("Print base", &mut self.params.print_render.base, false),
-        ] {
-            egui::CollapsingHeader::new(title).show(ui, |ui| {
-                let mut changed = tooltips::checkbox(
-                    ui,
-                    &mut base.active,
-                    "Active base tuning",
-                    "Enable changes to the stock's base and fog density.",
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut base.scale, 0. ..=3.),
-                    "Base scale",
-                    "Scale the stock's spectral base density.",
-                )
-                .changed();
-                for (name, value) in [
-                    ("Cyan", &mut base.cyan),
-                    ("Magenta", &mut base.magenta),
-                    ("Yellow", &mut base.yellow),
-                ] {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(value, 0. ..=3.),
-                        name,
-                        "Scale this color component of the spectral base density.",
-                    )
-                    .changed();
-                }
-                if film {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut base.tilt, -1. ..=1.),
-                        "Base tilt",
-                        "Tilt the film base density across wavelength around 555 nm.",
-                    )
-                    .changed();
-                }
-                if changed {
-                    self.dirty = true;
-                }
             });
+        if toggled {
+            self.params.print_render.glare.active ^= true;
+            self.dirty = true;
         }
-        egui::CollapsingHeader::new("Scan conversion").show(ui,|ui| {
-            let p=&mut self.params.film_render.convert;let mut changed=false;
-            tooltips::combo(ui,egui::ComboBox::from_id_salt("scan_illuminant").selected_text(&p.scan_illuminant),"Scan illuminant","The physical light used to capture the scanned negative.",|ui| {
-                for name in spektrafilm_math::illuminants::names() {changed|=ui.selectable_value(&mut p.scan_illuminant,name.into(),name).changed();}
-            });
-            changed|=tooltips::labeled(ui,egui::Slider::new(&mut p.exposure_compensation_ev,-8. ..=8.),"Scan exposure EV","Align the scanned input's level to the physical scan model before inversion.").changed();
-            changed|=tooltips::labeled(ui,egui::Slider::new(&mut p.base_percentile,90. ..=100.),"Base percentile","Use the brightest pixels above this luminance percentile to estimate clear film base.").changed();
-            changed|=tooltips::labeled(ui,egui::TextEdit::singleline(&mut p.calibration).desired_width(170.),"Device matrix","Nine row-major numbers correcting the scanner or camera color response before inversion.").changed();
-            changed|=tooltips::checkbox(ui,&mut self.params.settings.use_convert_lut,"Conversion LUT","Cache the inverse scan model in a 3D tetrahedral LUT for faster repeated previews.").changed();
-            if self.params.settings.use_convert_lut {changed|=tooltips::labeled(ui,egui::Slider::new(&mut self.params.settings.convert_lut_resolution,9..=65),"Conversion LUT resolution","Samples per RGB axis of the cached inverse scan model.").changed();}
-            if changed {self.dirty=true;}
-            self.calibration_controls(ui);
-        });
 
         // ── Scanner ─────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Scanner")
-            .default_open(false)
+        if self.tab == Tab::Scan {
+            ui.add_space(4.0);
+            let mut scan_for_print = self.scan_for_print_restore.is_some();
+            if tooltips::checkbox(
+                ui,
+                &mut scan_for_print,
+                "Scan for print",
+                tooltips::SCAN_FOR_PRINT,
+            )
+            .changed()
+            {
+                if scan_for_print {
+                    self.scan_for_print_restore = Some([
+                        self.params.scanner.white_correction,
+                        self.params.scanner.black_correction,
+                        self.params.print_render.glare.active,
+                    ]);
+                    self.params.scanner.white_correction = true;
+                    self.params.scanner.black_correction = true;
+                    self.params.print_render.glare.active = false;
+                } else if let Some([white, black, glare]) = self.scan_for_print_restore.take() {
+                    self.params.scanner.white_correction = white;
+                    self.params.scanner.black_correction = black;
+                    self.params.print_render.glare.active = glare;
+                }
+                self.dirty = true;
+            }
+        }
+        Section::new("Scanner", Tab::Scan, tooltips::SECTION_SCANNER)
+            .used(stages.scan, NOT_SCAN)
+            .pointers(&["/scanner"])
             .show(ui, |ui| {
                 let s = &mut self.params.scanner;
                 let mut changed = false;
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut s.lens_blur, 0.0..=5.0),
+                    tooltips::slider(&mut s.lens_blur, 0.0..=5.0).stock(stock.scanner.lens_blur),
                     "Lens blur σ (px)",
                     tooltips::CONTROL_LENS_BLUR_SIGMA_PX,
                 )
@@ -2579,14 +2806,14 @@ impl App {
                 let [mut sigma, mut amount] = s.unsharp_mask;
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut sigma, 0.0..=3.0),
+                    tooltips::slider(&mut sigma, 0.0..=3.0).stock(stock.scanner.unsharp_mask[0]),
                     "Unsharp σ (px)",
                     tooltips::CONTROL_UNSHARP_SIGMA_PX,
                 )
                 .changed();
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut amount, 0.0..=2.0),
+                    tooltips::slider(&mut amount, 0.0..=2.0).stock(stock.scanner.unsharp_mask[1]),
                     "Unsharp amount",
                     tooltips::CONTROL_UNSHARP_AMOUNT,
                 )
@@ -2604,7 +2831,8 @@ impl App {
                 if s.white_correction {
                     changed |= tooltips::labeled(
                         ui,
-                        egui::Slider::new(&mut s.white_level, 0.5..=1.0),
+                        tooltips::slider(&mut s.white_level, 0.5..=1.0)
+                            .stock(stock.scanner.white_level),
                         "White level",
                         tooltips::CONTROL_WHITE_LEVEL,
                     )
@@ -2620,7 +2848,8 @@ impl App {
                 if s.black_correction {
                     changed |= tooltips::labeled(
                         ui,
-                        egui::Slider::new(&mut s.black_level, 0.0..=0.5),
+                        tooltips::slider(&mut s.black_level, 0.0..=0.5)
+                            .stock(stock.scanner.black_level),
                         "Black level",
                         tooltips::CONTROL_BLACK_LEVEL,
                     )
@@ -2629,13 +2858,16 @@ impl App {
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_SCANNER);
+            });
 
         // ── Color management ────────────────────────────────────────────
-        egui::CollapsingHeader::new("Color management")
-            .default_open(false)
+        Section::new("Color management", Tab::Output, tooltips::SECTION_COLOR_MANAGEMENT)
+            .pointers(&[
+                "/io/output_gamut_compress",
+                "/io/input_gamut_compress",
+                "/settings/use_cat16",
+                "/settings/rgb_to_raw_method",
+            ])
             .show(ui, |ui| {
                 let algo = &mut self.params.io.output_gamut_compress.algorithm;
                 let mut changed = false;
@@ -2644,13 +2876,13 @@ impl App {
                 // drops the preview off the GPU-resident fast path.
                 tooltips::combo(
                     ui,
-                    egui::ComboBox::from_id_salt("Gamut compression").selected_text(algo.clone()),
+                    egui::ComboBox::from_id_salt("Gamut compression").selected_text(names::label(algo)),
                     "Gamut compression",
                     tooltips::CONTROL_OUTPUT_GAMUT_COMPRESSION,
                     |ui| {
                         for opt in ["off", "oklch", "oklrab", "cam16ucs", "aces_rgc"] {
                             changed |= ui
-                                .selectable_value(algo, opt.to_string(), opt)
+                                .selectable_value(algo, opt.to_string(), names::label(opt))
                                 .on_hover_text(tooltips::option(opt))
                                 .changed();
                         }
@@ -2663,22 +2895,42 @@ impl App {
                 tooltips::combo(
                     ui,
                     egui::ComboBox::from_id_salt("Input gamut compression")
-                        .selected_text(in_algo.clone()),
+                        .selected_text(names::label(in_algo)),
                     "Input gamut compression",
                     tooltips::CONTROL_INPUT_GAMUT_COMPRESSION,
                     |ui| {
                         for opt in ["off", "xy"] {
                             changed |= ui
-                                .selectable_value(in_algo, opt.to_string(), opt)
+                                .selectable_value(in_algo, opt.to_string(), names::label(opt))
                                 .on_hover_text(tooltips::option(opt))
                                 .changed();
                         }
                     },
                 );
-                tooltips::combo(ui,egui::ComboBox::from_id_salt("input_boundary").selected_text(&self.params.io.input_gamut_compress.boundary),"Input boundary","Compress toward the spectral locus or its smooth inscribed hull.",|ui| {
-                    for name in ["inscribed_hull","locus"] {changed|=ui.selectable_value(&mut self.params.io.input_gamut_compress.boundary,name.into(),name).changed();}
-                });
-                changed|=tooltips::labeled(ui,egui::Slider::new(&mut self.params.io.input_gamut_compress.hull_detail,1. ..=30.),"Hull detail","Number of Fourier modes retained in the inscribed gamut boundary; higher values follow the locus more closely.").changed();
+                if self.params.io.input_gamut_compress.algorithm != "off" {
+                    let gamut = &mut self.params.io.input_gamut_compress;
+                    tooltips::combo(
+                        ui,
+                        egui::ComboBox::from_id_salt("input_boundary")
+                            .selected_text(names::label(&gamut.boundary)),
+                        "Input boundary",
+                        "Compress toward the spectral locus or its smooth inscribed hull.",
+                        |ui| {
+                            for name in ["inscribed_hull", "locus"] {
+                                changed |= ui
+                                    .selectable_value(&mut gamut.boundary, name.into(), names::label(name))
+                                    .changed();
+                            }
+                        },
+                    );
+                    changed |= tooltips::labeled(
+                        ui,
+                        tooltips::slider(&mut gamut.hull_detail, 1. ..=30.).stock(stock.io.input_gamut_compress.hull_detail),
+                        "Hull detail",
+                        "Number of Fourier modes retained in the inscribed gamut boundary; higher values follow the locus more closely.",
+                    )
+                    .changed();
+                }
                 // CAT16 (vs CAT02) for the input chromatic adaptation feeding
                 // Hanatos — better blue/violet behavior; matches upstream >=0.3.3.
                 changed |= tooltips::checkbox(
@@ -2695,13 +2947,13 @@ impl App {
                 tooltips::combo(
                     ui,
                     egui::ComboBox::from_id_salt("RGB→raw upsampling")
-                        .selected_text(method.clone()),
+                        .selected_text(names::label(method)),
                     "RGB→raw upsampling",
                     tooltips::MENU_RGB_RAW_UPSAMPLING,
                     |ui| {
                         for opt in ["hanatos2025", "arctic2026beta04", "mallett2019", "jakob2019", "otsu2018", "gauss-lasers", "arctic2026alpha02"] {
                             changed |= ui
-                                .selectable_value(method, opt.to_string(), opt)
+                                .selectable_value(method, opt.to_string(), names::label(opt))
                                 .on_hover_text(tooltips::option(opt))
                                 .changed();
                         }
@@ -2710,76 +2962,18 @@ impl App {
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_COLOR_MANAGEMENT);
-
-        // ── Enlarger ────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Enlarger")
-            .default_open(false)
-            .show(ui, |ui| {
-                let e = &mut self.params.enlarger;
-                let mut changed = false;
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut e.print_exposure, 0.1..=5.0).logarithmic(true),
-                    "Print exposure",
-                    tooltips::CONTROL_PRINT_EXPOSURE,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut e.m_filter_shift, -50.0..=50.0),
-                    "Magenta filter shift",
-                    tooltips::CONTROL_MAGENTA_FILTER_SHIFT,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut e.y_filter_shift, -50.0..=50.0),
-                    "Yellow filter shift",
-                    tooltips::CONTROL_YELLOW_FILTER_SHIFT,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut e.preflash_exposure, 0.0..=0.5),
-                    "Preflash exposure",
-                    tooltips::PREFLASH,
-                )
-                .changed();
-                if e.preflash_exposure > 0.0 {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut e.preflash_m_filter_shift, -50.0..=50.0),
-                        "Preflash magenta shift",
-                        tooltips::CONTROL_PREFLASH_MAGENTA_SHIFT,
-                    )
-                    .changed();
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut e.preflash_y_filter_shift, -50.0..=50.0),
-                        "Preflash yellow shift",
-                        tooltips::CONTROL_PREFLASH_YELLOW_SHIFT,
-                    )
-                    .changed();
-                }
-                if changed {
-                    self.dirty = true;
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_ENLARGER);
+            });
 
         // ── Output ──────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("Output")
-            .default_open(false)
+        Section::new("Output", Tab::Output, tooltips::SECTION_OUTPUT)
+            .pointers(&["/io/upscale_factor", "/io/output_cctf_encoding"])
             .show(ui, |ui| {
                 let io = &mut self.params.io;
                 let mut changed = false;
                 changed |= tooltips::labeled(
                     ui,
-                    egui::Slider::new(&mut io.upscale_factor, 0.1..=1.0),
+                    tooltips::slider(&mut io.upscale_factor, 0.1..=1.0)
+                        .stock(stock.io.upscale_factor),
                     "Working resolution",
                     tooltips::WORKING_RESOLUTION,
                 )
@@ -2794,36 +2988,29 @@ impl App {
                 if changed {
                     self.dirty = true;
                 }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_OUTPUT);
+            });
 
         self.parity_controls(ui);
-        // ── Metrics ─────────────────────────────────────────────────────
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.monospace(format!(
-            "render:        {:>6.1} ms   {}",
-            self.last_render_ms,
-            fps_label(self.last_render_ms)
-        ));
-        ui.monospace(format!(
-            "pipeline build:{:>6.1} ms",
-            self.last_pipeline_build_ms
-        ));
-        ui.monospace(format!(
-            "clone/scale:   {:>6.1} / {:>5.1} ms",
-            self.last_input_clone_ms, self.last_scale_ms
-        ));
-        ui.monospace(format!("preview pack:  {:>6.1} ms", self.last_preview_ms));
-        ui.monospace(format!(
-            "worker total:  {:>6.1} ms",
-            self.last_worker_total_ms
-        ));
-        ui.monospace(format!("backend: {}", self.backend.name()));
-        ui.label(format!("Execution: {}", self.render_path));
-        ui.label(egui::RichText::new(&self.status).small());
+        if self.tab == Tab::Output {
+            self.lut_controls(ui, ctx);
+        }
+        if !self.display.show_advanced {
+            ui.add_space(10.0);
+            if ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new("Show advanced controls…")
+                            .small()
+                            .color(theme::TEXT_WEAK),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Reveal expert parameters in every tab (also in the View menu).")
+                .clicked()
+            {
+                self.display.show_advanced = true;
+            }
+        }
     }
 }
 
@@ -2905,32 +3092,65 @@ impl eframe::App for App {
             }
         }
         self.poll_export_job(ctx);
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.load_job.is_some() || self.render_job.is_some() {
-                    ui.spinner();
-                }
-                if self.status.starts_with("Load error:")
-                    || self.status.starts_with("Render error:")
-                {
-                    ui.colored_label(ui.visuals().error_fg_color, &self.status);
-                } else {
-                    ui.label(&self.status);
-                }
-            });
-        });
+        self.handle_shortcuts(ctx);
+        self.begin_frame_state(ctx);
+        self.update_title(ctx);
+        self.menu_bar(ctx);
+        self.status_bar(ctx);
         egui::SidePanel::right("controls")
-            .resizable(false)
-            .exact_width(340.0)
+            .resizable(true)
+            .default_width(380.0)
+            .width_range(330.0..=560.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                    left: 12,
+                    right: 4,
+                    top: 4,
+                    bottom: 0,
+                }),
+            )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.controls_panel(ui, ctx));
+                ui.style_mut().interaction.selectable_labels = false;
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: 8,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| self.sidebar_header(ui));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        ui.add_space(2.0);
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: 0,
+                                right: 10,
+                                top: 0,
+                                bottom: 12,
+                            })
+                            .show(ui, |ui| self.controls_panel(ui, ctx));
+                    });
             });
         let action = self.catalog.as_mut().and_then(|catalog| {
             egui::SidePanel::left("catalog")
-                .default_width(270.)
-                .min_width(220.)
-                .max_width(420.)
-                .show(ctx, |ui| catalog.show(ui, ctx))
+                .default_width(236.)
+                .width_range(200.0..=480.0)
+                .frame(
+                    egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                        left: 10,
+                        right: 10,
+                        top: 4,
+                        bottom: 0,
+                    }),
+                )
+                .show(ctx, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    catalog.show(ui, ctx)
+                })
                 .inner
         });
         match action {
@@ -2952,30 +3172,24 @@ impl eframe::App for App {
         let canvas = if self.display.gray_18_canvas {
             egui::Color32::from_gray(118)
         } else {
-            ctx.style().visuals.panel_fill
+            theme::WELL
         };
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.style()).fill(canvas))
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .fill(canvas)
+                    .inner_margin(0.0),
+            )
             .show(ctx, |ui| {
-                if self.canvas_input.is_some()
-                    || self.input_tex.is_some()
-                    || self.canvas_output.is_some()
-                    || self.output_tex.is_some()
-                {
+                let rect = ui.max_rect();
+                if self.has_canvas_image() {
                     self.draw_preview_with_zoom(ui);
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(if self.image.is_some() {
-                                "Click Render preview to process this image."
-                            } else {
-                                "Drop or open an image to start."
-                            })
-                            .size(18.0),
-                        );
-                    });
+                    self.empty_canvas(ui);
                 }
+                self.canvas_overlays(ui, rect);
             });
+        self.end_frame_state();
 
         // Accept drag-and-dropped image files.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -3075,15 +3289,19 @@ fn scan_profiles(data_dir: &Path) -> (Vec<ProfileEntry>, Vec<ProfileEntry>) {
         // Cheap probe: just deserialize the file's `info` field. We
         // could skip the rest of the profile but `Profile` already does
         // the right thing — and we pay this once at startup.
-        let (display, is_paper) = match profile::load_profile_by_name(data_dir, &stock) {
+        let (display, is_paper, group) = match profile::load_profile_by_name(data_dir, &stock) {
             Ok(p) => {
                 let display = p.info.name.clone().unwrap_or_else(|| stock.clone());
                 let is_paper = p.info.support == "paper" || p.info.stage == "printing";
-                (display, is_paper)
+                (display, is_paper, chrome::stock_group(&p))
             }
-            Err(_) => (stock.clone(), false),
+            Err(_) => (stock.clone(), false, "Color negative"),
         };
-        let entry = ProfileEntry { stock, display };
+        let entry = ProfileEntry {
+            stock,
+            display,
+            group,
+        };
         if is_paper {
             papers.push(entry);
         } else {
@@ -3095,10 +3313,6 @@ fn scan_profiles(data_dir: &Path) -> (Vec<ProfileEntry>, Vec<ProfileEntry>) {
     (films, papers)
 }
 
-/// Combo box that picks one of `entries` by its `stock` id (the
-/// underlying file stem) while showing `display` (the human-readable
-/// name) as the label. Falls back to showing the raw stock id if no
-/// entry with the current `selected_stock` exists.
 /// Development-time family of a profile (empty for colour stocks or on
 /// load failure — the picker hides itself for ≤1 entries either way).
 fn profile_dev_times(data_dir: &Path, stock: &str) -> Vec<f64> {
@@ -3121,14 +3335,12 @@ fn dev_time_combo(
     // exactly the entry the pipeline will use.
     let current_idx = profile::development_time_index(times, *selection);
     let mut changed = false;
-    let hint = tooltips::DEVELOPMENT_TIME;
-    ui.label(label)
-        .on_hover_text(hint)
-        .on_disabled_hover_text(hint);
-    egui::ComboBox::from_id_salt(salt)
-        .selected_text(format!("{} min", times[current_idx]))
-        .width(ui.available_width().min(280.0))
-        .show_ui(ui, |ui| {
+    tooltips::combo(
+        ui,
+        egui::ComboBox::from_id_salt(salt).selected_text(format!("{} min", times[current_idx])),
+        label,
+        tooltips::DEVELOPMENT_TIME,
+        |ui| {
             for (i, t) in times.iter().enumerate() {
                 if ui
                     .selectable_label(i == current_idx, format!("{t} min"))
@@ -3140,42 +3352,25 @@ fn dev_time_combo(
                     changed = true;
                 }
             }
-        });
+        },
+    );
     changed
 }
 
-fn profile_combo(
-    ui: &mut egui::Ui,
-    salt: &str,
-    label: &str,
-    entries: &[ProfileEntry],
-    selected_stock: &mut String,
-) -> bool {
-    let hint = if salt == "film" {
-        tooltips::FILM_PROFILE
-    } else {
-        tooltips::PAPER_PROFILE
-    };
-    ui.label(label)
-        .on_hover_text(hint)
-        .on_disabled_hover_text(hint);
-    let display = entries
-        .iter()
-        .find(|e| &e.stock == selected_stock)
-        .map(|e| e.display.clone())
-        .unwrap_or_else(|| selected_stock.clone());
-    let prev = selected_stock.clone();
-    egui::ComboBox::from_id_salt(salt)
-        .selected_text(&display)
-        .width(ui.available_width().min(280.0))
-        .show_ui(ui, |ui| {
-            for entry in entries {
-                ui.selectable_value(selected_stock, entry.stock.clone(), &entry.display)
-                    .on_hover_text(hint)
-                    .on_disabled_hover_text(hint);
-            }
-        });
-    prev != *selected_stock
+/// A small dark label pill drawn over the image.
+fn canvas_tag(painter: &egui::Painter, pos: egui::Pos2, anchor: egui::Align2, text: &str) {
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
+    let rect = anchor.anchor_size(pos, galley.size() + egui::vec2(12.0, 6.0));
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(150));
+    painter.galley(
+        rect.min + egui::vec2(6.0, 3.0),
+        galley,
+        egui::Color32::WHITE,
+    );
 }
 
 fn fps_label(ms: f32) -> &'static str {
@@ -3793,611 +3988,304 @@ impl App {
         self.pending_dirty = self.render_job.is_some();
         Ok(())
     }
-    fn project_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Save project…")
-                .on_hover_text(tooltips::CONTROL_SAVE_PROJECT)
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Project", &["json"])
-                    .set_file_name("spektrafilm.json")
-                    .save_file()
-                {
-                    self.status = match self.project_state().save(&path) {
-                        Ok(()) => format!("Saved project {}", path.display()),
-                        Err(e) => format!("Save project: {e:#}"),
-                    };
-                }
-            }
-            if ui
-                .button("Open project…")
-                .on_hover_text(tooltips::CONTROL_OPEN_PROJECT)
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Project", &["json"])
-                    .pick_file()
-                {
-                    self.status = match self.restore_project(&path, true) {
-                        Ok(()) => format!("Opened project {}", path.display()),
-                        Err(e) => format!("Open project: {e:#}"),
-                    };
-                }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Save defaults")
-                .on_hover_text(tooltips::CONTROL_SAVE_DEFAULTS)
-                .clicked()
-            {
-                let mut state = self.project_state();
-                state.image = None;
-                state.raw = self.raw_options.clone();
-                state.raw.lightroom_geometry = None;
-                self.status = match state.save(&project::default_path()) {
-                    Ok(()) => "Saved startup defaults".into(),
-                    Err(e) => format!("Save defaults: {e:#}"),
-                };
-            }
-            if ui
-                .button("Factory defaults")
-                .on_hover_text(tooltips::CONTROL_FACTORY_DEFAULTS)
-                .clicked()
-            {
-                let input_color = self.params.io.input_color_space.clone();
-                let input_encoded = self.params.io.input_cctf_decoding;
-                self.params = RuntimeParams::default();
-                if self.image.is_some() {
-                    self.params.io.input_color_space = input_color;
-                    self.params.io.input_cctf_decoding = input_encoded;
-                }
-                self.auto_preview = true;
-                self.params.settings.preview_max_size = 2048;
-                self.gpu_export = true;
-                self.lut = Default::default();
-                self.display = Default::default();
-                self.scan_for_print_restore = None;
-                if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name) {
-                    spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
-                }
-                self.raw_options = Default::default();
-                self.save_options = Default::default();
-                self.pipeline_cache = None;
-                self.pipeline_cache_key = None;
-                self.dirty = true;
-                self.pending_dirty = self.render_job.is_some();
-                match std::fs::remove_file(project::default_path()) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        self.status = format!("Reset defaults: {e}");
-                    }
-                }
-            }
-        });
-    }
     fn parity_controls(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Color and processing")
-            .show(ui, |ui| {
-                let mut changed = false;
-                let spaces = [
-                    "sRGB",
-                    "ProPhoto RGB",
-                    "ITU-R BT.2020",
-                    "ITU-R BT.709",
-                    "Adobe RGB (1998)",
-                    "Display P3",
-                    "DCI-P3",
-                    "ACEScg",
-                    "ACES2065-1",
-                ];
-                ui.label("Input primaries")
-                    .on_hover_text(tooltips::CONTROL_INPUT_PRIMARIES);
-                egui::ComboBox::from_id_salt("input_primaries")
-                    .selected_text(&self.params.io.input_color_space)
-                    .show_ui(ui, |ui| {
-                        for name in spaces {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.params.io.input_color_space,
-                                    name.into(),
-                                    name,
-                                )
-                                .on_hover_text(tooltips::option(name))
-                                .changed();
-                        }
-                    });
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.io.input_cctf_decoding,
-                    "Decode input transfer function",
-                    tooltips::CONTROL_DECODE_INPUT_TRANSFER_FUNCTION,
-                )
-                .changed();
-                ui.label("Output primaries")
-                    .on_hover_text(tooltips::CONTROL_OUTPUT_PRIMARIES);
-                egui::ComboBox::from_id_salt("output_primaries")
-                    .selected_text(&self.params.io.output_color_space)
-                    .show_ui(ui, |ui| {
-                        for name in spaces {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.params.io.output_color_space,
-                                    name.into(),
-                                    name,
-                                )
-                                .on_hover_text(tooltips::option(name))
-                                .changed();
-                        }
-                    });
-                for (label, order) in [
-                    ("Film dye order", &mut self.params.film_render.channel_order),
-                    (
-                        "Print dye order",
-                        &mut self.params.print_render.channel_order,
-                    ),
-                ] {
-                    ui.label(label).on_hover_text(tooltips::DYE_ORDER);
-                    egui::ComboBox::from_id_salt(label)
-                        .selected_text(format!("{order:?}"))
-                        .show_ui(ui, |ui| {
-                            for value in [
-                                [0, 1, 2],
-                                [0, 2, 1],
-                                [1, 0, 2],
-                                [1, 2, 0],
-                                [2, 0, 1],
-                                [2, 1, 0],
-                            ] {
-                                changed |= ui
-                                    .selectable_value(order, value, format!("{value:?}"))
-                                    .on_hover_text(tooltips::DYE_ORDER)
-                                    .changed();
-                            }
-                        });
-                }
-                ui.label("Enlarger illuminant")
-                    .on_hover_text(tooltips::MENU_ENLARGER_ILLUMINANT);
-                egui::ComboBox::from_id_salt("enlarger_illuminant")
-                    .selected_text(&self.params.enlarger.illuminant)
-                    .show_ui(ui, |ui| {
-                        for name in ["TH-KG3", "TH-KG3-L", "D50", "D55", "D65", "BB3200"] {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.params.enlarger.illuminant,
-                                    name.into(),
-                                    name,
-                                )
-                                .on_hover_text(tooltips::option(name))
-                                .changed();
-                        }
-                    });
-                let automatic_before = self.params.settings.neutral_print_filters_from_database;
-                let neutral_changed = tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.neutral_print_filters_from_database,
-                    "Automatic neutral print filters",
-                    tooltips::AUTOMATIC_NEUTRAL_FILTERS,
-                )
-                .changed();
-                changed |= neutral_changed;
-                if neutral_changed && automatic_before {
-                    let db =
-                        spektrafilm_core::neutral_filters::NeutralFilters::load(&self.data_dir);
-                    if let Some([c, m, y]) = db.lookup(
-                        &self.print_name,
-                        &self.params.enlarger.illuminant,
-                        &self.film_name,
-                    ) {
-                        self.params.enlarger.c_filter_neutral = c as f32;
-                        self.params.enlarger.m_filter_neutral = m as f32;
-                        self.params.enlarger.y_filter_neutral = y as f32;
-                    }
-                }
-                if !self.params.settings.neutral_print_filters_from_database {
-                    for (label, value) in [
-                        ("Neutral cyan", &mut self.params.enlarger.c_filter_neutral),
-                        (
-                            "Neutral magenta",
-                            &mut self.params.enlarger.m_filter_neutral,
-                        ),
-                        ("Neutral yellow", &mut self.params.enlarger.y_filter_neutral),
-                    ] {
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::DragValue::new(value).speed(0.1).range(0.0..=200.0),
-                            format!("{label}: "),
-                            tooltips::MANUAL_NEUTRAL_FILTER,
-                        )
-                        .changed();
-                    }
-                }
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.use_enlarger_lut,
-                    "Enlarger spectral LUT",
-                    tooltips::CONTROL_ENLARGER_SPECTRAL_LUT,
-                )
-                .changed();
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.use_scanner_lut,
-                    "Scanner spectral LUT",
-                    tooltips::CONTROL_SCANNER_SPECTRAL_LUT,
-                )
-                .changed();
-                if self.params.settings.use_enlarger_lut || self.params.settings.use_scanner_lut {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.params.settings.lut_resolution, 3..=65),
-                        "Spectral LUT resolution",
-                        tooltips::CONTROL_SPECTRAL_LUT_RESOLUTION,
-                    )
-                    .changed();
-                }
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.use_fast_stats,
-                    "Approximate physical-grain statistics",
-                    tooltips::CONTROL_APPROXIMATE_PHYSICAL_GRAIN_STATISTICS,
-                )
-                .changed();
-                ui.label("Output gamut compression")
-                    .on_hover_text(tooltips::CONTROL_OUTPUT_GAMUT_COMPRESSION);
-                egui::ComboBox::from_id_salt("gamut_algorithm")
-                    .selected_text(&self.params.io.output_gamut_compress.algorithm)
-                    .show_ui(ui, |ui| {
-                        for name in ["off", "cam16ucs", "oklch", "oklrab", "jzazbz", "aces_rgc"] {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.params.io.output_gamut_compress.algorithm,
-                                    name.into(),
-                                    name,
-                                )
-                                .on_hover_text(tooltips::option(name))
-                                .changed();
-                        }
-                    });
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.io.input_gamut_compress.active,
-                    "Input gamut compression",
-                    tooltips::CONTROL_INPUT_GAMUT_COMPRESSION,
-                )
-                .changed();
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.io.crop,
-                    "Crop before processing",
-                    tooltips::CONTROL_CROP_BEFORE_PROCESSING,
-                )
-                .changed();
-                if self.params.io.crop {
-                    for c in 0..2 {
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut self.params.io.crop_center[c], 0.0..=1.0),
-                            if c == 0 {
-                                "Crop center X"
-                            } else {
-                                "Crop center Y"
-                            },
-                            tooltips::CROP_CENTER,
-                        )
-                        .changed();
-                        changed |= tooltips::labeled(
-                            ui,
-                            egui::Slider::new(&mut self.params.io.crop_size[c], 0.01..=1.0),
-                            if c == 0 { "Crop width" } else { "Crop height" },
-                            tooltips::CROP_SIZE,
-                        )
-                        .changed();
-                    }
-                }
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(
-                        &mut self.params.film_render.grain.blur_dye_clouds_um,
-                        0.0..=5.0,
-                    ),
-                    "Dye cloud blur (µm)",
-                    tooltips::CONTROL_DYE_CLOUD_BLUR_UM,
-                )
-                .changed();
-                for i in 0..3 {
-                    changed |= tooltips::labeled(
-                        ui,
-                        egui::Slider::new(
-                            &mut self.params.film_render.grain.particle_scale_sublayers[i],
-                            0.1..=5.0,
-                        ),
-                        format!("Layer {} particle scale", i + 1),
-                        tooltips::LAYER_PARTICLE_SCALE,
-                    )
-                    .changed();
-                }
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.apply_hanatos2025_adaptation_surface,
-                    "Sensitivity adaptation surface",
-                    tooltips::CONTROL_SENSITIVITY_ADAPTATION_SURFACE,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.params.settings.spectral_gaussian_blur, 0.0..=10.0),
-                    "Spectral blur",
-                    tooltips::CONTROL_SPECTRAL_BLUR,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.params.camera.filter_uv[0], 0.0..=1.0),
-                    "UV filter amount",
-                    tooltips::CONTROL_UV_FILTER_AMOUNT,
-                )
-                .changed();
-                changed |= tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.params.camera.filter_ir[0], 0.0..=1.0),
-                    "IR filter amount",
-                    tooltips::CONTROL_IR_FILTER_AMOUNT,
-                )
-                .changed();
-                changed |= tooltips::checkbox(
-                    ui,
-                    &mut self.params.settings.preview_mode,
-                    "Simplified preview mode",
-                    tooltips::CONTROL_SIMPLIFIED_PREVIEW_MODE,
-                )
-                .changed();
-                if changed {
-                    self.dirty = true;
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_COLOR_AND_PROCESSING);
-        if tooltips::labeled(
-            ui,
-            egui::Slider::new(&mut self.params.settings.preview_max_size, 128..=8192).step_by(128.),
-            "Preview long edge (px)",
-            tooltips::CONTROL_PREVIEW_LONG_EDGE_PX,
+        use inspector::{Section, Tab};
+        let stock = self.stock_params();
+        Section::new(
+            "Color and processing",
+            Tab::Output,
+            tooltips::SECTION_COLOR_AND_PROCESSING,
         )
-        .changed()
-        {
-            self.dirty = true;
-        }
-        egui::CollapsingHeader::new("RAW development")
-            .show(ui, |ui| {
-                ui.label("RAW decoder")
-                    .on_hover_text(tooltips::MENU_RAW_DECODER);
-                egui::ComboBox::from_id_salt("raw_decoder")
-                    .selected_text(&self.raw_options.decoder)
-                    .show_ui(ui, |ui| {
-                        for name in ["auto", "libraw", "rawler"] {
-                            ui.selectable_value(&mut self.raw_options.decoder, name.into(), name)
-                                .on_hover_text(tooltips::option(name));
-                        }
-                    });
-                ui.label("White balance")
-                    .on_hover_text(tooltips::MENU_RAW_WHITE_BALANCE);
-                egui::ComboBox::from_id_salt("raw_white_balance")
-                    .selected_text(&self.raw_options.white_balance)
-                    .show_ui(ui, |ui| {
-                        for name in ["as_shot", "daylight", "tungsten", "custom"] {
-                            ui.selectable_value(
-                                &mut self.raw_options.white_balance,
+        .closed()
+        .show(ui, |ui| {
+            let mut changed = false;
+            let spaces = [
+                "sRGB",
+                "ProPhoto RGB",
+                "ITU-R BT.2020",
+                "ITU-R BT.709",
+                "Adobe RGB (1998)",
+                "Display P3",
+                "DCI-P3",
+                "ACEScg",
+                "ACES2065-1",
+            ];
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("input_primaries")
+                    .selected_text(&self.params.io.input_color_space),
+                "Input primaries",
+                tooltips::CONTROL_INPUT_PRIMARIES,
+                |ui| {
+                    for name in spaces {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.input_color_space,
                                 name.into(),
                                 name,
                             )
-                            .on_hover_text(tooltips::option(name));
-                        }
-                    });
-                if self.raw_options.white_balance == "custom" {
-                    tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.raw_options.temperature, 2000.0..=15000.0),
-                        "Temperature (K)",
-                        tooltips::CONTROL_TEMPERATURE_K,
-                    );
-                    tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.raw_options.tint, 0.1..=3.0),
-                        "Tint",
-                        tooltips::CONTROL_TINT,
-                    );
-                }
-                tooltips::checkbox(
+                            .on_hover_text(tooltips::option(name))
+                            .changed();
+                    }
+                },
+            );
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.io.input_cctf_decoding,
+                "Decode input transfer function",
+                tooltips::CONTROL_DECODE_INPUT_TRANSFER_FUNCTION,
+            )
+            .changed();
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("output_primaries")
+                    .selected_text(&self.params.io.output_color_space),
+                "Output primaries",
+                tooltips::CONTROL_OUTPUT_PRIMARIES,
+                |ui| {
+                    for name in spaces {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.output_color_space,
+                                name.into(),
+                                name,
+                            )
+                            .on_hover_text(tooltips::option(name))
+                            .changed();
+                    }
+                },
+            );
+            for (label, order) in [
+                ("Film dye order", &mut self.params.film_render.channel_order),
+                (
+                    "Print dye order",
+                    &mut self.params.print_render.channel_order,
+                ),
+            ] {
+                tooltips::combo(
                     ui,
-                    &mut self.raw_options.lens_correction,
-                    "Lens correction (Lensfun)",
-                    tooltips::CONTROL_LENS_CORRECTION_LENSFUN,
+                    egui::ComboBox::from_id_salt(label).selected_text(format!("{order:?}")),
+                    label,
+                    tooltips::DYE_ORDER,
+                    |ui| {
+                        for value in [
+                            [0, 1, 2],
+                            [0, 2, 1],
+                            [1, 0, 2],
+                            [1, 2, 0],
+                            [2, 0, 1],
+                            [2, 1, 0],
+                        ] {
+                            changed |= ui
+                                .selectable_value(order, value, format!("{value:?}"))
+                                .on_hover_text(tooltips::DYE_ORDER)
+                                .changed();
+                        }
+                    },
                 );
-                if self.raw_options.lens_correction {
-                    if let Some(path) = &self.raw_options.lens_database {
-                        ui.label(format!("Database override: {}", path.display()))
-                            .on_hover_text(tooltips::LENS_DATABASE_OVERRIDE);
-                        if ui
-                            .button("Use automatic Lensfun database")
-                            .on_hover_text(tooltips::CONTROL_USE_AUTOMATIC_LENSFUN_DATABASE)
-                            .clicked()
-                        {
-                            self.raw_options.lens_database = None;
-                            self.lens_database_status = LensDatabaseStatus::detect();
-                        }
-                    } else {
-                        ui.label(self.lens_database_status.label)
-                            .on_hover_text(&self.lens_database_status.detail);
+            }
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("enlarger_illuminant")
+                    .selected_text(&self.params.enlarger.illuminant),
+                "Enlarger illuminant",
+                tooltips::MENU_ENLARGER_ILLUMINANT,
+                |ui| {
+                    for name in ["TH-KG3", "TH-KG3-L", "D50", "D55", "D65", "BB3200"] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.enlarger.illuminant,
+                                name.into(),
+                                name,
+                            )
+                            .on_hover_text(tooltips::option(name))
+                            .changed();
                     }
-                    if ui
-                        .button("Choose Lensfun database…")
-                        .on_hover_text(tooltips::CHOOSE_LENS_DATABASE)
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.raw_options.lens_database = Some(path);
-                        }
-                    }
+                },
+            );
+            let automatic_before = self.params.settings.neutral_print_filters_from_database;
+            let neutral_changed = tooltips::checkbox(
+                ui,
+                &mut self.params.settings.neutral_print_filters_from_database,
+                "Automatic neutral print filters",
+                tooltips::AUTOMATIC_NEUTRAL_FILTERS,
+            )
+            .changed();
+            changed |= neutral_changed;
+            if neutral_changed && automatic_before {
+                let db = spektrafilm_core::neutral_filters::NeutralFilters::load(&self.data_dir);
+                if let Some([c, m, y]) = db.lookup(
+                    &self.print_name,
+                    &self.params.enlarger.illuminant,
+                    &self.film_name,
+                ) {
+                    self.params.enlarger.c_filter_neutral = c as f32;
+                    self.params.enlarger.m_filter_neutral = m as f32;
+                    self.params.enlarger.y_filter_neutral = y as f32;
                 }
-                if ui
-                    .button("Reload RAW with these settings")
-                    .on_hover_text(tooltips::CONTROL_RELOAD_RAW_WITH_THESE_SETTINGS)
-                    .clicked()
-                {
-                    if let Some(path) = self.image_path.clone() {
-                        let rotation = self.rotation;
-                        self.load_image_with_state(&path, rotation, None, None);
-                    }
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_RAW_DEVELOPMENT);
-        egui::CollapsingHeader::new("Display")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.image.is_some(), icons::RotateButton::new(false))
-                        .on_hover_text(tooltips::CONTROL_ROTATE)
-                        .on_disabled_hover_text(tooltips::CONTROL_ROTATE)
-                        .clicked()
-                    {
-                        self.rotate_input(3);
-                    }
-                    if ui
-                        .add_enabled(self.image.is_some(), icons::RotateButton::new(true))
-                        .on_hover_text(tooltips::CONTROL_ROTATE_2)
-                        .on_disabled_hover_text(tooltips::CONTROL_ROTATE_2)
-                        .clicked()
-                    {
-                        self.rotate_input(1);
-                    }
-                });
-                if tooltips::checkbox(
+            }
+            if !self.params.settings.neutral_print_filters_from_database {
+                let e = &mut self.params.enlarger;
+                changed |= tooltips::channels(
                     ui,
-                    &mut self.display.display_transform,
-                    "Display color transform",
-                    tooltips::CONTROL_DISPLAY_COLOR_TRANSFORM,
+                    "Neutral filters",
+                    tooltips::MANUAL_NEUTRAL_FILTER,
+                    tooltips::CMY,
+                    [
+                        &mut e.c_filter_neutral,
+                        &mut e.m_filter_neutral,
+                        &mut e.y_filter_neutral,
+                    ],
+                    0.0..=200.0,
+                    0.1,
                 )
-                .changed()
-                {
-                    self.dirty = true;
-                }
-                tooltips::checkbox(
+                .changed();
+            }
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.use_enlarger_lut,
+                "Enlarger spectral LUT",
+                tooltips::CONTROL_ENLARGER_SPECTRAL_LUT,
+            )
+            .changed();
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.use_scanner_lut,
+                "Scanner spectral LUT",
+                tooltips::CONTROL_SCANNER_SPECTRAL_LUT,
+            )
+            .changed();
+            if self.params.settings.use_enlarger_lut || self.params.settings.use_scanner_lut {
+                changed |= tooltips::labeled(
                     ui,
-                    &mut self.display.show_border,
-                    "White border layer",
-                    tooltips::CONTROL_WHITE_BORDER_LAYER,
-                );
-                tooltips::checkbox(
+                    tooltips::slider(&mut self.params.settings.lut_resolution, 3..=65)
+                        .stock(stock.settings.lut_resolution),
+                    "Spectral LUT resolution",
+                    tooltips::CONTROL_SPECTRAL_LUT_RESOLUTION,
+                )
+                .changed();
+            }
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.use_fast_stats,
+                "Approximate physical-grain statistics",
+                tooltips::CONTROL_APPROXIMATE_PHYSICAL_GRAIN_STATISTICS,
+            )
+            .changed();
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("gamut_algorithm").selected_text(names::label(
+                    &self.params.io.output_gamut_compress.algorithm,
+                )),
+                "Output gamut compression",
+                tooltips::CONTROL_OUTPUT_GAMUT_COMPRESSION,
+                |ui| {
+                    for name in ["off", "cam16ucs", "oklch", "oklrab", "jzazbz", "aces_rgc"] {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.params.io.output_gamut_compress.algorithm,
+                                name.into(),
+                                names::label(name),
+                            )
+                            .on_hover_text(tooltips::option(name))
+                            .changed();
+                    }
+                },
+            );
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.io.input_gamut_compress.active,
+                "Input gamut compression",
+                tooltips::CONTROL_INPUT_GAMUT_COMPRESSION,
+            )
+            .changed();
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.io.crop,
+                "Crop before processing",
+                tooltips::CONTROL_CROP_BEFORE_PROCESSING,
+            )
+            .changed();
+            if self.params.io.crop {
+                let io = &mut self.params.io;
+                let [cx, cy] = io.crop_center.each_mut();
+                changed |= tooltips::channels(
                     ui,
-                    &mut self.display.show_paper_back,
-                    "Paper-back layer",
-                    tooltips::CONTROL_PAPER_BACK_LAYER,
-                );
-                tooltips::checkbox(
+                    "Crop center",
+                    tooltips::CROP_CENTER,
+                    ["X", "Y"],
+                    [cx, cy],
+                    0.0..=1.0,
+                    0.002,
+                )
+                .changed();
+                let [w, h] = io.crop_size.each_mut();
+                changed |= tooltips::channels(
                     ui,
-                    &mut self.display.show_input,
-                    "Input layer",
-                    tooltips::CONTROL_INPUT_LAYER,
-                );
-                if self.display.show_input {
-                    tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.display.input_opacity, 0.0..=1.0),
-                        "Input opacity",
-                        tooltips::CONTROL_INPUT_OPACITY,
-                    );
-                }
-                tooltips::checkbox(
-                    ui,
-                    &mut self.display.show_output,
-                    "Output layer",
-                    tooltips::CONTROL_OUTPUT_LAYER,
-                );
-                if self.display.show_output {
-                    tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.display.output_opacity, 0.0..=1.0),
-                        "Output opacity",
-                        tooltips::CONTROL_OUTPUT_OPACITY,
-                    );
-                }
-                tooltips::checkbox(
-                    ui,
-                    &mut self.display.compare_split,
-                    "Compare input / output",
-                    tooltips::CONTROL_COMPARE_INPUT_OUTPUT,
-                );
-                if self.display.compare_split {
-                    tooltips::labeled(
-                        ui,
-                        egui::Slider::new(&mut self.display.split_position, 0.0..=1.0),
-                        "Comparison split",
-                        tooltips::CONTROL_COMPARISON_SPLIT,
-                    );
-                }
-                tooltips::checkbox(
-                    ui,
-                    &mut self.display.gray_18_canvas,
-                    "18% gray canvas",
-                    tooltips::CONTROL_18_GRAY_CANVAS,
-                );
-                tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.display.white_padding, 0.0..=0.2),
-                    "White border",
-                    tooltips::CONTROL_WHITE_BORDER,
-                );
-                tooltips::checkbox(
-                    ui,
-                    &mut self.display.animate,
-                    "Paper development / crossfade",
-                    tooltips::CONTROL_PAPER_DEVELOPMENT_CROSSFADE,
-                );
-                if ui
-                    .add_enabled(
-                        self.canvas_output.is_some(),
-                        egui::Button::new("Replay paper development"),
-                    )
-                    .on_hover_text(tooltips::CONTROL_REPLAY_PAPER_DEVELOPMENT)
-                    .on_disabled_hover_text(tooltips::CONTROL_REPLAY_PAPER_DEVELOPMENT)
-                    .clicked()
-                {
-                    self.canvas_previous = None;
-                    self.animation = Some((Instant::now(), true));
-                    self.ctx.request_repaint();
-                }
-                ui.label("Preview sampling")
-                    .on_hover_text(tooltips::MENU_CANVAS_INTERPOLATION);
-                egui::ComboBox::from_id_salt("canvas_interpolation")
-                    .selected_text(&self.display.output_interpolation)
-                    .show_ui(ui, |ui| {
-                        for mode in view::INTERPOLATIONS {
-                            if ui
-                                .selectable_value(
-                                    &mut self.display.output_interpolation,
-                                    mode.into(),
-                                    mode,
-                                )
-                                .on_hover_text(tooltips::option(mode))
-                                .changed()
-                            {
-                                if self.canvas.is_none() {
-                                    self.dirty = true;
-                                }
-                            }
-                        }
-                    });
-                if self.canvas.is_none() {
-                    ui.label(tooltips::GPU_CANVAS_NOTE);
-                }
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_DISPLAY);
-        egui::CollapsingHeader::new("File export")
+                    "Crop size",
+                    tooltips::CROP_SIZE,
+                    ["W", "H"],
+                    [w, h],
+                    0.01..=1.0,
+                    0.002,
+                )
+                .changed();
+            }
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(
+                    &mut self.params.film_render.grain.blur_dye_clouds_um,
+                    0.0..=5.0,
+                )
+                .stock(stock.film_render.grain.blur_dye_clouds_um),
+                "Dye cloud blur (µm)",
+                tooltips::CONTROL_DYE_CLOUD_BLUR_UM,
+            )
+            .changed();
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.apply_hanatos2025_adaptation_surface,
+                "Sensitivity adaptation surface",
+                tooltips::CONTROL_SENSITIVITY_ADAPTATION_SURFACE,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut self.params.settings.spectral_gaussian_blur, 0.0..=10.0)
+                    .stock(stock.settings.spectral_gaussian_blur),
+                "Spectral blur",
+                tooltips::CONTROL_SPECTRAL_BLUR,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut self.params.camera.filter_uv[0], 0.0..=1.0)
+                    .stock(stock.camera.filter_uv[0]),
+                "UV filter amount",
+                tooltips::CONTROL_UV_FILTER_AMOUNT,
+            )
+            .changed();
+            changed |= tooltips::labeled(
+                ui,
+                tooltips::slider(&mut self.params.camera.filter_ir[0], 0.0..=1.0)
+                    .stock(stock.camera.filter_ir[0]),
+                "IR filter amount",
+                tooltips::CONTROL_IR_FILTER_AMOUNT,
+            )
+            .changed();
+            changed |= tooltips::checkbox(
+                ui,
+                &mut self.params.settings.preview_mode,
+                "Simplified preview mode",
+                tooltips::CONTROL_SIMPLIFIED_PREVIEW_MODE,
+            )
+            .changed();
+            if changed {
+                self.dirty = true;
+            }
+        });
+        Section::new("File export", Tab::Output, tooltips::SECTION_FILE_EXPORT)
+            .closed()
             .show(ui, |ui| {
                 tooltips::checkbox(
                     ui,
@@ -4405,11 +4293,13 @@ impl App {
                     "Use GPU for full-resolution export",
                     tooltips::EXPORT_PRECISION,
                 );
-                ui.label("Saving color space")
-                    .on_hover_text(tooltips::MENU_SAVING_COLOR_SPACE);
-                egui::ComboBox::from_id_salt("saving_color_space")
-                    .selected_text(&self.save_options.color_space)
-                    .show_ui(ui, |ui| {
+                tooltips::combo(
+                    ui,
+                    egui::ComboBox::from_id_salt("saving_color_space")
+                        .selected_text(&self.save_options.color_space),
+                    "Saving color space",
+                    tooltips::MENU_SAVING_COLOR_SPACE,
+                    |ui| {
                         for name in [
                             "sRGB",
                             "Display P3",
@@ -4426,23 +4316,26 @@ impl App {
                             )
                             .on_hover_text(tooltips::option(name));
                         }
-                    });
+                    },
+                );
                 tooltips::checkbox(
                     ui,
                     &mut self.save_options.encoded,
                     "Encode saving transfer function",
                     tooltips::CONTROL_ENCODE_SAVING_TRANSFER_FUNCTION,
                 );
-                ui.label("TIFF bit depth")
-                    .on_hover_text(tooltips::MENU_EXPORT_DEPTH);
-                egui::ComboBox::from_id_salt("export_depth")
-                    .selected_text(format!("{} bit TIFF", self.save_options.bit_depth))
-                    .show_ui(ui, |ui| {
+                tooltips::combo(
+                    ui,
+                    egui::ComboBox::from_id_salt("export_depth")
+                        .selected_text(format!("{} bit", self.save_options.bit_depth)),
+                    "TIFF bit depth",
+                    tooltips::MENU_EXPORT_DEPTH,
+                    |ui| {
                         for depth in [8, 16, 32] {
                             ui.selectable_value(
                                 &mut self.save_options.bit_depth,
                                 depth,
-                                format!("{depth} bit TIFF"),
+                                format!("{depth} bit"),
                             )
                             .on_hover_text(if depth == 32 {
                                 tooltips::TIFF_FLOAT
@@ -4450,17 +4343,138 @@ impl App {
                                 tooltips::TIFF_INTEGER
                             });
                         }
-                    });
+                    },
+                );
                 tooltips::labeled(
                     ui,
                     egui::Slider::new(&mut self.save_options.jpeg_quality, 1..=100),
                     "JPEG quality",
                     tooltips::CONTROL_JPEG_QUALITY,
                 );
-                ui.label("Float TIFF and EXR preserve values outside 0–1.");
-            })
-            .header_response
-            .on_hover_text(tooltips::SECTION_FILE_EXPORT);
+                ui.label(
+                    egui::RichText::new("Float TIFF and EXR preserve values outside 0–1.")
+                        .small()
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+    }
+
+    fn raw_controls(&mut self, ui: &mut egui::Ui) {
+        use inspector::{Section, Tab};
+        Section::new(
+            "RAW development",
+            Tab::Input,
+            tooltips::SECTION_RAW_DEVELOPMENT,
+        )
+        .closed()
+        .show(ui, |ui| {
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("raw_decoder")
+                    .selected_text(names::label(&self.raw_options.decoder)),
+                "RAW decoder",
+                tooltips::MENU_RAW_DECODER,
+                |ui| {
+                    for name in ["auto", "libraw", "rawler"] {
+                        ui.selectable_value(
+                            &mut self.raw_options.decoder,
+                            name.into(),
+                            names::label(name),
+                        )
+                        .on_hover_text(tooltips::option(name));
+                    }
+                },
+            );
+            tooltips::combo(
+                ui,
+                egui::ComboBox::from_id_salt("raw_white_balance")
+                    .selected_text(names::label(&self.raw_options.white_balance)),
+                "White balance",
+                tooltips::MENU_RAW_WHITE_BALANCE,
+                |ui| {
+                    for name in ["as_shot", "daylight", "tungsten", "custom"] {
+                        ui.selectable_value(
+                            &mut self.raw_options.white_balance,
+                            name.into(),
+                            names::label(name),
+                        )
+                        .on_hover_text(tooltips::option(name));
+                    }
+                },
+            );
+            if self.raw_options.white_balance == "custom" {
+                tooltips::labeled(
+                    ui,
+                    egui::Slider::new(&mut self.raw_options.temperature, 2000.0..=15000.0),
+                    "Temperature (K)",
+                    tooltips::CONTROL_TEMPERATURE_K,
+                );
+                tooltips::labeled(
+                    ui,
+                    egui::Slider::new(&mut self.raw_options.tint, 0.1..=3.0),
+                    "Tint",
+                    tooltips::CONTROL_TINT,
+                );
+            }
+            tooltips::checkbox(
+                ui,
+                &mut self.raw_options.lens_correction,
+                "Lens correction (Lensfun)",
+                tooltips::CONTROL_LENS_CORRECTION_LENSFUN,
+            );
+            if self.raw_options.lens_correction {
+                if let Some(path) = &self.raw_options.lens_database {
+                    ui.label(
+                        egui::RichText::new(format!("Database override: {}", path.display()))
+                            .small()
+                            .color(theme::TEXT_WEAK),
+                    )
+                    .on_hover_text(tooltips::LENS_DATABASE_OVERRIDE);
+                    if ui
+                        .button("Use automatic Lensfun database")
+                        .on_hover_text(tooltips::CONTROL_USE_AUTOMATIC_LENSFUN_DATABASE)
+                        .clicked()
+                    {
+                        self.raw_options.lens_database = None;
+                        self.lens_database_status = LensDatabaseStatus::detect();
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(self.lens_database_status.label)
+                            .small()
+                            .color(theme::TEXT_WEAK),
+                    )
+                    .on_hover_text(&self.lens_database_status.detail);
+                }
+                if ui
+                    .button("Choose Lensfun database…")
+                    .on_hover_text(tooltips::CHOOSE_LENS_DATABASE)
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.raw_options.lens_database = Some(path);
+                    }
+                }
+            }
+            let pending = self.loaded_raw_options.as_ref() != Some(&self.raw_options);
+            if ui
+                .add_enabled(
+                    self.image_path.is_some(),
+                    egui::Button::new(if pending {
+                        egui::RichText::new("Reload RAW with these settings").color(theme::ACCENT)
+                    } else {
+                        egui::RichText::new("Reload RAW with these settings")
+                    }),
+                )
+                .on_hover_text(tooltips::CONTROL_RELOAD_RAW_WITH_THESE_SETTINGS)
+                .clicked()
+            {
+                if let Some(path) = self.image_path.clone() {
+                    let rotation = self.rotation;
+                    self.load_image_with_state(&path, rotation, None, None);
+                }
+            }
+        });
     }
 }
 
@@ -4626,6 +4640,7 @@ mod preview_failure_tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Err("test refinement failure".into())).unwrap();
         app.render_job = Some(RenderJob {
+            started: Instant::now(),
             discard: false,
             rx,
             handle: None,
