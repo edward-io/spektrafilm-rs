@@ -45,3 +45,4 @@ foreign-types = "0.5"
 
 [dev-dependencies]
 pollster = "0.4"
+tempfile = "3"

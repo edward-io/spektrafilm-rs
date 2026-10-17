@@ -82,12 +82,50 @@ Changes from the original Rust fork's v0.1.2 baseline,
   [parity report](docs/experimental-parity.md) records preview timings, the strict
   0.001 GPU error gate and remaining limits.
 
+## Lightroom Classic catalogs
+
+Choose **Catalog…**, drop a `.lrcat` file, or pass it to `spektrafilm-gui` on
+launch. The left browser shows photo thumbnails and Lightroom's accepted,
+rejected and unflagged states. **Accepted only** filters picks; click a photo,
+use **Previous / Next**, or press the left/right arrow keys to browse.
+Unavailable originals are skipped. Connect the photo drive and press
+**Refresh** to update availability, flags and geometry.
+
+Catalogs are opened read-only. Original files are developed by Spektrafilm,
+with Lightroom's crop, straighten angle, rotation and flips applied. Lightroom
+color, exposure, white balance and other tonal adjustments are not imported.
+Imported geometry is retained in saved Spektrafilm projects and full-resolution
+GPU/CPU exports. Camera previews are used only as browser thumbnails.
+
+Adobe lens and perspective corrections are not reproduced; affected photos
+show a warning because their framing can differ. The importer targets the
+current Lightroom Classic catalog layout; unsupported layouts report an error.
+The photo list is virtualized, thumbnails load in the background, and recently
+developed images use a bounded memory cache for faster revisits.
+
+Use an optimized build when browsing full-size RAWs; plain `cargo run` uses the
+much slower debug build:
+
+```sh
+cargo run --release -p spektrafilm-gui -- "/path/to/catalog.lrcat"
+```
+
+To measure selection through the rendered preview on the first six available
+RAWs (without preloading), run the local benchmark. Set
+`SPEKTRAFILM_BENCH_RAW_DECODER=rawler` or `libraw` to compare decoders. Landscape
+and portrait source previews are saved in `target/catalog-load-benchmark/`:
+
+```sh
+SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG="/path/to/catalog.lrcat" \
+  cargo test --release -p spektrafilm-gui benchmark_catalog_load -- --ignored --nocapture
+```
+
 ## GUI and RAW development
 
 Open or drop JPEG, PNG, TIFF, EXR or camera RAW files. RAW support includes the
-Sony ILCE-7M5 through rawler 0.8. Auto uses an installed LibRaw when available,
-then falls back to rawler. LibRaw is optional; configuration and camera regression
-instructions are in the [support notes](docs/upstream-sync.md). Lensfun is built in,
+Sony ILCE-7M5 through rawler 0.8. Auto tries rawler first, then falls back to an
+installed LibRaw if decoding fails. LibRaw is optional; configuration and camera
+regression instructions are in the [support notes](docs/upstream-sync.md). Lensfun is built in,
 so lens correction needs no separate Lensfun installation or library-path setting.
 Its database is found automatically; when none is installed, the loading worker
 downloads the official compatible database once and caches it in your user data

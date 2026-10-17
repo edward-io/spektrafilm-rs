@@ -6,6 +6,7 @@
 // render; the panel scales it to fit.
 
 mod calibration_ui;
+mod catalog_ui;
 mod icons;
 mod lut_ui;
 mod paper_back;
@@ -215,6 +216,9 @@ impl LensDatabaseStatus {
 struct App {
     ctx: egui::Context,
     load_job: Option<LoadJob>,
+    pending_load: Option<LoadRequest>,
+    image_cache: std::collections::VecDeque<CachedImage>,
+    catalog: Option<catalog_ui::Browser>,
     preview_input: Vec<(u32, Arc<ImageBuf>)>,
     rendered_preview_limit: u32,
     render_path: String,
@@ -308,6 +312,7 @@ struct App {
 }
 
 struct LoadJob {
+    discard: bool,
     path: PathBuf,
     started: Instant,
     color_override: Option<(String, bool)>,
@@ -319,11 +324,40 @@ struct LoadJob {
 }
 
 struct LoadedPreview {
-    loaded: spektrafilm_io::LoadedImage,
+    source: SourceImage,
     input: Arc<ImageBuf>,
     preview: PreviewTextureData,
     paper: Arc<PreviewTextureData>,
     source_key: (String, bool, bool),
+}
+
+#[derive(Clone)]
+struct SourceImage {
+    pixels: Arc<ImageBuf>,
+    metadata: spektrafilm_io::Metadata,
+    color_space: String,
+    encoded: bool,
+    stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+struct LoadRequest {
+    path: PathBuf,
+    rotation: u8,
+    color_override: Option<(String, bool)>,
+    view_override: Option<(f32, egui::Vec2)>,
+    raw_options: spektrafilm_io::RawOptions,
+}
+
+struct CachedImage {
+    path: PathBuf,
+    rotation: u8,
+    options: spektrafilm_io::RawOptions,
+    source: SourceImage,
+}
+
+fn image_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// One in-flight preview render. The worker owns a Pipeline + the
@@ -407,6 +441,9 @@ impl App {
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             load_job: None,
+            pending_load: None,
+            image_cache: Default::default(),
+            catalog: None,
             preview_input: Vec::new(),
             rendered_preview_limit: 0,
             render_path: "Awaiting render".into(),
@@ -477,7 +514,69 @@ impl App {
     }
 
     fn load_image_from_path(&mut self, path: &Path) {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lrcat"))
+        {
+            self.open_catalog(path.to_path_buf());
+            return;
+        }
+        self.raw_options.lightroom_geometry = None;
+        if let Some(catalog) = &mut self.catalog {
+            catalog.selected = None;
+        }
         self.load_image_with_state(path, 0, None, None);
+    }
+
+    fn clear_image(&mut self) {
+        self.image = None;
+        self.image_path = None;
+        self.loaded_raw_options = None;
+        self.output_image = None;
+        self.output_tex = None;
+        self.input_tex = None;
+        self.canvas_input = None;
+        self.canvas_output = None;
+        self.canvas_previous = None;
+        self.animation = None;
+        self.preview_input.clear();
+        self.dirty = false;
+        self.pending_dirty = false;
+    }
+
+    fn open_catalog(&mut self, path: PathBuf) {
+        if let Some(job) = &mut self.load_job {
+            job.discard = true;
+        }
+        if let Some(job) = &mut self.render_job {
+            job.discard = true;
+        }
+        self.pending_load = None;
+        self.clear_image();
+        self.raw_options.lightroom_geometry = None;
+        self.catalog = Some(catalog_ui::Browser::open(path, &self.ctx));
+        self.status = "Reading Lightroom catalog…".into();
+    }
+
+    fn select_catalog_photo(&mut self, photo: spektrafilm_io::lightroom::Photo) {
+        match photo.geometry {
+            Ok(geometry) => {
+                self.raw_options.lightroom_geometry = Some(geometry);
+                self.params.io.crop = false;
+                self.load_image_with_state(&photo.path, 0, None, None);
+            }
+            Err(error) => {
+                if let Some(job) = &mut self.load_job {
+                    job.discard = true;
+                }
+                if let Some(job) = &mut self.render_job {
+                    job.discard = true;
+                }
+                self.pending_load = None;
+                self.clear_image();
+                self.status = format!("Load error: catalog crop/rotation: {error}");
+            }
+        }
     }
     fn load_image_with_state(
         &mut self,
@@ -489,8 +588,6 @@ impl App {
         if let Some(render) = &mut self.render_job {
             render.discard = true;
         }
-        let display_transform = self.display.display_transform;
-        let preview_color = color_override.clone();
         let path = match std::path::absolute(path) {
             Ok(path) => path,
             Err(e) => {
@@ -498,8 +595,53 @@ impl App {
                 return;
             }
         };
+        let request = LoadRequest {
+            path,
+            rotation,
+            color_override,
+            view_override,
+            raw_options: self.raw_options.clone(),
+        };
+        if self.image_path.as_ref() != Some(&request.path)
+            || self.export_raw_options().lightroom_geometry
+                != request.raw_options.lightroom_geometry
+        {
+            self.clear_image();
+        }
+        if let Some(job) = &mut self.load_job {
+            job.discard = true;
+            self.status = format!(
+                "Waiting to load {}…",
+                request
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            self.pending_load = Some(request);
+            return;
+        }
+        self.start_image_load(request);
+    }
+
+    fn start_image_load(&mut self, request: LoadRequest) {
+        let LoadRequest {
+            path,
+            rotation,
+            color_override,
+            view_override,
+            raw_options: options,
+        } = request;
+        let display_transform = self.display.display_transform;
+        let preview_color = color_override.clone();
+        let cached = self
+            .image_cache
+            .iter()
+            .find(|cached| {
+                cached.path == path && cached.rotation == rotation && cached.options == options
+            })
+            .map(|cached| cached.source.clone());
         let worker_path = path.clone();
-        let options = self.raw_options.clone();
         let loaded_options = options.clone();
         let ctx = self.ctx.clone();
         let (tx, rx) = mpsc::channel();
@@ -507,14 +649,31 @@ impl App {
             .name("spektrafilm-load".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut loaded = spektrafilm_io::load(&worker_path, &options)
-                        .map_err(|e| format!("{e:#}"))?;
-                    if rotation % 4 != 0 {
-                        loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
-                    }
-                    let input = Arc::new(spektrafilm_core::resize::preview(&loaded.pixels, 2048));
+                    let started = Instant::now();
+                    let stamp = image_stamp(&worker_path);
+                    let source =
+                        match cached.filter(|source| stamp.is_some() && source.stamp == stamp) {
+                            Some(source) => source,
+                            None => {
+                                let mut loaded = spektrafilm_io::load(&worker_path, &options)
+                                    .map_err(|e| format!("{e:#}"))?;
+                                if rotation % 4 != 0 {
+                                    loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
+                                }
+                                SourceImage {
+                                    pixels: Arc::new(loaded.pixels),
+                                    metadata: loaded.metadata,
+                                    color_space: loaded.color_space,
+                                    encoded: loaded.encoded,
+                                    stamp,
+                                }
+                            }
+                        };
+                    let loaded = started.elapsed();
+                    let input = Arc::new(spektrafilm_core::resize::preview(&source.pixels, 2048));
+                    let resized = started.elapsed();
                     let (color, encoded) =
-                        preview_color.unwrap_or((loaded.color_space.clone(), loaded.encoded));
+                        preview_color.unwrap_or((source.color_space.clone(), source.encoded));
                     let mut io = spektrafilm_core::params::IoParams::default();
                     io.output_color_space = color;
                     io.output_cctf_encoding = encoded;
@@ -524,9 +683,11 @@ impl App {
                         display_transform,
                     );
                     let preview = make_preview_texture_data(&input, &io, display_transform);
+                    let displayed = started.elapsed();
                     let paper = paper_back::cached(preview.size[0], preview.size[1]);
+                    eprintln!("[spektrafilm] load {}: decode {:.1} ms, resize {:.1} ms, display {:.1} ms, paper {:.1} ms", worker_path.display(), loaded.as_secs_f64() * 1000., (resized - loaded).as_secs_f64() * 1000., (displayed - resized).as_secs_f64() * 1000., (started.elapsed() - displayed).as_secs_f64() * 1000.);
                     Ok(LoadedPreview {
-                        loaded,
+                        source,
                         input,
                         preview,
                         paper,
@@ -544,6 +705,7 @@ impl App {
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
                 self.load_job = Some(LoadJob {
+                    discard: false,
                     path,
                     started: Instant::now(),
                     color_override,
@@ -574,27 +736,61 @@ impl App {
         if let Some(handle) = job.handle.take() {
             let _ = handle.join();
         }
+        if job.discard {
+            if let Some(request) = self.pending_load.take() {
+                self.start_image_load(request);
+            }
+            return;
+        }
         // Refresh after a load (including failures after a successful download),
         // keeping filesystem discovery out of the UI paint loop.
         self.lens_database_status = LensDatabaseStatus::detect();
         match result {
             Ok(display) => {
-                self.loaded_raw_options = Some(job.raw_options);
                 let LoadedPreview {
-                    loaded,
+                    source,
                     input,
                     preview,
                     paper,
                     source_key,
                 } = display;
-                self.metadata = loaded.metadata;
+                if let Some(catalog) = &mut self.catalog {
+                    catalog.source_thumbnail(&self.ctx, &job.path, &preview);
+                }
+                self.image_cache.retain(|cached| {
+                    cached.path != job.path
+                        || cached.options != job.raw_options
+                        || cached.rotation != job.rotation
+                });
+                self.image_cache.push_back(CachedImage {
+                    path: job.path.clone(),
+                    rotation: job.rotation,
+                    options: job.raw_options.clone(),
+                    source: source.clone(),
+                });
+                // Keep the current source plus at most 512 MiB of previously developed images.
+                let mut previous_bytes: usize = self
+                    .image_cache
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .map(|cached| std::mem::size_of_val(cached.source.pixels.data.as_slice()))
+                    .sum();
+                while previous_bytes > 512 * 1024 * 1024 {
+                    if let Some(cached) = self.image_cache.pop_front() {
+                        previous_bytes -=
+                            std::mem::size_of_val(cached.source.pixels.data.as_slice());
+                    }
+                }
+                self.loaded_raw_options = Some(job.raw_options);
+                self.metadata = source.metadata;
                 let (color, encoded) = job
                     .color_override
-                    .unwrap_or((loaded.color_space, loaded.encoded));
+                    .unwrap_or((source.color_space, source.encoded));
                 self.params.io.input_color_space = color;
                 self.params.io.input_cctf_decoding = encoded;
                 self.rotation = job.rotation;
-                let img = loaded.pixels;
+                let img = source.pixels;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
                     img.width,
@@ -602,7 +798,7 @@ impl App {
                     img.pixel_count() as f64 / 1e6,
                     job.started.elapsed().as_secs_f32() * 1000.
                 );
-                self.image = Some(Arc::new(img));
+                self.image = Some(img);
                 self.image_path = Some(job.path);
                 self.output_image = None;
                 self.output_tex = None;
@@ -664,6 +860,7 @@ impl App {
         let ctx = self.ctx.clone();
         let (tx, rx) = mpsc::channel();
         let worker_color = color.clone();
+        let worker_path = path.clone();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-rotate".into())
             .spawn(move || {
@@ -681,11 +878,12 @@ impl App {
                     let preview = make_preview_texture_data(&input, &io, display_transform);
                     let paper = paper_back::cached(preview.size[0], preview.size[1]);
                     Ok(LoadedPreview {
-                        loaded: spektrafilm_io::LoadedImage {
-                            pixels,
+                        source: SourceImage {
+                            pixels: Arc::new(pixels),
                             metadata,
                             color_space: worker_color,
                             encoded,
+                            stamp: image_stamp(&worker_path),
                         },
                         input,
                         preview,
@@ -700,6 +898,7 @@ impl App {
         match handle {
             Ok(handle) => {
                 self.load_job = Some(LoadJob {
+                    discard: false,
                     path,
                     started: Instant::now(),
                     color_override: Some((color, encoded)),
@@ -1485,7 +1684,7 @@ impl App {
         ui.add_space(6.0);
 
         // ── File ────────────────────────────────────────────────────────
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("Open…")
                 .on_hover_text(tooltips::CONTROL_OPEN)
@@ -1504,6 +1703,18 @@ impl App {
                     .pick_file()
                 {
                     self.load_image_from_path(&path);
+                }
+            }
+            if ui
+                .button("Catalog…")
+                .on_hover_text("Browse a Lightroom Classic catalog read-only")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Lightroom Classic catalog", &["lrcat"])
+                    .pick_file()
+                {
+                    self.open_catalog(path);
                 }
             }
             let save_enabled = self.output_image.is_some()
@@ -2714,6 +2925,30 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls_panel(ui, ctx));
             });
+        let action = self.catalog.as_mut().and_then(|catalog| {
+            egui::SidePanel::left("catalog")
+                .default_width(270.)
+                .min_width(220.)
+                .max_width(420.)
+                .show(ctx, |ui| catalog.show(ui, ctx))
+                .inner
+        });
+        match action {
+            Some(catalog_ui::Action::Close) => self.catalog = None,
+            Some(catalog_ui::Action::Select(photo)) => self.select_catalog_photo(photo),
+            Some(catalog_ui::Action::Empty) => {
+                if let Some(job) = &mut self.load_job {
+                    job.discard = true;
+                }
+                if let Some(job) = &mut self.render_job {
+                    job.discard = true;
+                }
+                self.pending_load = None;
+                self.clear_image();
+                self.status = "Catalog loaded. No available photos match the filter.".into();
+            }
+            None => {}
+        }
         let canvas = if self.display.gray_18_canvas {
             egui::Color32::from_gray(118)
         } else {
@@ -3043,7 +3278,7 @@ fn make_preview_texture_data(
             .expect("validated output")
             .transfer;
         let matrix = spektrafilm_math::transfer::rgb_matrix(&io.output_color_space, "sRGB");
-        for px in display.data.chunks_exact_mut(3) {
+        display.data.par_chunks_exact_mut(3).for_each(|px| {
             let linear = std::array::from_fn::<_, 3, _>(|c| {
                 if io.output_cctf_encoding {
                     curve.decode(px[c] as f64)
@@ -3060,7 +3295,7 @@ fn make_preview_texture_data(
                     ),
                 );
             }
-        }
+        });
         converted = display;
         &converted
     };
@@ -3300,6 +3535,10 @@ fn run_f64_export(
     if let Some(path) = &raw_options.lens_database {
         cmd.arg("--lens-database").arg(path);
     }
+    if let Some(geometry) = &raw_options.lightroom_geometry {
+        cmd.arg("--lightroom-geometry")
+            .arg(serde_json::to_string(geometry)?);
+    }
     run_cli(&mut cmd, cancel)
 }
 
@@ -3522,6 +3761,9 @@ impl App {
         self.raw_options = state.raw;
         self.save_options = state.output;
         if load_image {
+            if let Some(catalog) = &mut self.catalog {
+                catalog.selected = None;
+            }
             if let Some(image) = state.image {
                 self.load_image_with_state(
                     &image,
@@ -3594,6 +3836,7 @@ impl App {
                 let mut state = self.project_state();
                 state.image = None;
                 state.raw = self.raw_options.clone();
+                state.raw.lightroom_geometry = None;
                 self.status = match state.save(&project::default_path()) {
                     Ok(()) => "Saved startup defaults".into(),
                     Err(e) => format!("Save defaults: {e:#}"),
@@ -4401,6 +4644,227 @@ mod preview_failure_tests {
             "failed refinement automatically retried"
         );
         assert!(app.status.contains("test refinement failure"));
+    }
+}
+
+#[cfg(test)]
+mod preview_texture_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_display_conversion_matches_scalar_reference() {
+        let image = ImageBuf::from_data(
+            31,
+            17,
+            (0..31 * 17 * 3)
+                .map(|i| spektrafilm_math::precision::from_f64((i % 127) as f64 / 100. - 0.1))
+                .collect(),
+        );
+        for (color, encoded) in [
+            ("ACES2065-1", false),
+            ("sRGB", false),
+            ("sRGB", true),
+            ("ProPhoto RGB", true),
+        ] {
+            let mut io = spektrafilm_core::params::IoParams::default();
+            io.output_color_space = color.into();
+            io.output_cctf_encoding = encoded;
+            for transform in [false, true] {
+                let actual = make_preview_texture_data(&image, &io, transform);
+                let curve = spektrafilm_math::transfer::get(color).unwrap().transfer;
+                let matrix = spektrafilm_math::transfer::rgb_matrix(color, "sRGB");
+                let expected: Vec<u8> = image
+                    .pixels()
+                    .flat_map(|pixel| {
+                        let mut rgb = [pixel[0], pixel[1], pixel[2]];
+                        if transform && !(color == "sRGB" && encoded) {
+                            let linear = rgb.map(|v| {
+                                if encoded {
+                                    curve.decode(v as f64)
+                                } else {
+                                    v as f64
+                                }
+                            });
+                            rgb = std::array::from_fn(|c| {
+                                spektrafilm_math::precision::from_f64(
+                                    spektrafilm_math::transfer::Transfer::Srgb.encode(
+                                        matrix[c][0] * linear[0]
+                                            + matrix[c][1] * linear[1]
+                                            + matrix[c][2] * linear[2],
+                                    ),
+                                )
+                            });
+                        }
+                        let rgb = rgb.map(|v| (to_f32(v).clamp(0., 1.) * 255.).round() as u8);
+                        [rgb[0], rgb[1], rgb[2], 255]
+                    })
+                    .collect();
+                assert_eq!(
+                    actual.rgba, expected,
+                    "{color}, encoded={encoded}, transform={transform}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_loading_tests {
+    use super::*;
+    use spektrafilm_io::lightroom::{Geometry, Photo};
+
+    fn finish(app: &mut App) {
+        while let Some(job) = &mut app.load_job {
+            if let Some(handle) = job.handle.take() {
+                handle.join().unwrap();
+            }
+            app.poll_load_job();
+        }
+        assert!(app.image.is_some(), "{}", app.status);
+    }
+
+    #[test]
+    #[ignore = "requires SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG and local originals"]
+    fn benchmark_catalog_load() {
+        tracing_subscriber::fmt()
+            .with_env_filter("spektrafilm_io=debug")
+            .try_init()
+            .ok();
+        let path = std::env::var_os("SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG").expect("catalog path");
+        let catalog = spektrafilm_io::lightroom::Catalog::open(Path::new(&path)).unwrap();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, Arc::from(spektrafilm_gpu::select_backend()), None);
+        if let Ok(decoder) = std::env::var("SPEKTRAFILM_BENCH_RAW_DECODER") {
+            app.raw_options.decoder = decoder;
+        }
+        for (index, photo) in catalog
+            .photos
+            .into_iter()
+            .filter(|p| p.available && spektrafilm_io::is_raw(&p.path))
+            .take(6)
+            .enumerate()
+        {
+            let started = Instant::now();
+            app.select_catalog_photo(photo);
+            finish(&mut app);
+            eprintln!("[benchmark] source: {}", app.status);
+            app.dispatch_render(&ctx);
+            while let Some(job) = &mut app.render_job {
+                if let Some(handle) = job.handle.take() {
+                    handle.join().unwrap();
+                }
+                app.poll_render_job(&ctx);
+            }
+            assert!(app.output_image.is_some(), "{}", app.status);
+            eprintln!(
+                "[benchmark] click-to-render {:.1} ms: {}",
+                started.elapsed().as_secs_f64() * 1000.,
+                app.status
+            );
+            if index == 0 || index == 3 {
+                let mut io = app.params.io.clone();
+                io.output_color_space = io.input_color_space.clone();
+                io.output_cctf_encoding = io.input_cctf_decoding;
+                let source = &app
+                    .preview_input
+                    .iter()
+                    .find(|(limit, _)| *limit == 2048)
+                    .unwrap()
+                    .1;
+                let preview = make_preview_texture_data(source, &io, true);
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/catalog-load-benchmark");
+                std::fs::create_dir_all(&dir).unwrap();
+                image::save_buffer(
+                    dir.join(format!("{}-{index}.png", app.raw_options.decoder)),
+                    &preview.rgba,
+                    preview.size[0] as u32,
+                    preview.size[1] as u32,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_navigation_keeps_latest_geometry_and_revisits_use_decoded_cache() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        app.raw_options = spektrafilm_io::RawOptions {
+            decoder: "rawler".into(),
+            ..Default::default()
+        };
+        app.params.camera.exposure_compensation_ev = 1.25;
+        let dir = tempfile::tempdir().unwrap();
+        let photo = |id, orientation, crop| {
+            let path = dir.path().join(format!("{id}.dng"));
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../spektrafilm-io/tests/fixtures/synthetic.dng"),
+                &path,
+            )
+            .unwrap();
+            Photo {
+                id,
+                path,
+                available: true,
+                copy_name: String::new(),
+                flag: 1,
+                geometry: Ok(Geometry {
+                    orientation,
+                    crop,
+                    angle: 0.,
+                }),
+                framing_warning: false,
+            }
+        };
+        let first = photo(1, 1, [0., 0., 1., 1.]);
+        let second = photo(2, 6, [0.25, 0., 1., 0.5]);
+        let latest = photo(3, 8, [0., 0., 0.5, 1.]);
+        app.select_catalog_photo(first.clone());
+        app.select_catalog_photo(second.clone());
+        app.select_catalog_photo(latest.clone());
+        assert!(app.pending_load.is_some());
+        finish(&mut app);
+        assert_eq!(app.image_path.as_ref(), Some(&latest.path));
+        assert_eq!(
+            (
+                app.image.as_ref().unwrap().width,
+                app.image.as_ref().unwrap().height
+            ),
+            (32, 16)
+        );
+        assert_eq!(app.params.camera.exposure_compensation_ev, 1.25);
+        let latest_pixels = app.image.as_ref().unwrap().clone();
+        app.select_catalog_photo(first);
+        finish(&mut app);
+        app.select_catalog_photo(latest.clone());
+        finish(&mut app);
+        assert!(Arc::ptr_eq(app.image.as_ref().unwrap(), &latest_pixels));
+        let path = dir.path().join("project.json");
+        app.project_state().save(&path).unwrap();
+        let mut reopened = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        reopened.restore_project(&path, true).unwrap();
+        finish(&mut reopened);
+        assert_eq!(reopened.image.as_ref().unwrap().data, latest_pixels.data);
+        assert_eq!(
+            reopened.export_raw_options().lightroom_geometry,
+            latest.geometry.ok()
+        );
+        app.open_catalog(dir.path().join("missing.lrcat"));
+        assert!(app.image.is_none() && app.image_path.is_none());
+        assert!(app.pending_load.is_none());
     }
 }
 

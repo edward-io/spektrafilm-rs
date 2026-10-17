@@ -2,10 +2,12 @@
 //! Optional: set SPEKTRAFILM_LIBRAW_LIBRARY or install a system LibRaw library.
 use super::{LoadedImage, Metadata, RawOptions};
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use spektrafilm_math::{colorspace, image::ImageBuf, precision::from_f64, transfer};
 use std::{
     ffi::{CString, c_char, c_void},
     path::Path,
+    time::Instant,
 };
 type Ptr = *mut c_void;
 #[repr(C)]
@@ -48,6 +50,7 @@ pub fn library() -> Result<libloading::Library> {
         })
 }
 pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Result<LoadedImage> {
+    let started = Instant::now();
     // SAFETY: only documented C API functions and libraw_processed_image_t's
     // stable layout are used. Guards free both allocations before unloading.
     unsafe {
@@ -94,7 +97,9 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
             }
         };
         check(open(raw, filename.as_ptr()), "open")?;
+        let opened = started.elapsed();
         check(unpack(raw), "unpack")?;
+        let unpacked = started.elapsed();
         // LibRaw 0.22 exposes the vendor crop through its stable C API.
         // Apply it after unpack (masked-area black levels are already read)
         // and before processing; otherwise newer Sony ARWs include padding.
@@ -116,6 +121,7 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
             }
         }
         check(process(raw), "process")?;
+        let processed = started.elapsed();
         let mut error = 0;
         let image = mem(raw, &mut error);
         check(error, "image buffer")?;
@@ -123,8 +129,14 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
             bail!("LibRaw returned an empty image");
         }
         let _image = Guard(image.cast(), *free);
+        let copied = started.elapsed();
         let header = &*image;
-        if header.kind != 2 || header.bits != 16 || header.colors < 3 {
+        if header.kind != 2
+            || header.bits != 16
+            || header.colors < 3
+            || header.width == 0
+            || header.height == 0
+        {
             bail!("LibRaw returned an unsupported bitmap layout");
         }
         let count = header.width as usize * header.height as usize * header.colors as usize;
@@ -133,16 +145,7 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
         }
         let bytes = std::slice::from_raw_parts(header.data.as_ptr(), header.data_size as usize);
         let mut pixels = ImageBuf::new(header.width as u32, header.height as u32);
-        for (dst, src) in pixels
-            .data
-            .chunks_exact_mut(3)
-            .zip(bytes.chunks_exact(header.colors as usize * 2))
-        {
-            for c in 0..3 {
-                let v = u16::from_ne_bytes([src[c * 2], src[c * 2 + 1]]) as f32 / 65535f32;
-                dst[c] = from_f64(v as f64);
-            }
-        }
+        copy_bitmap(&mut pixels, bytes, header.colors as usize);
         if options.lens_correction {
             super::lens::correct(&mut pixels, path, options.lens_database.as_deref())?;
         }
@@ -173,6 +176,7 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
                 }
             }
         }
+        let converted = started.elapsed();
         let native = little_exif::metadata::Metadata::new_from_path(path)
             .or_else(|_| {
                 little_exif::metadata::Metadata::new_from_vec(
@@ -181,9 +185,28 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
                 )
             })
             .ok();
+        let source_orientation = native
+            .as_ref()
+            .and_then(|metadata| {
+                metadata.into_iter().find_map(|tag| match tag {
+                    little_exif::exif_tag::ExifTag::Orientation(value) => value.first().copied(),
+                    _ => None,
+                })
+            })
+            .unwrap_or(1);
+        tracing::debug!(
+            open_ms = opened.as_secs_f64() * 1000.,
+            unpack_ms = (unpacked - opened).as_secs_f64() * 1000.,
+            develop_ms = (processed - unpacked).as_secs_f64() * 1000.,
+            copy_ms = (copied - processed).as_secs_f64() * 1000.,
+            convert_ms = (converted - copied).as_secs_f64() * 1000.,
+            metadata_ms = (started.elapsed() - converted).as_secs_f64() * 1000.,
+            "LibRaw load"
+        );
         Ok(LoadedImage {
             pixels,
             metadata: Metadata {
+                source_orientation,
                 native,
                 ..Default::default()
             },
@@ -193,4 +216,39 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
     }
 }
 
+fn copy_bitmap(pixels: &mut ImageBuf, bytes: &[u8], colors: usize) {
+    let stride = pixels.width as usize * colors * 2;
+    pixels
+        .par_rows_mut()
+        .zip(bytes.par_chunks_exact(stride))
+        .for_each(|(row, source)| {
+            for (dst, src) in row.chunks_exact_mut(3).zip(source.chunks_exact(colors * 2)) {
+                for c in 0..3 {
+                    let v = u16::from_ne_bytes([src[c * 2], src[c * 2 + 1]]) as f32 / 65535f32;
+                    dst[c] = from_f64(v as f64);
+                }
+            }
+        });
+}
+
 use spektrafilm_math::illuminants::white_xyz;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_bitmap_copy_preserves_rgb_samples_and_ignores_extra_channels() {
+        for colors in [3, 4] {
+            let samples: Vec<u16> = (0..35 * 19 * colors).map(|i| (i * 997) as u16).collect();
+            let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let mut pixels = ImageBuf::new(35, 19);
+            copy_bitmap(&mut pixels, &bytes, colors);
+            for (actual, source) in pixels.pixels().zip(samples.chunks_exact(colors)) {
+                for c in 0..3 {
+                    assert_eq!(actual[c], from_f64((source[c] as f32 / 65535f32) as f64));
+                }
+            }
+        }
+    }
+}

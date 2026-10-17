@@ -26,6 +26,7 @@ bzip2 = "0.6"
 tar = "0.4"
 tempfile = "3"
 moxcms = { version = "0.8.1", features = ["extended_range"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 serde_json.workspace = true

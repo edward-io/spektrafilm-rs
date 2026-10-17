@@ -26,6 +26,36 @@ fn success(result: std::process::Output) {
 }
 
 #[test]
+fn process_exports_imported_lightroom_crop_and_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = root().join("crates/spektrafilm-io/tests/fixtures/synthetic.dng");
+    let output = dir.path().join("cropped.tif");
+    let settings = dir.path().join("settings.json");
+    let mut params = RuntimeParams::default();
+    params.debug.deactivate_spatial_effects = true;
+    params.debug.deactivate_stochastic_effects = true;
+    fs::write(&settings, serde_json::to_vec(&params).unwrap()).unwrap();
+    success(cli(&[
+        "process",
+        input.to_str().unwrap(),
+        "--film",
+        "kodak_gold_200",
+        "--paper",
+        "kodak_portra_endura",
+        "--raw-decoder",
+        "rawler",
+        "--lightroom-geometry",
+        r#"{"orientation":6,"crop":[0.25,0,1,0.5],"angle":0}"#,
+        "--params",
+        settings.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]));
+    let image = load(&output, &RawOptions::default()).unwrap().pixels;
+    assert_eq!((image.width, image.height), (16, 24));
+}
+
+#[test]
 fn raw_processing_honors_explicit_input_fields_and_detects_unspecified_fields() {
     let dir = tempfile::tempdir().unwrap();
     let data = root().join("data");

@@ -22,7 +22,7 @@ preserves supported image metadata.
 
 Rawler 0.8 includes Sony ILCE-7M5 support. The user's RAW was checked with rawler,
 LibRaw and Auto and decoded to the active 7008 × 4672 image. LibRaw uses its
-public C API via dynamic loading. Auto tries LibRaw and falls back to rawler.
+public C API via dynamic loading. Auto tries rawler and falls back to LibRaw.
 `SPEKTRAFILM_LIBRAW_LIBRARY` optionally selects an installed LibRaw library.
 
 Default builds include static Lensfun 0.3.4. An installed database is detected,

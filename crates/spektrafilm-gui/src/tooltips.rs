@@ -88,7 +88,7 @@ pub fn inhibition_receiver(donor: &str, receiver: usize) -> &'static str {
 
 pub fn option(name: &str) -> &'static str {
     match name {
-        "auto" => "Try LibRaw first and fall back to rawler if decoding fails.",
+        "auto" => "Try rawler first and fall back to LibRaw if decoding fails.",
         "libraw" => "Decode with an installed LibRaw library, matching the Python RAW workflow.",
         "rawler" => "Decode with the built-in Rust RAW decoder without an external RAW library.",
         "as_shot" | "camera" => "Use the white balance recorded by the camera.",

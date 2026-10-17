@@ -3,6 +3,7 @@ mod color;
 mod lens;
 mod lens_api;
 pub mod lens_database;
+pub mod lightroom;
 mod raw_libraw;
 mod xmp;
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ use std::{fs::File, io::BufWriter, path::Path};
 
 #[derive(Clone, Default)]
 pub struct Metadata {
+    pub source_orientation: u16,
     pub native: Option<little_exif::metadata::Metadata>,
     pub jpeg_segments: Vec<Vec<u8>>,
     pub exif: Option<Vec<u8>>,
@@ -35,6 +37,7 @@ pub struct RawOptions {
     pub tint: f64,
     pub lens_correction: bool,
     pub lens_database: Option<std::path::PathBuf>,
+    pub lightroom_geometry: Option<lightroom::Geometry>,
 }
 impl Default for RawOptions {
     fn default() -> Self {
@@ -45,6 +48,7 @@ impl Default for RawOptions {
             tint: 1.,
             lens_correction: false,
             lens_database: None,
+            lightroom_geometry: None,
         }
     }
 }
@@ -109,6 +113,21 @@ pub fn is_raw(path: &Path) -> bool {
 }
 
 pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
+    let started = std::time::Instant::now();
+    let mut loaded = load_source(path, raw)?;
+    let developed = started.elapsed();
+    if let Some(geometry) = &raw.lightroom_geometry {
+        loaded.pixels = geometry.apply(loaded.pixels, loaded.metadata.source_orientation)?;
+    }
+    tracing::debug!(
+        develop_ms = developed.as_secs_f64() * 1000.,
+        geometry_ms = (started.elapsed() - developed).as_secs_f64() * 1000.,
+        "Image load"
+    );
+    Ok(loaded)
+}
+
+fn load_source(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
     if is_raw(path) {
         if !["auto", "libraw", "rawler"].contains(&raw.decoder.as_str()) {
             bail!("unknown RAW decoder: {}", raw.decoder);
@@ -125,19 +144,18 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
         {
             bail!("RAW temperature and tint must be finite and positive");
         }
-        if raw.decoder == "rawler" {
-            return load_raw(path, raw);
+        if raw.decoder == "libraw" {
+            return raw_libraw::library().and_then(|library| raw_libraw::load(path, raw, library));
         }
-        let libraw_result =
-            raw_libraw::library().and_then(|library| raw_libraw::load(path, raw, library));
-        match libraw_result {
+        match load_raw(path, raw) {
             Ok(image) => return Ok(image),
-            Err(e) if raw.decoder == "libraw" || e.is::<lens::CorrectionFailure>() => {
+            Err(e) if raw.decoder == "rawler" || e.is::<lens::CorrectionFailure>() => {
                 return Err(e);
             }
-            Err(libraw_error) => {
-                return load_raw(path, raw)
-                    .map_err(|rawler_error| raw_fallback_error(rawler_error, libraw_error));
+            Err(rawler_error) => {
+                return raw_libraw::library()
+                    .and_then(|library| raw_libraw::load(path, raw, library))
+                    .map_err(|libraw_error| raw_fallback_error(rawler_error, libraw_error));
             }
         }
     }
@@ -177,7 +195,9 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
     } else {
         (None, None)
     };
+    let orientation = decoder.orientation()?;
     let metadata = Metadata {
+        source_orientation: orientation.to_exif() as u16,
         native: little_exif::metadata::Metadata::new_from_path(path).ok(),
         jpeg_segments: jpeg_metadata_segments(path),
         exif: decoder.exif_metadata()?,
@@ -189,7 +209,6 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
         iptc: decoder.iptc_metadata()?,
     };
     let embedded_icc = decoder.icc_profile()?.or(tiff_icc);
-    let orientation = decoder.orientation()?;
     let mut image = image::DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
     let default_encoded = matches!(extension(path).as_str(), "png" | "jpg" | "jpeg");
@@ -227,6 +246,9 @@ pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
 fn raw_fallback_error(rawler_error: anyhow::Error, libraw_error: anyhow::Error) -> anyhow::Error {
     if rawler_error.is::<lens::CorrectionFailure>() {
         return rawler_error;
+    }
+    if libraw_error.is::<lens::CorrectionFailure>() {
+        return libraw_error;
     }
     anyhow::anyhow!(
         "RAW decoding failed. rawler: {rawler_error:#}. LibRaw: {libraw_error:#}. \
@@ -392,6 +414,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
     Ok(LoadedImage {
         pixels,
         metadata: Metadata {
+            source_orientation: raw.orientation.to_u16(),
             native: little_exif::metadata::Metadata::new_from_path(path)
                 .or_else(|_| {
                     little_exif::metadata::Metadata::new_from_vec(

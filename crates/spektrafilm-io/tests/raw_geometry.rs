@@ -87,6 +87,39 @@ fn rawler_applies_all_exif_orientations_before_clearing_export_orientation() {
 }
 
 #[test]
+fn catalog_geometry_overrides_camera_orientation_without_applying_it_twice() {
+    let normal_path = fixture("catalog-normal", 1, true);
+    let rotated_path = fixture("catalog-rotated", 6, true);
+    let options = RawOptions {
+        decoder: "rawler".into(),
+        ..Default::default()
+    };
+    let baseline = load(&normal_path, &options).unwrap().pixels;
+    let geometry = spektrafilm_io::lightroom::Geometry {
+        orientation: 8,
+        crop: [0.25, 0., 0.75, 0.5],
+        angle: 0.,
+    };
+    let expected = geometry.apply(baseline, 1).unwrap();
+    let loaded = load(
+        &rotated_path,
+        &RawOptions {
+            lightroom_geometry: Some(geometry),
+            ..options
+        },
+    )
+    .unwrap();
+    assert_eq!(loaded.metadata.source_orientation, 6);
+    assert_eq!(
+        (loaded.pixels.width, loaded.pixels.height),
+        (expected.width, expected.height)
+    );
+    assert_eq!(loaded.pixels.data, expected.data);
+    std::fs::remove_file(normal_path).unwrap();
+    std::fs::remove_file(rotated_path).unwrap();
+}
+
+#[test]
 fn inactive_custom_tint_does_not_change_rawler_camera_white_balance() {
     let path = fixture("inactive-tint", 1, false);
     for mode in ["as_shot", "camera", "daylight", "tungsten", "custom"] {
@@ -119,6 +152,57 @@ fn inactive_custom_tint_does_not_change_rawler_camera_white_balance() {
         }
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn auto_prefers_rawler_and_preserves_its_geometry_and_pixels() {
+    let path = fixture("auto-rawler", 6, true);
+    let expected = load(
+        &path,
+        &RawOptions {
+            decoder: "rawler".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let actual = load(&path, &RawOptions::default()).unwrap();
+    assert_eq!(actual.color_space, "sRGB");
+    assert_eq!(actual.encoded, expected.encoded);
+    assert_eq!(
+        actual.metadata.source_orientation,
+        expected.metadata.source_orientation
+    );
+    assert_eq!(
+        (actual.pixels.width, actual.pixels.height),
+        (expected.pixels.width, expected.pixels.height)
+    );
+    assert_eq!(actual.pixels.data, expected.pixels.data);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn auto_reports_both_decoder_failures_and_explicit_rawler_does_not_fall_back() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("missing.dng");
+    let message = format!("{:#}", load(&path, &RawOptions::default()).err().unwrap());
+    assert!(
+        message.contains("RAW decoding failed. rawler:"),
+        "{message}"
+    );
+    assert!(message.contains("LibRaw:"), "{message}");
+    let message = format!(
+        "{:#}",
+        load(
+            &path,
+            &RawOptions {
+                decoder: "rawler".into(),
+                ..Default::default()
+            }
+        )
+        .err()
+        .unwrap()
+    );
+    assert!(!message.contains("LibRaw"), "{message}");
 }
 
 #[test]

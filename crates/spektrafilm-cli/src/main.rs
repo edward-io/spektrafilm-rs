@@ -44,6 +44,9 @@ enum Commands {
         /// Clockwise rotation applied after decoding, before crop / processing.
         #[arg(long, default_value="0", value_parser=clap::value_parser!(u8).range(0..=3))]
         rotate_quarter_turns: u8,
+        /// Geometry imported from Lightroom (JSON); no color adjustments are applied.
+        #[arg(long)]
+        lightroom_geometry: Option<String>,
         /// Output image path.
         #[arg(short, long)]
         output: PathBuf,
@@ -183,6 +186,7 @@ fn main() -> Result<()> {
         Commands::Process {
             input,
             rotate_quarter_turns,
+            lightroom_geometry,
             output,
             film,
             paper,
@@ -225,6 +229,7 @@ fn main() -> Result<()> {
                 lens_correction,
                 lens_database.as_deref(),
                 rotate_quarter_turns,
+                lightroom_geometry.as_deref(),
             )?;
         }
         Commands::ListProfiles { data_dir } => {
@@ -291,6 +296,7 @@ fn cmd_process(
     lens_correction: bool,
     lens_database: Option<&Path>,
     rotate_quarter_turns: u8,
+    lightroom_geometry: Option<&str>,
 ) -> Result<()> {
     let total_start = Instant::now();
 
@@ -350,6 +356,10 @@ fn cmd_process(
             tint,
             lens_correction,
             lens_database: lens_database.map(Path::to_path_buf),
+            lightroom_geometry: lightroom_geometry
+                .map(serde_json::from_str)
+                .transpose()
+                .context("parsing Lightroom geometry")?,
         },
     )?;
     if !input_overrides[0] {

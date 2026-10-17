@@ -362,10 +362,19 @@ mod builtin_tests {
         assert!(!message.contains("install a current LibRaw"), "{message}");
     }
     #[test]
-    fn fallback_preserves_lens_errors_when_libraw_is_unavailable() {
+    fn fallback_preserves_lens_errors_from_either_decoder() {
         let error = crate::raw_fallback_error(
             anyhow::anyhow!("database unavailable").context(CorrectionFailure),
             anyhow::anyhow!("LibRaw is not installed"),
+        );
+        assert!(error.is::<CorrectionFailure>());
+        assert_eq!(
+            format!("{error:#}"),
+            "Lens correction failed: database unavailable"
+        );
+        let error = crate::raw_fallback_error(
+            anyhow::anyhow!("unknown camera"),
+            anyhow::anyhow!("database unavailable").context(CorrectionFailure),
         );
         assert!(error.is::<CorrectionFailure>());
         assert_eq!(
