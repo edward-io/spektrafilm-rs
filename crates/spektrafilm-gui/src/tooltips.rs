@@ -126,7 +126,7 @@ pub fn labeled(
         label.paint_marker(ui, modified);
         attach_help(label.response, help, modified, true);
         if response.changed() {
-            inspector::note_changed(id);
+            inspector::note_changed(id, text.text());
         }
         response
     })
@@ -142,7 +142,8 @@ pub fn checkbox(
     help: &str,
 ) -> Response {
     let text = text.into();
-    let id = inspector::row_id(text.text());
+    let caption = text.text().to_owned();
+    let id = inspector::row_id(&caption);
     let modified = inspector::row_modified(id);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -169,7 +170,7 @@ pub fn checkbox(
         }
         attach_help(label, help, modified, false);
         if response.changed() {
-            inspector::note_changed(id);
+            inspector::note_changed(id, &caption);
         }
         response
     })
@@ -254,7 +255,7 @@ pub fn channels<T: egui::emath::Numeric, const N: usize>(
             .labelled_by(label.id);
         attach_help(label, help, modified, true);
         if response.changed() {
-            inspector::note_changed(id);
+            inspector::note_changed(id, text.text());
         }
         response
     })
@@ -694,8 +695,6 @@ pub const CONTROL_LENS_CORRECTION_LENSFUN: &str =
     "Correct supported lens distortion, color fringing and vignetting using Lensfun profiles.";
 pub const CONTROL_USE_AUTOMATIC_LENSFUN_DATABASE: &str =
     "Clear the chosen folder and discover a local or automatically downloaded lens database.";
-pub const CONTROL_RELOAD_RAW_WITH_THESE_SETTINGS: &str =
-    "Decode the original RAW again using the current decoder, white balance and lens settings.";
 pub const CONTROL_ROTATE: &str =
     "Rotate the source image 90 degrees counterclockwise before processing and export.";
 pub const CONTROL_ROTATE_2: &str =
@@ -762,8 +761,7 @@ pub const SECTION_OUTPUT: &str =
     "Choose direct film scanning, processing resolution and output signal encoding.";
 pub const SECTION_COLOR_AND_PROCESSING: &str =
     "Adjust color spaces, spectral processing, grain structure and source cropping.";
-pub const SECTION_RAW_DEVELOPMENT: &str =
-    "Set how camera RAW data is decoded before the film simulation.";
+pub const SECTION_RAW_DEVELOPMENT: &str = "Set how camera RAW data is decoded before the film simulation. Changes reload the RAW automatically.";
 pub const SECTION_DISPLAY: &str =
     "Control preview layers, comparison, borders, scaling and display animations.";
 pub const SECTION_FILE_EXPORT: &str =
@@ -1000,7 +998,7 @@ mod tests {
         const STOCK: f32 = 0.25;
         let ctx = egui::Context::default();
         let mut value = 0.75f32;
-        let mut frame = |time: f64, events: Vec<egui::Event>, value: &mut f32| {
+        let frame = |time: f64, events: Vec<egui::Event>, value: &mut f32| {
             let mut changed = false;
             let output = ctx.run(
                 egui::RawInput {

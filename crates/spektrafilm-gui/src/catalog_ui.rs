@@ -2,6 +2,7 @@
 //! panel that feeds the selected photo, with its crop, into the editor.
 use crate::{inspector, theme};
 use eframe::egui::{self, RichText};
+use spektrafilm_gpu::scheduler::{Priority, Scheduler, Task};
 use spektrafilm_io::lightroom::{Catalog, Photo, THUMBNAIL_PX};
 use std::{
     collections::{HashMap, HashSet},
@@ -16,6 +17,8 @@ pub enum Action {
 }
 
 pub struct Browser {
+    scheduler: Scheduler,
+    thumbnail_task: Task,
     path: PathBuf,
     catalog: Option<Catalog>,
     loading: Option<mpsc::Receiver<Result<Catalog, String>>>,
@@ -28,9 +31,21 @@ pub struct Browser {
     pending_thumbnails: HashSet<i64>,
     thumbnail_tx: mpsc::SyncSender<(i64, PathBuf, u16)>,
     thumbnail_rx: mpsc::Receiver<(i64, Option<image::RgbaImage>)>,
+    /// Photos with settings saved in Spektrafilm, marked in the list.
+    pub edited: HashSet<i64>,
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        self.thumbnail_task.cancel();
+    }
 }
 
 impl Browser {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub(super) fn source_thumbnail(
         &mut self,
         ctx: &egui::Context,
@@ -72,17 +87,23 @@ impl Browser {
         );
     }
 
-    pub fn open(path: PathBuf, ctx: &egui::Context) -> Self {
+    pub fn open(path: PathBuf, ctx: &egui::Context, scheduler: &Scheduler) -> Self {
         let (thumbnail_tx, requests) = mpsc::sync_channel::<(i64, PathBuf, u16)>(24);
         let (results, thumbnail_rx) = mpsc::channel();
         let repaint = ctx.clone();
+        let thumbnail_task = scheduler.task(Priority::Background);
+        let task = thumbnail_task.clone();
         std::thread::spawn(move || {
+            let _scope = task.enter();
             while let Ok((id, path, orientation)) = requests.recv() {
-                let image = std::panic::catch_unwind(|| {
-                    spektrafilm_io::lightroom::thumbnail(&path, orientation)
-                })
-                .ok()
-                .and_then(Result::ok);
+                let image = {
+                    let Ok(_cpu) = task.cpu() else { break };
+                    std::panic::catch_unwind(|| {
+                        spektrafilm_io::lightroom::thumbnail(&path, orientation)
+                    })
+                    .ok()
+                    .and_then(Result::ok)
+                };
                 if results.send((id, image)).is_err() {
                     break;
                 }
@@ -90,6 +111,8 @@ impl Browser {
             }
         });
         let mut browser = Self {
+            scheduler: scheduler.clone(),
+            thumbnail_task,
             path,
             catalog: None,
             loading: None,
@@ -102,6 +125,7 @@ impl Browser {
             pending_thumbnails: HashSet::new(),
             thumbnail_tx,
             thumbnail_rx,
+            edited: HashSet::new(),
         };
         browser.refresh(ctx);
         browser
@@ -114,8 +138,12 @@ impl Browser {
         let path = self.path.clone();
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
+        let task = self.scheduler.task(Priority::Interactive);
         std::thread::spawn(move || {
-            let result = Catalog::open(&path).map_err(|e| format!("{e:#}"));
+            let result = task
+                .cpu()
+                .map_err(|e| e.to_string())
+                .and_then(|_cpu| Catalog::open(&path).map_err(|e| format!("{e:#}")));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -297,6 +325,9 @@ impl Browser {
         let Some(catalog) = &self.catalog else {
             return action;
         };
+        if let Some(warning) = catalog.compatibility_warning() {
+            notice(ui, ui.visuals().warn_fg_color, &warning);
+        }
         let unavailable = catalog_stats.map_or(0, |(_, _, u)| u);
         if unavailable > 0 {
             notice(
@@ -416,6 +447,7 @@ impl Browser {
                     frame,
                     caption_height,
                     self.selected == Some(index),
+                    self.edited.contains(&photo.id),
                 );
                 if response.clicked() {
                     response.surrender_focus();
@@ -448,21 +480,21 @@ fn thumbnail_cell(
     frame_size: egui::Vec2,
     caption_height: f32,
     selected: bool,
+    edited: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         frame_size + egui::vec2(0.0, caption_height),
         egui::Sense::click(),
     );
     let name = photo.path.file_name().unwrap_or_default().to_string_lossy();
-    let response = response.on_hover_text(if photo.copy_name.is_empty() {
-        photo.path.display().to_string()
-    } else {
-        format!(
-            "{}\nVirtual copy: {}",
-            photo.path.display(),
-            photo.copy_name
-        )
-    });
+    let mut hover = photo.path.display().to_string();
+    if !photo.copy_name.is_empty() {
+        hover += &format!("\nVirtual copy: {}", photo.copy_name);
+    }
+    if edited {
+        hover += "\nEdited in Spektrafilm";
+    }
+    let response = response.on_hover_text(hover);
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -519,6 +551,16 @@ fn thumbnail_cell(
             c,
             4.5,
             color,
+            egui::Stroke::new(1.5, egui::Color32::from_black_alpha(160)),
+        );
+    }
+    if edited {
+        // Accent dot, matching the inspector's "changed" marker.
+        let c = frame.right_bottom() + egui::vec2(-10.0, -10.0);
+        painter.circle(
+            c,
+            4.5,
+            theme::ACCENT,
             egui::Stroke::new(1.5, egui::Color32::from_black_alpha(160)),
         );
     }
@@ -580,16 +622,21 @@ mod tests {
         for width in [210.0, 260.0, 333.0, 480.0] {
             let ctx = egui::Context::default();
             crate::theme::apply(&ctx);
-            let mut browser = Browser::open(PathBuf::from("/missing/catalog.lrcat"), &ctx);
+            let mut browser = Browser::open(
+                PathBuf::from("/missing/catalog.lrcat"),
+                &ctx,
+                &Scheduler::default(),
+            );
             browser.loading = None;
             browser.catalog = Some(Catalog {
                 path: PathBuf::new(),
                 photos: photos(60),
+                schema_version: Some("9999999".into()),
             });
             browser.filter();
             let mut panel_width = 0.0;
             for frame in 0..6 {
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -617,9 +664,14 @@ mod tests {
     #[test]
     fn accepted_filter_and_navigation_use_catalog_flags() {
         let ctx = egui::Context::default();
-        let mut browser = Browser::open(PathBuf::from("/missing/catalog.lrcat"), &ctx);
+        let mut browser = Browser::open(
+            PathBuf::from("/missing/catalog.lrcat"),
+            &ctx,
+            &Scheduler::default(),
+        );
         browser.catalog = Some(Catalog {
             path: PathBuf::new(),
+            schema_version: Some("1504001".into()),
             photos: [1, 0, -1, 1, 1]
                 .into_iter()
                 .enumerate()

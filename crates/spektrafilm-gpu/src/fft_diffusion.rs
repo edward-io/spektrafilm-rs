@@ -344,6 +344,7 @@ fn build_at_shape(
 }
 
 pub(super) fn apply(b: &WgpuBackend, image: &ImageBuf, plan: &crate::DiffusionGpuPlan) -> ImageBuf {
+    let _gpu = crate::scheduler::gpu_permit();
     let size = [image.width, image.height];
     let bytes = image.pixel_count() as u64 * 12;
     let source = spatial::buffer(b, size);

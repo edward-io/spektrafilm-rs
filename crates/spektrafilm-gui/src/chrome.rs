@@ -24,6 +24,7 @@ const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key
 const ROTATE_LEFT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
 const ROTATE_RIGHT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 const SPLIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Y);
+const APPLY_PREVIOUS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::P);
 const FULL_SCREEN: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::CTRL), Key::F);
 /// Plain F, which is also what arrives for macOS fn/Globe+F: the fn key itself
@@ -130,7 +131,7 @@ impl App {
                 Ok(()) => format!("Opened project {}", path.display()),
                 Err(e) => format!("Open project error: {e:#}"),
             };
-            self.history.reset(self.snapshot());
+            self.rebase_history();
         }
     }
 
@@ -162,7 +163,10 @@ impl App {
         if let Ok(film) = profile::load_profile_by_name(&self.data_dir, &self.film_name) {
             spektrafilm_core::pipeline::apply_stock_defaults(&film, &mut self.params);
         }
-        self.raw_options = Default::default();
+        self.raw_options = spektrafilm_io::RawOptions {
+            lightroom_geometry: self.raw_options.lightroom_geometry.clone(),
+            ..Default::default()
+        };
         self.save_options = Default::default();
         self.pipeline_cache = None;
         self.pipeline_cache_key = None;
@@ -213,7 +217,7 @@ impl App {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: history::Snapshot) {
+    pub(crate) fn apply_snapshot(&mut self, snapshot: history::Snapshot) {
         let params = match serde_json::from_value::<RuntimeParams>((*snapshot.params).clone()) {
             Ok(params) => params,
             Err(e) => {
@@ -236,24 +240,24 @@ impl App {
         self.pending_dirty = self.render_job.is_some();
     }
 
-    fn undo(&mut self) {
-        match self.history.undo(self.snapshot()) {
-            Some(s) => {
-                self.apply_snapshot(s);
-                self.status = "Undo".into();
-            }
-            None => self.status = "Nothing to undo".into(),
-        }
+    pub(crate) fn undo(&mut self) {
+        self.record_step();
+        let Some(label) = self.history.undo_label().map(str::to_owned) else {
+            self.status = "Nothing to undo".into();
+            return;
+        };
+        self.go_to_step(|h| h.undo());
+        self.status = format!("Undo {label}");
     }
 
-    fn redo(&mut self) {
-        match self.history.redo(self.snapshot()) {
-            Some(s) => {
-                self.apply_snapshot(s);
-                self.status = "Redo".into();
-            }
-            None => self.status = "Nothing to redo".into(),
-        }
+    pub(crate) fn redo(&mut self) {
+        self.record_step();
+        let Some(label) = self.history.redo_label().map(str::to_owned) else {
+            self.status = "Nothing to redo".into();
+            return;
+        };
+        self.go_to_step(|h| h.redo());
+        self.status = format!("Redo {label}");
     }
 
     /// Stock defaults for the current film: what resets restore and where the
@@ -291,12 +295,11 @@ impl App {
         self.params_json = Arc::new(serde_json::to_value(&self.params).unwrap_or_default());
         let idle = !ctx.input(|i| i.pointer.any_down()) && !ctx.wants_keyboard_input();
         if idle {
-            self.history.observe(self.snapshot());
+            self.record_step();
         }
         let baseline = self.baseline_json();
         inspector::begin_frame(
             self.tab,
-            self.display.show_advanced,
             self.params_json.clone(),
             baseline,
             self.learned_rows.clone(),
@@ -310,15 +313,20 @@ impl App {
             return;
         }
         let mut after = serde_json::to_value(&self.params).unwrap_or_default();
-        if let [id] = out.changed[..] {
+        if let [(id, caption)] = &out.changed[..] {
             let pointers = inspector::diff_pointers(&self.params_json, &after);
             if !pointers.is_empty() {
-                Arc::make_mut(&mut self.learned_rows).insert(id, pointers);
+                for pointer in &pointers {
+                    self.pointer_captions
+                        .insert(pointer.clone(), caption.clone());
+                }
+                Arc::make_mut(&mut self.learned_rows).insert(*id, pointers);
             }
         }
         if out.resets.is_empty() {
             return;
         }
+        self.pending_label = Some("Reset to stock default".into());
         let baseline = self.baseline_json();
         for pointers in &out.resets {
             inspector::reset_pointers(&mut after, &baseline, pointers);
@@ -391,6 +399,9 @@ impl App {
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            if pressed(&APPLY_PREVIOUS) && self.image.is_some() {
+                self.apply_previous_edit();
             }
             if pressed(&SPLIT) {
                 self.display.compare_split = !self.display.compare_split;
@@ -508,26 +519,99 @@ impl App {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    ui.set_min_width(200.0);
+                    ui.set_min_width(240.0);
+                    let undo = self
+                        .history
+                        .undo_label()
+                        .map_or("Undo".into(), |label| format!("Undo {label}"));
                     if ui
                         .add_enabled(
                             self.history.can_undo(),
-                            egui::Button::new("Undo").shortcut_text(shortcut(&UNDO)),
+                            egui::Button::new(undo).shortcut_text(shortcut(&UNDO)),
                         )
                         .clicked()
                     {
                         ui.close_menu();
                         self.undo();
                     }
+                    let redo = self
+                        .history
+                        .redo_label()
+                        .map_or("Redo".into(), |label| format!("Redo {label}"));
                     if ui
                         .add_enabled(
                             self.history.can_redo(),
-                            egui::Button::new("Redo").shortcut_text(shortcut(&REDO)),
+                            egui::Button::new(redo).shortcut_text(shortcut(&REDO)),
                         )
                         .clicked()
                     {
                         ui.close_menu();
                         self.redo();
+                    }
+                });
+                ui.menu_button("Photo", |ui| {
+                    ui.set_min_width(240.0);
+                    let has_image = self.image.is_some();
+                    if ui
+                        .add_enabled(
+                            has_image && self.previous_edit.is_some(),
+                            egui::Button::new("Apply previous settings")
+                                .shortcut_text(shortcut(&APPLY_PREVIOUS)),
+                        )
+                        .on_hover_text(
+                            "Give this photo the look of the photo you viewed before it \
+                             (not its rotation or RAW options). Undoable.",
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.apply_previous_edit();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_image, egui::Button::new("Copy settings"))
+                        .on_hover_text("Copy this photo's film, paper and settings.")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.copy_photo_edit();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_image && self.copied_edit.is_some(),
+                            egui::Button::new("Paste settings"),
+                        )
+                        .on_hover_text(
+                            "Apply the copied film, paper and settings to this photo \
+                             (not its rotation or RAW options).",
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.paste_photo_edit();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_image, egui::Button::new("Reset to defaults"))
+                        .on_hover_text(
+                            "Return this photo to your startup defaults (or factory settings). \
+                             Undoable.",
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.reset_photo_edit();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.history.steps().len() > 1,
+                            egui::Button::new("Clear history"),
+                        )
+                        .on_hover_text("Forget this photo's history, keeping its current look.")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.clear_history();
                     }
                 });
                 ui.menu_button("View", |ui| {
@@ -611,11 +695,6 @@ impl App {
                     ui.separator();
                     ui.checkbox(&mut self.auto_preview, "Auto preview")
                         .on_hover_text(tooltips::CONTROL_AUTO_PREVIEW);
-                    ui.checkbox(&mut self.display.show_advanced, "Show advanced controls")
-                        .on_hover_text(
-                            "Show expert parameters: emulsion physics, inhibition matrices, \
-                             spectral LUTs and other parity controls.",
-                        );
                     ui.separator();
                     ui.checkbox(&mut self.display.show_border, "Print border")
                         .on_hover_text(tooltips::CONTROL_WHITE_BORDER_LAYER);
@@ -1197,6 +1276,105 @@ impl App {
             });
     }
 
+    /// The History panel at the foot of the sidebar: collapsed by default,
+    /// newest step first, click a step to go back to it.
+    pub(crate) fn history_panel(&mut self, ui: &mut egui::Ui) {
+        let id = ui.make_persistent_id("history-panel");
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let count = self.history.steps().len().saturating_sub(1);
+        let header = ui.horizontal(|ui| {
+            state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+            let label = ui.add(
+                egui::Label::new(inspector::title("History").size(14.0))
+                    .sense(egui::Sense::click())
+                    .selectable(false),
+            );
+            if label.clicked() {
+                state.toggle(ui);
+            }
+            ui.label(
+                RichText::new(count.to_string())
+                    .small()
+                    .color(theme::TEXT_WEAK),
+            );
+            if state.is_open() && count > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Clear")
+                        .on_hover_text("Forget this photo's history, keeping its current look.")
+                        .clicked()
+                    {
+                        self.clear_history();
+                    }
+                });
+            }
+        });
+        let mut jump = None;
+        state.show_body_unindented(ui, |ui| {
+            let now = history::now();
+            let position = self.history.position();
+            // The panel sizes itself from last frame's content, so ask for the
+            // list's full height (up to the cap) rather than shrinking into it.
+            let row = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+            let height = (self.history.steps().len() as f32 * row).min(220.0);
+            egui::ScrollArea::vertical()
+                .id_salt("history-steps")
+                .max_height(220.0)
+                .min_scrolled_height(height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (index, step) in self.history.steps().iter().enumerate().rev() {
+                        let current = index == position;
+                        let color = if current {
+                            theme::TEXT
+                        } else if index > position {
+                            theme::TEXT_FAINT
+                        } else {
+                            theme::TEXT_CAPTION
+                        };
+                        let row = ui.horizontal(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 18.0), egui::Sense::hover());
+                            if current {
+                                ui.painter().circle_filled(dot.center(), 3.0, theme::ACCENT);
+                            }
+                            let label = ui.add(
+                                egui::Label::new(RichText::new(&step.label).color(color))
+                                    .truncate()
+                                    .sense(egui::Sense::click())
+                                    .selectable(false),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(relative_time(now, step.at))
+                                            .small()
+                                            .color(theme::TEXT_FAINT),
+                                    );
+                                },
+                            );
+                            label
+                        });
+                        let label = row.inner.on_hover_text(if index > position {
+                            "Undone. Click to redo up to here; a new edit discards it."
+                        } else {
+                            "Click to go back to this step."
+                        });
+                        if label.clicked() && !current {
+                            jump = Some(index);
+                        }
+                    }
+                });
+        });
+        state.store(ui.ctx());
+        let _ = header;
+        if let Some(index) = jump {
+            self.go_to_step(|h| h.jump(index));
+        }
+    }
+
     fn timing_report(&self) -> String {
         format!(
             "Render {:.1} ms ({})\nPipeline build {:.1} ms\nClone / scale {:.1} / {:.1} ms\nPreview pack {:.1} ms\nWorker total {:.1} ms\nBackend: {}\nExecution: {}",
@@ -1373,6 +1551,17 @@ fn stock_picker(
     );
     ui.add_space(4.0);
     changed
+}
+
+/// "now", "5 min ago", "3 h ago", "2 d ago".
+fn relative_time(now: u64, at: u64) -> String {
+    let seconds = now.saturating_sub(at);
+    match seconds {
+        0..60 => "now".into(),
+        60..3600 => format!("{} min ago", seconds / 60),
+        3600..86_400 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
 }
 
 fn toggle_full_screen(ctx: &egui::Context) {

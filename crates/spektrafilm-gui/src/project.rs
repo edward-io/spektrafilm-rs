@@ -19,8 +19,6 @@ pub struct DisplayParams {
     pub split_position: f32,
     pub white_padding: f32,
     pub output_interpolation: String,
-    /// Reveal expert parameters in the inspector.
-    pub show_advanced: bool,
 }
 impl Default for DisplayParams {
     fn default() -> Self {
@@ -38,7 +36,6 @@ impl Default for DisplayParams {
             split_position: 0.5,
             white_padding: 0.03,
             output_interpolation: "linear".into(),
-            show_advanced: false,
         }
     }
 }
@@ -147,6 +144,12 @@ impl Project {
     }
 }
 pub fn default_path() -> PathBuf {
+    // Tests must never read or write a real user's startup defaults.
+    if cfg!(test) {
+        return std::env::temp_dir()
+            .join(format!("spektrafilm-test-defaults-{}", std::process::id()))
+            .join("defaults.json");
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

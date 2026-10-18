@@ -69,11 +69,14 @@ impl App {
         let film = self.film_name.clone();
         let paper = self.print_name.clone();
         let (tx, rx) = mpsc::channel();
+        let task = self.scheduler.task(Priority::Export);
         std::thread::Builder::new()
             .name("spektrafilm-calibration".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> Result<Output, String> {
+                        let _scope = task.enter();
+                        let _cpu = task.cpu().map_err(|e| e.to_string())?;
                         let film = profile::load_profile_by_name(&data, &film)
                             .map_err(|e| e.to_string())?;
                         match action {

@@ -1,7 +1,7 @@
 //! Read-only Lightroom Classic catalog import. Develop settings are data, never Lua code.
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use spektrafilm_math::{image::ImageBuf, precision::from_f64};
 use std::{
@@ -24,9 +24,24 @@ pub struct Photo {
 pub struct Catalog {
     pub path: PathBuf,
     pub photos: Vec<Photo>,
+    /// Adobe's internal database version, not the Lightroom application version.
+    pub schema_version: Option<String>,
 }
 
 impl Catalog {
+    pub fn compatibility_warning(&self) -> Option<String> {
+        match self.schema_version.as_deref() {
+            Some("1500000" | "1504001") => None,
+            Some(version) => Some(format!(
+                "Catalog schema {version} is untested. Flags and crop/rotation may be interpreted differently."
+            )),
+            None => Some(
+                "Catalog schema version is unavailable. Flags and crop/rotation compatibility is unverified."
+                    .into(),
+            ),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open_with_flags(
             path,
@@ -37,7 +52,28 @@ impl Catalog {
         connection.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")?;
         // A read transaction keeps paths, flags and Develop settings in one consistent snapshot.
         let transaction = connection.transaction()?;
-        // shortcut: Lightroom's internal schema is version dependent; validate new layouts when Adobe changes these tables.
+        let has_version_columns: bool = transaction.query_row(
+            "SELECT count(*) = 2 FROM pragma_table_info('Adobe_variablesTable')
+             WHERE lower(name) IN ('name', 'value')",
+            [],
+            |row| row.get(0),
+        )?;
+        let schema_version: Option<String> = if has_version_columns {
+            transaction
+                .query_row(
+                    "SELECT CAST(value AS TEXT) FROM Adobe_variablesTable
+                     WHERE name = 'Adobe_DBVersion' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("reading Lightroom catalog schema version")?
+                .flatten()
+                .filter(|version: &String| !version.trim().is_empty())
+        } else {
+            None
+        };
+        // Preparing this query checks every required table and column before reading photos.
         let mut statement = transaction
             .prepare(
                 "SELECT i.id_local, r.absolutePath, fo.pathFromRoot, f.idx_filename,
@@ -51,7 +87,12 @@ impl Catalog {
              WHERE i.fileFormat != 'VIDEO'
              ORDER BY i.captureTime, f.idx_filename, i.id_local",
             )
-            .context("unsupported Lightroom Classic catalog layout")?;
+            .with_context(|| {
+                format!(
+                    "Unsupported Lightroom Classic catalog layout (schema {}): required photo, flag or crop data is unavailable",
+                    schema_version.as_deref().unwrap_or("unknown")
+                )
+            })?;
         let mut photos = statement
             .query_map([], |row| {
                 let root: String = row.get(1)?;
@@ -95,6 +136,7 @@ impl Catalog {
         Ok(Self {
             path: path.to_path_buf(),
             photos,
+            schema_version,
         })
     }
 }
@@ -161,10 +203,8 @@ impl Geometry {
         } else {
             1
         };
-        if self.crop == [0., 0., 1., 1.]
-            && self.angle == 0.
-            && self.orientation == source_orientation
-        {
+        let orientation_only = self.crop == [0., 0., 1., 1.] && self.angle == 0.;
+        if orientation_only && self.orientation == source_orientation {
             return Ok(image);
         }
         let (w, h) = if source_orientation >= 5 {
@@ -206,6 +246,12 @@ impl Geometry {
                         oh as f64,
                         inverse,
                     );
+                    // Rotations and flips without a crop do not need interpolation.
+                    if orientation_only {
+                        let [sx, sy] = orient([u, v], w, h, source_orientation);
+                        pixel.copy_from_slice(&image.get(sx as u32, sy as u32));
+                        continue;
+                    }
                     let (u, v) = (
                         (u / width as f64 - 0.5) * cw,
                         (v / height as f64 - 0.5) * ch,
@@ -390,6 +436,57 @@ mod tests {
         }
     }
     #[test]
+    fn orientation_only_preserves_every_sample_for_all_source_and_catalog_orientations() {
+        let image = ImageBuf::from_data(
+            7,
+            5,
+            (0..7 * 5 * 3)
+                .map(|v| from_f64(v as f64 / 3. - 10.))
+                .collect(),
+        );
+        let oriented = |orientation| {
+            let (w, h) = if orientation >= 5 { (5, 7) } else { (7, 5) };
+            let mut out = ImageBuf::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let (sx, sy) = match orientation {
+                        2 => (6 - x, y),
+                        3 => (6 - x, 4 - y),
+                        4 => (x, 4 - y),
+                        5 => (y, x),
+                        6 => (y, 4 - x),
+                        7 => (6 - y, 4 - x),
+                        8 => (6 - y, x),
+                        _ => (x, y),
+                    };
+                    out.set(x, y, image.get(sx, sy));
+                }
+            }
+            out
+        };
+        for source in 1..=8 {
+            for catalog in 1..=8 {
+                let output = Geometry {
+                    orientation: catalog,
+                    crop: [0., 0., 1., 1.],
+                    angle: 0.,
+                }
+                .apply(oriented(source), source)
+                .unwrap();
+                let expected = oriented(catalog);
+                assert_eq!(
+                    (output.width, output.height),
+                    (expected.width, expected.height)
+                );
+                assert_eq!(
+                    output.data, expected.data,
+                    "source={source}, catalog={catalog}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn straightened_crop_resolves_the_rotated_diagonal() {
         let image = ImageBuf::from_data(
             10,
@@ -448,6 +545,78 @@ mod tests {
         assert!(Catalog::open(&missing).is_err());
         assert!(!missing.exists());
     }
+    #[test]
+    fn catalog_schema_check_warns_for_untested_versions_and_rejects_incompatible_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("compatibility.lrcat");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE Adobe_images(id_local INTEGER, rootFile INTEGER, copyName TEXT, pick REAL, orientation TEXT, fileFormat TEXT, captureTime TEXT);
+             CREATE TABLE AgLibraryFile(id_local INTEGER, folder INTEGER, idx_filename TEXT);
+             CREATE TABLE AgLibraryFolder(id_local INTEGER, rootFolder INTEGER, pathFromRoot TEXT);
+             CREATE TABLE AgLibraryRootFolder(id_local INTEGER, absolutePath TEXT);
+             CREATE TABLE Adobe_imageDevelopSettings(image INTEGER, text TEXT);
+             CREATE TABLE Adobe_variablesTable(name TEXT, value);",
+        )
+        .unwrap();
+        for version in [
+            Some("1500000"),
+            Some("1504001"),
+            Some("9999999"),
+            Some(""),
+            None,
+        ] {
+            db.execute("DELETE FROM Adobe_variablesTable", []).unwrap();
+            if let Some(version) = version {
+                db.execute(
+                    "INSERT INTO Adobe_variablesTable VALUES ('Adobe_DBVersion', ?1)",
+                    [version],
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let catalog = Catalog::open(&path).unwrap();
+            assert_eq!(
+                catalog.schema_version.as_deref(),
+                version.filter(|v| !v.is_empty())
+            );
+            let warning = catalog.compatibility_warning();
+            assert_eq!(
+                warning.is_none(),
+                matches!(version, Some("1500000" | "1504001"))
+            );
+            if version == Some("9999999") {
+                assert!(warning.unwrap().contains("9999999"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        db.execute_batch("DROP TABLE Adobe_variablesTable").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let catalog = Catalog::open(&path).unwrap();
+        assert!(catalog.schema_version.is_none());
+        assert!(catalog.compatibility_warning().is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        db.execute_batch(
+            "CREATE TABLE Adobe_variablesTable(name TEXT, value);
+             INSERT INTO Adobe_variablesTable VALUES ('Adobe_DBVersion', 1504001);
+             ALTER TABLE Adobe_images DROP COLUMN pick;",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = Catalog::open(&path).err().expect("missing pick must fail");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("schema 1504001") && error.contains("pick"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        db.execute_batch("DROP TABLE Adobe_images").unwrap();
+        let error = Catalog::open(&path).err().expect("missing table must fail");
+        assert!(format!("{error:#}").contains("Adobe_images"));
+    }
+
     #[test]
     fn inspect_catalog_if_requested() {
         let Some(path) = std::env::var_os("SPEKTRAFILM_TEST_LIGHTROOM_CATALOG") else {

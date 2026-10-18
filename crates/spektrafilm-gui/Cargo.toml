@@ -30,6 +30,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.15"
+rusqlite = { version = "0.37", features = ["bundled"] }
 rayon.workspace = true
 bytemuck = { version = "1.25", features = ["derive"] }
 raw-window-handle = "0.6"

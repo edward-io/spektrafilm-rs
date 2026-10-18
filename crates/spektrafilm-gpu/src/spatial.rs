@@ -376,6 +376,7 @@ pub(super) fn halation(
 }
 
 pub(super) fn gaussian_multi(b: &WgpuBackend, image: &ImageBuf, sigmas: &[f32]) -> Vec<ImageBuf> {
+    let _gpu = crate::scheduler::gpu_permit();
     if sigmas.is_empty() {
         return vec![];
     }
@@ -425,6 +426,7 @@ pub(super) fn apply(
     image: &ImageBuf,
     build: impl FnOnce(&wgpu::Buffer, &wgpu::Buffer, [u32; 2]) -> State,
 ) -> ImageBuf {
+    let _gpu = crate::scheduler::gpu_permit();
     let size = [image.width, image.height];
     let bytes = image.pixel_count() as u64 * 12;
     let src = buffer(b, size);

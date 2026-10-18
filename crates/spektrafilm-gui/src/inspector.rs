@@ -73,12 +73,11 @@ impl Stages {
 #[derive(Default)]
 struct Frame {
     tab: Tab,
-    advanced: bool,
     current: Arc<Value>,
     baseline: Arc<Value>,
     learned: Arc<HashMap<Id, Vec<String>>>,
     section: String,
-    changed: Vec<Id>,
+    changed: Vec<(Id, String)>,
     resets: Vec<Vec<String>>,
 }
 
@@ -88,13 +87,13 @@ thread_local! {
 
 /// What the panel did this frame, for the app to apply after drawing.
 pub struct FrameOutput {
-    pub changed: Vec<Id>,
+    /// Rows changed this frame, with their captions.
+    pub changed: Vec<(Id, String)>,
     pub resets: Vec<Vec<String>>,
 }
 
 pub fn begin_frame(
     tab: Tab,
-    advanced: bool,
     current: Arc<Value>,
     baseline: Arc<Value>,
     learned: Arc<HashMap<Id, Vec<String>>>,
@@ -102,7 +101,6 @@ pub fn begin_frame(
     FRAME.with_borrow_mut(|f| {
         *f = Frame {
             tab,
-            advanced,
             current,
             baseline,
             learned,
@@ -152,8 +150,8 @@ pub fn row_stock_modified() -> Option<bool> {
     ROW.get().1
 }
 
-pub fn note_changed(id: Id) {
-    FRAME.with_borrow_mut(|f| f.changed.push(id));
+pub fn note_changed(id: Id, caption: &str) {
+    FRAME.with_borrow_mut(|f| f.changed.push((id, caption.to_owned())));
 }
 
 /// Whether a learned row differs from the stock default.
@@ -221,10 +219,10 @@ pub fn title(text: &str) -> RichText {
     RichText::new(text).family(egui::FontFamily::Name(theme::SEMIBOLD.into()))
 }
 
-/// A collapsible inspector section. Filters itself by tab and the advanced
-/// toggle, hosts its enable checkbox in the header, greys its body when the
-/// stage is off or unused by the workflow, and offers a reset when any of its
-/// parameters differ from the stock default.
+/// A collapsible inspector section. Filters itself by tab, hosts its enable
+/// checkbox in the header, fades its body when the stage is off or unused by
+/// the workflow, and offers a reset when any of its parameters differ from the
+/// stock default.
 pub struct Section<'a> {
     title: &'a str,
     tab: Option<Tab>,
@@ -233,7 +231,6 @@ pub struct Section<'a> {
     active: Option<(bool, &'a str)>,
     unused: Option<&'a str>,
     pointers: &'a [&'a str],
-    advanced: bool,
     nested: bool,
 }
 
@@ -247,7 +244,6 @@ impl<'a> Section<'a> {
             active: None,
             unused: None,
             pointers: &[],
-            advanced: false,
             nested: false,
         }
     }
@@ -279,18 +275,12 @@ impl<'a> Section<'a> {
         self.pointers = pointers;
         self
     }
-    /// Only shown when "Show advanced controls" is on.
-    pub fn advanced(mut self) -> Self {
-        self.advanced = true;
-        self
-    }
-
     /// Draw the section. Returns `true` when the header checkbox was toggled;
     /// the caller flips its own `active` flag so the body closure can keep its
     /// mutable borrow of the same struct.
     pub fn show(self, ui: &mut Ui, add_body: impl FnOnce(&mut Ui)) -> bool {
-        let (tab, show_advanced) = FRAME.with_borrow(|f| (f.tab, f.advanced));
-        if self.tab.is_some_and(|t| t != tab) || (self.advanced && !show_advanced) {
+        let tab = FRAME.with_borrow(|f| f.tab);
+        if self.tab.is_some_and(|t| t != tab) {
             return false;
         }
         let pointers: Vec<String> = self.pointers.iter().map(|p| p.to_string()).collect();

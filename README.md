@@ -103,8 +103,11 @@ Imported geometry is retained in saved Spektrafilm projects and full-resolution
 GPU/CPU exports. Camera previews are used only as browser thumbnails.
 
 Adobe lens and perspective corrections are not reproduced; affected photos
-show a warning because their framing can differ. The importer targets the
-current Lightroom Classic catalog layout; unsupported layouts report an error.
+show a warning because their framing can differ. The importer has been tested
+with internal catalog schema versions `1500000` and `1504001` (these are not
+Lightroom application versions). Required tables and columns are checked before
+reading photos. Untested or missing schema versions show a compatibility warning;
+incompatible layouts report an error that includes the detected schema version.
 The photo list is virtualized, thumbnails load in the background, and recently
 developed images use a bounded memory cache for faster revisits.
 
@@ -146,14 +149,19 @@ Set **Preview long edge (px)** in the right sidebar to change preview size.
 This is independent of the simplified-effect preview mode: the default is 2048
 pixels on the long edge, dropping to at most 640 while dragging a control.
 Scaled inputs are cached, and releasing the control refines the preview.
-Auto preview can be disabled for manual rendering. RAW decoder, white-balance
-and lens settings take effect with **Reload RAW with these settings**. Lens
-correction reports whether the database is downloaded, installed locally or not
+Current-image loading, edits and display preparation take priority over exports
+and background catalog thumbnails. CPU and wgpu work use separate scheduling
+lanes. A waiting foreground render can interrupt a wgpu export between processing
+stages, with intermediate buffers retained on the GPU. A running stage still
+finishes first; no speculative image preloading is enabled.
+Auto preview can be disabled for manual rendering. Changing the RAW decoder,
+white balance or lens settings automatically reloads the RAW in the background.
+Lens correction reports whether the database is downloaded, installed locally or not
 downloaded yet. Hover over an available database's status to see its location.
 The first download requires internet access; subsequent loads use the cache offline.
 Projects retain the RAW settings that produced the loaded image; pending RAW
-edits become part of the project after Reload. Image paths remain valid when
-the project is saved in another folder.
+edits become part of the project after a successful reload. Image paths remain
+valid when the project is saved in another folder.
 
 **Save preview** writes the bounded preview. **Export** renders the original at
 full resolution on the GPU; disable GPU export under File export for the f64

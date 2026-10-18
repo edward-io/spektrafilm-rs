@@ -7,6 +7,7 @@
 //! compression-agnostic. The production `"xy"` radial compressor and inspection `"oklch"` variant
 //! are both available.
 
+use rayon::prelude::*;
 use spektrafilm_math::spectral::{self, CMF_X_F64, CMF_Y_F64, CMF_Z_F64, TcLut};
 
 use crate::gamut_compression::reinhard_knee;
@@ -209,8 +210,9 @@ impl InputGamutCompress {
         let ch = lut.channels;
         let inv = 1.0 / (size as f64 - 1.0);
         let mut data = vec![0.0f64; size * size * ch];
-        for i in 0..size {
-            for j in 0..size {
+        let row_len = (size * ch).max(1);
+        let write_row = |(i, row): (usize, &mut [f64])| {
+            for (j, cell) in row.chunks_exact_mut(ch).enumerate() {
                 // Step 1: tc cell → CIE xy.
                 let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
                 // Step 2: compress.
@@ -224,9 +226,18 @@ impl InputGamutCompress {
                 // Step 4: bilinear sample original LUT at (tx, ty) grid coords.
                 let sample =
                     bilinear_sample(lut, tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
-                let base = (i * size + j) * ch;
-                data[base..base + ch].copy_from_slice(&sample[..ch]);
+                cell.copy_from_slice(&sample[..ch]);
             }
+        };
+        if self.oklch {
+            // OKLCH lazily builds its own parallel lookup table.
+            data.chunks_exact_mut(row_len)
+                .enumerate()
+                .for_each(write_row);
+        } else {
+            data.par_chunks_exact_mut(row_len)
+                .enumerate()
+                .for_each(write_row);
         }
         TcLut {
             size,
@@ -325,6 +336,48 @@ mod tests {
             (checksum - 5846.5426164588).abs() < 1e-6,
             "checksum {checksum}",
         );
+    }
+
+    /// Worker count does not change the serial per-cell arithmetic.
+    #[test]
+    fn parallel_remap_is_bit_identical_to_serial_reference() {
+        let lut = synthetic_lut(31);
+        let white = [0.3127, 0.3290];
+        for boundary in ["locus", "inscribed_hull"] {
+            let mut spec = InputGamutCompress::build("xy", [0.815, 1., 1.2]).unwrap();
+            spec.set_boundary(boundary, 5., white).unwrap();
+            let inv = 1. / (lut.size as f64 - 1.);
+            let mut expected = Vec::with_capacity(lut.data.len());
+            for i in 0..lut.size {
+                for j in 0..lut.size {
+                    let xy = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
+                    let xy = spec.compress_xy([xy.0, xy.1], white);
+                    let (tx, ty) = spectral::xy_to_tc(xy[0], xy[1]);
+                    let sample = bilinear_sample(
+                        &lut,
+                        tx * (lut.size - 1) as f64,
+                        ty * (lut.size - 1) as f64,
+                    );
+                    expected.extend_from_slice(&sample);
+                }
+            }
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let output = pool.install(|| spec.remap(&lut, white));
+                assert_eq!(output.data.len(), expected.len());
+                assert!(
+                    output
+                        .data
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{boundary}, {threads} threads changed a LUT sample"
+                );
+            }
+        }
     }
 
     /// An inactive ("off") compressor returns the LUT unchanged.

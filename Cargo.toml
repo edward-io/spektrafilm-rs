@@ -33,7 +33,7 @@ image = { version = "0.25", default-features = false, features = ["tiff", "png",
 exr = "1.73"
 wgpu = "24"
 clap = { version = "4", features = ["derive"] }
-eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "glow", "default_fonts", "wayland", "x11", "persistence"] }
 egui = "0.31"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

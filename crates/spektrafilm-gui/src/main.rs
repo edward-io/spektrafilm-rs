@@ -6,8 +6,10 @@
 // render; the panel scales it to fit.
 
 mod calibration_ui;
+mod catalog_edits;
 mod catalog_ui;
 mod chrome;
+mod edits;
 mod history;
 mod icons;
 mod inspector;
@@ -15,6 +17,7 @@ mod lut_ui;
 mod names;
 mod paper_back;
 mod project;
+mod settings;
 mod theme;
 mod tooltips;
 mod view;
@@ -32,6 +35,7 @@ use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
+use spektrafilm_gpu::scheduler::{self, Priority, Scheduler, Task};
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::to_f32;
 
@@ -59,6 +63,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([900.0, 560.0]),
         renderer: gui_renderer(),
+        // Window geometry, panel widths, section state and app preferences.
+        persistence_path: Some(settings::storage_file()),
         // egui's default device descriptor hardcodes
         // `max_texture_dimension_2d: 8192`, so uploading the preview of an
         // image wider or taller than 8192 px (a single texture) panics.
@@ -224,6 +230,7 @@ impl LensDatabaseStatus {
 
 struct App {
     ctx: egui::Context,
+    scheduler: Scheduler,
     load_job: Option<LoadJob>,
     pending_load: Option<LoadRequest>,
     image_cache: std::collections::VecDeque<CachedImage>,
@@ -253,8 +260,7 @@ struct App {
     params: RuntimeParams,
     metadata: spektrafilm_io::Metadata,
     raw_options: spektrafilm_io::RawOptions,
-    /// Settings that produced the current pixels; controls can contain edits
-    /// waiting for an explicit RAW reload.
+    /// Settings that produced the current pixels while automatic RAW reloads run.
     loaded_raw_options: Option<spektrafilm_io::RawOptions>,
     lens_database_status: LensDatabaseStatus,
     save_options: spektrafilm_io::SaveOptions,
@@ -333,10 +339,29 @@ struct App {
     /// `zoom` value at which one source pixel maps to one screen pixel.
     view_actual_zoom: f32,
     window_title: String,
+    /// Per-photo settings database, opened on first use.
+    edit_store: Option<edits::EditStore>,
+    edit_store_failed: bool,
+    /// The open catalog photo (catalog path, Lightroom photo id) that edits save to.
+    current_photo: Option<(PathBuf, i64)>,
+    /// Settings captured by Photo → Copy settings.
+    copied_edit: Option<edits::PhotoEdit>,
+    /// The look of the catalog photo viewed before the current one (P).
+    previous_edit: Option<edits::PhotoEdit>,
+    /// Whether the current photo's history already has rows in the store.
+    history_persisted: bool,
+    /// Label for the next history step when it isn't a control change.
+    pending_label: Option<String>,
+    /// Inspector captions for param pointers, learned as rows change; used to
+    /// label history steps.
+    pointer_captions: std::collections::HashMap<String, String>,
+    /// The catalog to reopen at the next launch.
+    last_catalog: Option<PathBuf>,
 }
 
 struct LoadJob {
     discard: bool,
+    task: Task,
     path: PathBuf,
     started: Instant,
     color_override: Option<(String, bool)>,
@@ -389,7 +414,10 @@ fn image_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
 /// plus the two timings the status bar shows.
 struct RenderJob {
     discard: bool,
+    task: Task,
     started: Instant,
+    /// A fast low-resolution frame requested while a control was being dragged.
+    interactive: bool,
     rx: mpsc::Receiver<Result<RenderResult, String>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -411,6 +439,20 @@ struct RenderResult {
     pipeline_cache: (String, Pipeline),
 }
 
+impl LoadJob {
+    fn discard(&mut self) {
+        self.discard = true;
+        self.task.cancel();
+    }
+}
+
+impl RenderJob {
+    fn discard(&mut self) {
+        self.discard = true;
+        self.task.cancel();
+    }
+}
+
 struct PreviewTextureData {
     size: [usize; 2],
     rgba: Vec<u8>,
@@ -422,6 +464,7 @@ struct ExportJob {
     rx: mpsc::Receiver<Result<(f32, String), String>>,
     handle: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+    task: Task,
     started_at: Instant,
     label: String,
 }
@@ -465,6 +508,7 @@ impl App {
 
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
+            scheduler: Scheduler::default(),
             load_job: None,
             pending_load: None,
             image_cache: Default::default(),
@@ -535,11 +579,23 @@ impl App {
             before_button_held: false,
             view_actual_zoom: 0.0,
             window_title: String::new(),
+            edit_store: None,
+            edit_store_failed: false,
+            current_photo: None,
+            copied_edit: None,
+            previous_edit: None,
+            history_persisted: false,
+            pending_label: None,
+            pointer_captions: Default::default(),
+            last_catalog: None,
         };
         if project::default_path().exists() {
             if let Err(e) = app.restore_project(&project::default_path(), false) {
                 app.status = format!("Startup defaults: {e:#}");
             }
+        }
+        if let Some(storage) = cc.storage {
+            app.restore_settings(storage, initial_image.is_some());
         }
         if let Some(p) = initial_image {
             app.load_image_from_path(&p);
@@ -555,6 +611,7 @@ impl App {
             self.open_catalog(path.to_path_buf());
             return;
         }
+        self.leave_photo();
         self.raw_options.lightroom_geometry = None;
         if let Some(catalog) = &mut self.catalog {
             catalog.selected = None;
@@ -579,32 +636,54 @@ impl App {
     }
 
     fn open_catalog(&mut self, path: PathBuf) {
+        self.leave_photo();
         if let Some(job) = &mut self.load_job {
-            job.discard = true;
+            job.discard();
         }
         if let Some(job) = &mut self.render_job {
-            job.discard = true;
+            job.discard();
         }
         self.pending_load = None;
         self.clear_image();
         self.raw_options.lightroom_geometry = None;
-        self.catalog = Some(catalog_ui::Browser::open(path, &self.ctx));
+        self.last_catalog = Some(path.clone());
+        self.catalog = Some(catalog_ui::Browser::open(path, &self.ctx, &self.scheduler));
         self.status = "Reading Lightroom catalog…".into();
+        self.load_edited_markers();
     }
 
     fn select_catalog_photo(&mut self, photo: spektrafilm_io::lightroom::Photo) {
+        // Save the outgoing photo and remember its look for "Apply previous
+        // settings", then open the incoming one with its own settings (or the
+        // defaults, if it has none).
+        self.commit_photo_edit();
+        if self.current_photo.is_some() {
+            self.previous_edit = Some(self.current_edit());
+        }
+        self.current_photo = self
+            .catalog
+            .as_ref()
+            .map(|browser| (browser.path().to_path_buf(), photo.id));
+        self.history_persisted = false;
+        let rotation = match self.current_photo.clone() {
+            Some((catalog, id)) => self.open_photo_edit(&catalog, id),
+            None => {
+                self.rebase_history();
+                0
+            }
+        };
         match photo.geometry {
             Ok(geometry) => {
                 self.raw_options.lightroom_geometry = Some(geometry);
                 self.params.io.crop = false;
-                self.load_image_with_state(&photo.path, 0, None, None);
+                self.load_image_with_state(&photo.path, rotation, None, None);
             }
             Err(error) => {
                 if let Some(job) = &mut self.load_job {
-                    job.discard = true;
+                    job.discard();
                 }
                 if let Some(job) = &mut self.render_job {
-                    job.discard = true;
+                    job.discard();
                 }
                 self.pending_load = None;
                 self.clear_image();
@@ -620,7 +699,7 @@ impl App {
         view_override: Option<(f32, egui::Vec2)>,
     ) {
         if let Some(render) = &mut self.render_job {
-            render.discard = true;
+            render.discard();
         }
         let path = match std::path::absolute(path) {
             Ok(path) => path,
@@ -643,7 +722,7 @@ impl App {
             self.clear_image();
         }
         if let Some(job) = &mut self.load_job {
-            job.discard = true;
+            job.discard();
             self.status = format!(
                 "Waiting to load {}…",
                 request
@@ -656,6 +735,39 @@ impl App {
             return;
         }
         self.start_image_load(request);
+    }
+
+    fn reload_raw_if_changed(&mut self, previous: &spektrafilm_io::RawOptions) {
+        if previous == &self.raw_options {
+            return;
+        }
+        let (path, rotation, view, options) = if let Some(request) = &self.pending_load {
+            (
+                &request.path,
+                request.rotation,
+                request.view_override,
+                &request.raw_options,
+            )
+        } else if let Some(job) = &self.load_job {
+            if job.discard {
+                return;
+            }
+            (&job.path, job.rotation, job.view_override, &job.raw_options)
+        } else if let Some(path) = &self.image_path {
+            (
+                path,
+                self.rotation,
+                Some((self.zoom, self.pan)),
+                self.export_raw_options(),
+            )
+        } else {
+            return;
+        };
+        if !spektrafilm_io::is_raw(path) || options == &self.raw_options {
+            return;
+        }
+        let path = path.clone();
+        self.load_image_with_state(&path, rotation, None, view);
     }
 
     fn start_image_load(&mut self, request: LoadRequest) {
@@ -677,12 +789,16 @@ impl App {
             .map(|cached| cached.source.clone());
         let worker_path = path.clone();
         let loaded_options = options.clone();
+        let task = self.scheduler.task(Priority::Interactive);
+        let worker_task = task.clone();
         let ctx = self.ctx.clone();
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-load".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _scope = worker_task.enter();
+                    let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let started = Instant::now();
                     let stamp = image_stamp(&worker_path);
                     let source =
@@ -691,6 +807,7 @@ impl App {
                             None => {
                                 let mut loaded = spektrafilm_io::load(&worker_path, &options)
                                     .map_err(|e| format!("{e:#}"))?;
+                                worker_task.check().map_err(|e| e.to_string())?;
                                 if rotation % 4 != 0 {
                                     loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
                                 }
@@ -703,8 +820,11 @@ impl App {
                                 }
                             }
                         };
+                    drop(cpu);
                     let loaded = started.elapsed();
+                    let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let input = Arc::new(spektrafilm_core::resize::preview(&source.pixels, 2048));
+                    drop(cpu);
                     let resized = started.elapsed();
                     let (color, encoded) =
                         preview_color.unwrap_or((source.color_space.clone(), source.encoded));
@@ -716,8 +836,11 @@ impl App {
                         io.output_cctf_encoding,
                         display_transform,
                     );
+                    let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let preview = make_preview_texture_data(&input, &io, display_transform);
+                    drop(cpu);
                     let displayed = started.elapsed();
+                    let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let paper = paper_back::cached(preview.size[0], preview.size[1]);
                     eprintln!("[spektrafilm] load {}: decode {:.1} ms, resize {:.1} ms, display {:.1} ms, paper {:.1} ms", worker_path.display(), loaded.as_secs_f64() * 1000., (resized - loaded).as_secs_f64() * 1000., (displayed - resized).as_secs_f64() * 1000., (started.elapsed() - displayed).as_secs_f64() * 1000.);
                     Ok(LoadedPreview {
@@ -740,6 +863,7 @@ impl App {
                 );
                 self.load_job = Some(LoadJob {
                     discard: false,
+                    task,
                     path,
                     started: Instant::now(),
                     color_override,
@@ -816,6 +940,7 @@ impl App {
                             std::mem::size_of_val(cached.source.pixels.data.as_slice());
                     }
                 }
+                let new_image = self.image_path.as_ref() != Some(&job.path);
                 self.loaded_raw_options = Some(job.raw_options);
                 self.metadata = source.metadata;
                 let (color, encoded) = job
@@ -868,9 +993,21 @@ impl App {
                 self.zoom = zoom;
                 self.pan = pan;
                 if let Some(render) = &mut self.render_job {
-                    render.discard = true;
+                    render.discard();
                 }
                 self.dirty = true;
+                if new_image {
+                    // The file's own colour encoding was just applied; that's not
+                    // an edit. A catalog photo keeps its (restored) history.
+                    if self.current_photo.is_some() {
+                        self.amend_history();
+                    } else {
+                        self.rebase_history();
+                    }
+                } else {
+                    // Rotation or a RAW reload of the same photo.
+                    self.save_photo_edit();
+                }
             }
             Err(e) => {
                 self.status = format!("Load error: {e}");
@@ -895,11 +1032,16 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let worker_color = color.clone();
         let worker_path = path.clone();
+        let task = self.scheduler.task(Priority::Interactive);
+        let worker_task = task.clone();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-rotate".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _scope = worker_task.enter();
+                    let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let pixels = image.rotated_quarter_turns(turns);
+                    worker_task.check().map_err(|e| e.to_string())?;
                     let input = Arc::new(spektrafilm_core::resize::preview(&pixels, 2048));
                     let mut io = spektrafilm_core::params::IoParams::default();
                     io.output_color_space = worker_color.clone();
@@ -933,6 +1075,7 @@ impl App {
             Ok(handle) => {
                 self.load_job = Some(LoadJob {
                     discard: false,
+                    task,
                     path,
                     started: Instant::now(),
                     color_override: Some((color, encoded)),
@@ -943,7 +1086,7 @@ impl App {
                     handle: Some(handle),
                 });
                 if let Some(job) = &mut self.render_job {
-                    job.discard = true;
+                    job.discard();
                 }
                 self.status = "Rotating input…".into();
                 self.ctx.request_repaint();
@@ -987,6 +1130,7 @@ impl App {
         } else {
             configured_limit
         };
+        let interactive = preview_limit < configured_limit;
         let source_key = (
             params.io.input_color_space.clone(),
             params.io.input_cctf_decoding,
@@ -1011,6 +1155,8 @@ impl App {
         self.status = format!("Rendering preview (maximum {preview_limit} px)…");
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
+        let task = self.scheduler.task(Priority::Interactive);
+        let worker_task = task.clone();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-render".into())
             .spawn(move || {
@@ -1018,6 +1164,8 @@ impl App {
                 // message — otherwise the receiver only sees a disconnect
                 // and the user gets a uselessly vague status line.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _scope = worker_task.enter();
+                    let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let t_total = Instant::now();
                     let t_scale = Instant::now();
                     // simulate_preview always bounds input size. Preview mode
@@ -1050,6 +1198,13 @@ impl App {
                         }
                     };
                     let pipeline_build_ms = t_build.elapsed().as_secs_f32() * 1000.;
+                    drop(cpu);
+                    worker_task.check().map_err(|e| e.to_string())?;
+                    let cpu_render = if backend.is_gpu() {
+                        None
+                    } else {
+                        Some(worker_task.cpu().map_err(|e| e.to_string())?)
+                    };
                     let t = Instant::now();
                     let mut path = if backend.is_gpu() {
                         "GPU stages"
@@ -1084,6 +1239,8 @@ impl App {
                         }
                     };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
+                    drop(cpu_render);
+                    let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let t_preview = Instant::now();
                     let preview =
                         make_preview_texture_data(&output, &pipeline.params.io, display_transform);
@@ -1137,7 +1294,9 @@ impl App {
             .expect("OS thread spawn");
         self.render_job = Some(RenderJob {
             discard: false,
+            task,
             started: Instant::now(),
+            interactive,
             rx,
             handle: Some(handle),
         });
@@ -1435,6 +1594,7 @@ impl App {
             let _ = h.join();
         }
         let discard = job.discard;
+        let interactive = job.interactive;
         self.render_job = None;
         if discard {
             self.dirty = true;
@@ -1470,18 +1630,19 @@ impl App {
                 self.last_preview_ms = r.preview_ms;
                 self.last_worker_total_ms = r.worker_total_ms;
                 if let Some(canvas) = &self.canvas {
+                    let first_frame = self.canvas_output.is_none();
                     self.canvas_previous = self
                         .canvas_output
                         .take()
                         .filter(|old| old.size == r.preview.size);
-                    self.animation = if self.display.animate
-                        && r.preview.size[0] * r.preview.size[1] <= 1_500_000
-                        && !ctx.is_using_pointer()
-                    {
-                        Some((Instant::now(), self.canvas_previous.is_none()))
-                    } else {
-                        None
-                    };
+                    self.animation = canvas_transition(
+                        self.display.animate,
+                        r.preview.size,
+                        interactive || ctx.is_using_pointer(),
+                        first_frame,
+                        self.canvas_previous.is_some(),
+                    )
+                    .map(|develop| (Instant::now(), develop));
                     if let Some((key, source)) = &r.source_preview {
                         self.canvas_input = Some(canvas.upload(source));
                         self.source_display_key = Some(key.clone());
@@ -1692,10 +1853,13 @@ impl App {
         let ctx = ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let task = self.scheduler.task(Priority::Export);
+        let worker_task = task.clone();
         let started_at = Instant::now();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-export".into())
             .spawn(move || {
+                let _scope = worker_task.enter();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&worker_cancel)))
                         .unwrap_or_else(|panic| Err(anyhow::anyhow!(panic_message(panic))));
@@ -1717,6 +1881,7 @@ impl App {
                     rx,
                     handle: Some(handle),
                     cancel,
+                    task,
                     started_at,
                     label: label.into(),
                 });
@@ -1734,6 +1899,7 @@ impl App {
             return;
         };
         if !job.cancel.swap(true, Ordering::SeqCst) {
+            job.task.cancel();
             self.status = "Cancelling export…".into();
         }
     }
@@ -2183,7 +2349,6 @@ impl App {
                     "Physical emulsion parameters",
                     tooltips::SECTION_PHYSICAL_EMULSION_PARAMETERS,
                 )
-                .advanced()
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(
@@ -2336,7 +2501,6 @@ impl App {
                 )
                 .changed();
                 Section::nested("Inhibition matrix", tooltips::SECTION_INHIBITION_MATRIX)
-                    .advanced()
                     .show(ui, |ui| {
                         changed |= tooltips::labeled(
                             ui,
@@ -2994,27 +3158,14 @@ impl App {
         if self.tab == Tab::Output {
             self.lut_controls(ui, ctx);
         }
-        if !self.display.show_advanced {
-            ui.add_space(10.0);
-            if ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new("Show advanced controls…")
-                            .small()
-                            .color(theme::TEXT_WEAK),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_text("Reveal expert parameters in every tab (also in the View menu).")
-                .clicked()
-            {
-                self.display.show_advanced = true;
-            }
-        }
     }
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.store_settings(storage);
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // First-paint hook: tag the wgpu Metal layer's colorspace as sRGB.
         // Has to happen here (not in `App::new`) because the CAMetalLayer
@@ -3092,6 +3243,7 @@ impl eframe::App for App {
             }
         }
         self.poll_export_job(ctx);
+        let raw_before = self.raw_options.clone();
         self.handle_shortcuts(ctx);
         self.begin_frame_state(ctx);
         self.update_title(ctx);
@@ -3120,6 +3272,15 @@ impl eframe::App for App {
                     })
                     .show(ui, |ui| self.sidebar_header(ui));
                 ui.separator();
+                egui::TopBottomPanel::bottom("history")
+                    .frame(egui::Frame::new().inner_margin(egui::Margin {
+                        left: 0,
+                        right: 8,
+                        top: 4,
+                        bottom: 6,
+                    }))
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| self.history_panel(ui));
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -3154,14 +3315,19 @@ impl eframe::App for App {
                 .inner
         });
         match action {
-            Some(catalog_ui::Action::Close) => self.catalog = None,
+            Some(catalog_ui::Action::Close) => {
+                self.leave_photo();
+                self.catalog = None;
+                self.last_catalog = None;
+            }
             Some(catalog_ui::Action::Select(photo)) => self.select_catalog_photo(photo),
             Some(catalog_ui::Action::Empty) => {
+                self.leave_photo();
                 if let Some(job) = &mut self.load_job {
-                    job.discard = true;
+                    job.discard();
                 }
                 if let Some(job) = &mut self.render_job {
-                    job.discard = true;
+                    job.discard();
                 }
                 self.pending_load = None;
                 self.clear_image();
@@ -3202,6 +3368,7 @@ impl eframe::App for App {
         if let Some(path) = dropped.into_iter().next() {
             self.load_image_from_path(&path);
         }
+        self.reload_raw_if_changed(&raw_before);
     }
 
     /// Called once when the window is closing. If an export is still
@@ -3210,10 +3377,12 @@ impl eframe::App for App {
     /// this the f64 CLI orphans into its own process group and keeps
     /// hammering the CPU long after the window is gone.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.leave_photo();
         let Some(job) = self.export_job.take() else {
             return;
         };
         job.cancel.store(true, Ordering::SeqCst);
+        job.task.cancel();
         if let Some(h) = job.handle {
             let _ = h.join();
         }
@@ -3355,6 +3524,33 @@ fn dev_time_combo(
         },
     );
     changed
+}
+
+/// How a freshly rendered preview replaces the previous one: `Some(true)`
+/// develops it from blank paper, `Some(false)` crossfades, `None` swaps
+/// immediately.
+///
+/// Only the first frame of a newly loaded image develops. Frames rendered for
+/// a drag never animate, even when they land after the control is released,
+/// and a resolution change (drag preview to full preview) swaps rather than
+/// re-developing an image already on screen.
+fn canvas_transition(
+    animate: bool,
+    size: [usize; 2],
+    interactive: bool,
+    first_frame: bool,
+    previous_same_size: bool,
+) -> Option<bool> {
+    let small_enough = size[0] * size[1] <= 1_500_000;
+    if !animate || !small_enough || interactive {
+        None
+    } else if first_frame {
+        Some(true)
+    } else if previous_same_size {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// A small dark label pill drawn over the image.
@@ -3751,6 +3947,7 @@ fn run_gpu_export(
     options: &spektrafilm_io::SaveOptions,
     metadata: &spektrafilm_io::Metadata,
 ) -> Result<()> {
+    let cpu = scheduler::cpu_permit()?;
     let film = profile::load_profile_by_name(data_dir, film_name)?;
     let paper = profile::load_profile_by_name(
         data_dir,
@@ -3764,15 +3961,23 @@ fn run_gpu_export(
     params.settings.preview_mode = false;
     let pipeline = Pipeline::new_with_spectral(film, paper, params.clone(), data_dir)
         .map_err(anyhow::Error::msg)?;
+    drop(cpu);
     if cancel.load(Ordering::SeqCst) {
         anyhow::bail!("cancelled");
     }
+    let cpu_render = if backend.is_gpu() {
+        None
+    } else {
+        scheduler::cpu_permit()?
+    };
     let output_image = pipeline
         .process_resident_borrowed(image, backend)
         .unwrap_or_else(|| pipeline.process(image.clone(), backend));
+    drop(cpu_render);
     if cancel.load(Ordering::SeqCst) {
         anyhow::bail!("cancelled");
     }
+    let _cpu = scheduler::cpu_permit()?;
     spektrafilm_io::save_converted(
         &output_image,
         &params.io.output_color_space,
@@ -3946,6 +4151,9 @@ impl App {
     }
     fn restore_project(&mut self, path: &Path, load_image: bool) -> Result<()> {
         let state = project::Project::load(path)?;
+        if load_image {
+            self.leave_photo();
+        }
         profile::load_profile_by_name(&self.data_dir, &state.film)?;
         profile::load_profile_by_name(&self.data_dir, &state.paper)?;
         self.auto_preview = state.auto_preview;
@@ -4456,31 +4664,218 @@ impl App {
                     }
                 }
             }
-            let pending = self.loaded_raw_options.as_ref() != Some(&self.raw_options);
-            if ui
-                .add_enabled(
-                    self.image_path.is_some(),
-                    egui::Button::new(if pending {
-                        egui::RichText::new("Reload RAW with these settings").color(theme::ACCENT)
-                    } else {
-                        egui::RichText::new("Reload RAW with these settings")
-                    }),
-                )
-                .on_hover_text(tooltips::CONTROL_RELOAD_RAW_WITH_THESE_SETTINGS)
-                .clicked()
-            {
-                if let Some(path) = self.image_path.clone() {
-                    let rotation = self.rotation;
-                    self.load_image_with_state(&path, rotation, None, None);
-                }
-            }
         });
+    }
+}
+
+#[cfg(test)]
+mod raw_reload_tests {
+    use super::*;
+
+    fn new_app() -> App {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        app.raw_options = spektrafilm_io::RawOptions {
+            decoder: "rawler".into(),
+            ..Default::default()
+        };
+        app
+    }
+
+    fn input() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../spektrafilm-io/tests/fixtures/synthetic.dng")
+    }
+
+    fn finish(app: &mut App) {
+        while let Some(job) = &mut app.load_job {
+            if let Some(handle) = job.handle.take() {
+                handle.join().unwrap();
+            }
+            app.poll_load_job();
+        }
+    }
+
+    #[test]
+    fn raw_changes_reload_pixels_and_preserve_geometry_rotation_and_view() {
+        let mut app = new_app();
+        app.raw_options.lightroom_geometry = Some(spektrafilm_io::lightroom::Geometry {
+            orientation: 6,
+            crop: [0.1, 0.1, 0.9, 0.9],
+            angle: 0.,
+        });
+        let view = (2., egui::vec2(15., -8.));
+        app.load_image_with_state(&input(), 1, None, Some(view));
+        finish(&mut app);
+        assert!(app.image.is_some(), "{}", app.status);
+        let original = app.image.clone().unwrap();
+        let previous = app.raw_options.clone();
+        app.raw_options.white_balance = "custom".into();
+        app.raw_options.temperature = 3000.;
+        app.raw_options.tint = 1.3;
+        app.reload_raw_if_changed(&previous);
+        assert!(app.load_job.is_some());
+        assert_eq!(app.export_raw_options(), &previous);
+        finish(&mut app);
+        assert!(app.status.starts_with("Loaded "), "{}", app.status);
+        let expected = spektrafilm_io::load(&input(), &app.raw_options)
+            .unwrap()
+            .pixels
+            .rotated_quarter_turns(1);
+        assert_eq!(app.image.as_ref().unwrap().data, expected.data);
+        assert_ne!(app.image.as_ref().unwrap().data, original.data);
+        assert_eq!(app.rotation, 1);
+        assert_eq!((app.zoom, app.pan), view);
+        assert_eq!(app.project_state().raw, app.raw_options);
+
+        let applied = app.raw_options.clone();
+        app.raw_options.decoder = "invalid".into();
+        app.reload_raw_if_changed(&applied);
+        finish(&mut app);
+        assert!(app.status.starts_with("Load error:"), "{}", app.status);
+        assert_eq!(app.export_raw_options(), &applied);
+        assert_eq!(app.image.as_ref().unwrap().data, expected.data);
+        app.reload_raw_if_changed(&app.raw_options.clone());
+        assert!(
+            app.load_job.is_none(),
+            "failed reload was retried without an edit"
+        );
+    }
+
+    #[test]
+    fn rapid_raw_changes_keep_only_the_latest_selected_photo_and_settings() {
+        let mut app = new_app();
+        app.load_image_from_path(&input());
+        let dir = tempfile::tempdir().unwrap();
+        let selected = dir.path().join("selected.dng");
+        std::fs::copy(input(), &selected).unwrap();
+        let view = (1.5, egui::vec2(-4., 12.));
+        app.load_image_with_state(&selected, 3, None, Some(view));
+        for tint in [1.1, 1.2, 1.3] {
+            let previous = app.raw_options.clone();
+            app.raw_options.white_balance = "custom".into();
+            app.raw_options.tint = tint;
+            app.reload_raw_if_changed(&previous);
+            assert!(app.load_job.as_ref().unwrap().discard);
+            let pending = app.pending_load.as_ref().unwrap();
+            assert_eq!(pending.path, selected);
+            assert_eq!(pending.rotation, 3);
+            assert_eq!(pending.view_override, Some(view));
+            assert_eq!(pending.raw_options, app.raw_options);
+        }
+        finish(&mut app);
+        assert!(app.status.starts_with("Loaded "), "{}", app.status);
+        assert_eq!(app.image_path, Some(selected));
+        assert_eq!(app.export_raw_options(), &app.raw_options);
+        assert_eq!(app.rotation, 3);
+        assert_eq!((app.zoom, app.pan), view);
+        assert!(app.pending_load.is_none());
+        app.reload_raw_if_changed(&app.raw_options.clone());
+        assert!(
+            app.load_job.is_none(),
+            "unchanged settings started another load"
+        );
+    }
+
+    #[test]
+    fn raw_changes_without_a_raw_photo_do_not_start_a_load() {
+        let mut app = new_app();
+        let previous = app.raw_options.clone();
+        app.raw_options.tint = 1.2;
+        app.reload_raw_if_changed(&previous);
+        assert!(app.load_job.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        image::RgbImage::new(8, 4).save(&path).unwrap();
+        app.load_image_from_path(&path);
+        finish(&mut app);
+        assert!(app.image.is_some(), "{}", app.status);
+        let previous = app.raw_options.clone();
+        app.raw_options.tint = 1.3;
+        app.reload_raw_if_changed(&previous);
+        assert!(app.load_job.is_none());
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::canvas_transition;
+
+    const SMALL: [usize; 2] = [1024, 683];
+
+    #[test]
+    fn only_a_new_image_develops_from_blank_paper() {
+        assert_eq!(
+            canvas_transition(true, SMALL, false, true, false),
+            Some(true)
+        );
+        assert_eq!(
+            canvas_transition(true, SMALL, false, false, true),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn editing_a_control_never_redevelops_the_image() {
+        // Drag preview landing after release, after a full-size frame.
+        assert_eq!(
+            canvas_transition(true, [640, 427], true, false, false),
+            None
+        );
+        // Full-size frame replacing a drag preview of a different size.
+        assert_eq!(canvas_transition(true, SMALL, false, false, false), None);
+        // Drag previews never animate, even back to back at the same size.
+        assert_eq!(canvas_transition(true, [640, 427], true, false, true), None);
+    }
+
+    #[test]
+    fn animation_respects_the_toggle_and_size_limit() {
+        assert_eq!(canvas_transition(false, SMALL, false, true, false), None);
+        assert_eq!(
+            canvas_transition(true, [2048, 1365], false, true, false),
+            None
+        );
     }
 }
 
 #[cfg(all(test, unix))]
 mod export_tests {
     use super::*;
+
+    #[test]
+    fn cancelling_an_export_waiting_for_capacity_does_not_run_or_write_it() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        let first = app.scheduler.task(Priority::Interactive).cpu().unwrap();
+        let second = app.scheduler.task(Priority::Interactive).cpu().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let visited = ran.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("cancelled.png");
+        app.start_export_job(&ctx, "test", output.clone(), move |_| {
+            let _cpu = scheduler::cpu_permit()?;
+            visited.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        app.cancel_export();
+        let job = app.export_job.as_mut().unwrap();
+        let result = job.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        job.handle.take().unwrap().join().unwrap();
+        assert!(!ran.load(Ordering::Relaxed));
+        assert!(!output.exists());
+        drop((first, second));
+    }
+
     #[test]
     fn verbose_child_does_not_block_export() {
         let mut cmd = std::process::Command::new("sh");
@@ -4642,6 +5037,8 @@ mod preview_failure_tests {
         app.render_job = Some(RenderJob {
             started: Instant::now(),
             discard: false,
+            task: app.scheduler.task(Priority::Interactive),
+            interactive: false,
             rx,
             handle: None,
         });
@@ -4910,6 +5307,64 @@ mod preview_cache_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires SPEKTRAFILM_BENCH_IMAGE and local originals"]
+    fn benchmark_setting_changes() {
+        let path = std::env::var_os("SPEKTRAFILM_BENCH_IMAGE").expect("image path");
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(&cc, Arc::from(spektrafilm_gpu::select_backend()), None);
+        app.params = RuntimeParams::default();
+        app.film_name = "kodak_gold_200".into();
+        app.print_name = "kodak_portra_endura".into();
+        app.raw_options = spektrafilm_io::RawOptions {
+            decoder: "rawler".into(),
+            ..Default::default()
+        };
+        app.load_image_from_path(Path::new(&path));
+        while let Some(job) = &mut app.load_job {
+            if let Some(handle) = job.handle.take() {
+                handle.join().unwrap();
+            }
+            app.poll_load_job();
+        }
+        assert!(app.image.is_some(), "{}", app.status);
+        for limit in [640, 2048] {
+            app.params.settings.preview_max_size = limit;
+            for setting in ["exposure", "print_exposure", "halation"] {
+                for step in 0..5 {
+                    match setting {
+                        "exposure" => app.params.camera.exposure_compensation_ev = step as f32 / 4.,
+                        "print_exposure" => {
+                            app.params.enlarger.print_exposure = 1. + step as f32 / 4.
+                        }
+                        "halation" => app.params.film_render.halation.boost_ev = step as f32 / 4.,
+                        _ => unreachable!(),
+                    }
+                    let start = Instant::now();
+                    app.dispatch_render(&ctx);
+                    let dispatch_ms = start.elapsed().as_secs_f64() * 1000.;
+                    while let Some(job) = &mut app.render_job {
+                        if let Some(handle) = job.handle.take() {
+                            handle.join().unwrap();
+                        }
+                        app.poll_render_job(&ctx);
+                    }
+                    assert!(app.output_image.is_some(), "{}", app.status);
+                    eprintln!(
+                        "[settings-benchmark] limit={limit} setting={setting} step={step} dispatch={dispatch_ms:.3} build={:.3} resize={:.3} render={:.3} display={:.3} worker={:.3} total={:.3}",
+                        app.last_pipeline_build_ms,
+                        app.last_scale_ms,
+                        app.last_render_ms,
+                        app.last_preview_ms,
+                        app.last_worker_total_ms,
+                        start.elapsed().as_secs_f64() * 1000.
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cached_previews_match_rebuilt_pipelines_after_control_changes() {
         use serde_json::json;
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
@@ -5037,6 +5492,56 @@ mod preview_cache_tests {
 #[cfg(test)]
 mod gpu_export_tests {
     use super::*;
+
+    #[test]
+    fn scheduled_exports_match_interactive_gpu_processing() {
+        let backend = spektrafilm_gpu::select_backend();
+        if !backend.is_gpu() {
+            return;
+        }
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let image = ImageBuf::from_data(
+            63,
+            31,
+            (0..63 * 31 * 3)
+                .map(|i| spektrafilm_math::precision::from_f64(0.03 + 0.6 * (i % 63) as f64 / 62.))
+                .collect(),
+        );
+        let scheduler = Scheduler::default();
+        for route in [
+            "input > film > print > scan",
+            "input > convert-film > print > scan",
+        ] {
+            let mut params = RuntimeParams::default();
+            params.workflow.route = route.into();
+            params.debug.deactivate_stochastic_effects = true;
+            let pipeline = Pipeline::new_with_spectral(
+                profile::load_profile_by_name(&data, "kodak_gold_200").unwrap(),
+                profile::load_profile_by_name(&data, "kodak_portra_endura").unwrap(),
+                params,
+                &data,
+            )
+            .unwrap();
+            let render = |priority| {
+                let task = scheduler.task(priority);
+                let _scope = task.enter();
+                pipeline
+                    .process_resident_borrowed(&image, backend.as_ref())
+                    .expect("GPU resident path")
+            };
+            let expected = render(Priority::Interactive);
+            let actual = render(Priority::Export);
+            assert_eq!(
+                (actual.width, actual.height),
+                (expected.width, expected.height)
+            );
+            assert_eq!(
+                actual.data, expected.data,
+                "scheduled export changed {route}"
+            );
+        }
+    }
+
     #[test]
     fn gpu_export_uses_original_and_honors_working_scale_and_saving_color() {
         let backend = spektrafilm_gpu::select_backend();

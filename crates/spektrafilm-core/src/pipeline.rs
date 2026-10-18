@@ -201,6 +201,8 @@ impl Pipeline {
         mut params: RuntimeParams,
         data_dir: &Path,
     ) -> Result<Self, String> {
+        let stage_timings = stage_timings_enabled();
+        let t = Instant::now();
         params.validate()?;
         for name in [
             &film.info.reference_illuminant,
@@ -263,6 +265,8 @@ impl Pipeline {
             params.enlarger.y_filter_neutral as f64,
         ]);
         let (c_neutral_f64, m_neutral_f64, y_neutral_f64) = (cmy_f64[0], cmy_f64[1], cmy_f64[2]);
+        print_stage_timing(stage_timings, "calibration.profiles", t);
+        let t = Instant::now();
 
         // Film sensitivity: Python `sensitivity = np.nan_to_num(10 ** log_sensitivity)` — f64.
         let log_sens = film.log_sensitivity_f64();
@@ -294,6 +298,8 @@ impl Pipeline {
             }
         }
         let mut front_illuminant = film.info.reference_illuminant.clone();
+        print_stage_timing(stage_timings, "calibration.sensitivity", t);
+        let t = Instant::now();
 
         let method = params.settings.rgb_to_raw_method.as_str();
         let tc_lut = if method == "hanatos2025" {
@@ -337,6 +343,8 @@ impl Pipeline {
         compressor.set_boundary(&spec.boundary, spec.hull_detail as f64, [white.0, white.1])?;
         let tc_lut = Some(compressor.remap(&tc_lut, [white.0, white.1]));
 
+        print_stage_timing(stage_timings, "calibration.spectral", t);
+        let t = Instant::now();
         // Compute enlarger illuminant with dichroic filters — f64 for Python parity.
         // c/m/y come from the f64 lookup, shift values are f32 in params.
         let print_illuminant = enlarger::enlarger_filtered_illuminant_f64(
@@ -482,6 +490,7 @@ impl Pipeline {
                 film.data.base_density.fill(0.);
             }
         }
+        print_stage_timing(stage_timings, "calibration.print", t);
         Ok(Self {
             film,
             print,

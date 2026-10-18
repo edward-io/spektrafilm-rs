@@ -243,6 +243,7 @@ fn apply_with_draws(
     p: &LayeredGrainGpuParams,
     draws: Option<&wgpu::Buffer>,
 ) -> ImageBuf {
+    let _gpu = crate::scheduler::gpu_permit();
     let input = scalars_to_f32(&image.data);
     let n = image.pixel_count() as u32;
     let bytes = n as u64 * 12;

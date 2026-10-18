@@ -264,6 +264,7 @@ impl WgpuBackend {
         groups: [u32; 3],
         output_idx: usize,
     ) -> Vec<f32> {
+        let _gpu = crate::scheduler::gpu_permit();
         let t_start = std::time::Instant::now();
         let layout_entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
             .iter()
@@ -378,11 +379,14 @@ impl WgpuBackend {
     /// mallett matmul), highlight boost, camera diffusion/lens blur,
     /// halation, density curves, DIR, grain, print spectral, enlarger
     /// diffusion, scan spectral, glare, gamut compression, scanner lens blur,
-    /// and unsharp as a single command buffer with ping-pong image storage.
+    /// and unsharp with ping-pong image storage. Interactive renders use one
+    /// command buffer; scheduled background work yields between stages.
     /// Only one upload at the start and one readback at the end.
     pub fn run_film_chain(&self, p: &crate::FilmChainParams<'_>) -> ImageBuf {
         use wgpu::util::DeviceExt;
+        let mut gpu = crate::scheduler::gpu_permit();
         let t_start = std::time::Instant::now();
+        let mut yielded_ms = 0.;
         // Pull all references into locals so the existing body below
         // doesn't need a rewrite — only the param sources change.
         let image = p.image;
@@ -1165,7 +1169,7 @@ impl WgpuBackend {
             .output_cctf_encoding
             .then(|| color_transfer::build(self, n_pixels, p.output_transfer, true, 1., &buf_b));
 
-        // ── Single command buffer chaining everything ────────────────────
+        // Interactive frames batch everything; lower priorities have stage boundaries.
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let dispatch = |encoder: &mut wgpu::CommandEncoder,
                         pipe: &wgpu::ComputePipeline,
@@ -1182,12 +1186,14 @@ impl WgpuBackend {
 
         if let Some(state) = &input_transfer_state {
             state.encode_passes(&mut encoder, n_pixels);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         }
         if let Some(state) = &convert_state {
             state.encode(&mut encoder, n_pixels, &buf_a, &buf_b);
         } else {
             // 1. Front pass (hanatos or mallett): buf_a (rgb in) → buf_b (raw)
             dispatch(&mut encoder, &front_pipe.pipeline, &bg_front, n_pixels);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             // 1a. Highlight boost on raw, before optical scatter.
             if let Some(hs) = highlight_state.as_ref() {
                 hs.encode_passes(&mut encoder);
@@ -1196,16 +1202,19 @@ impl WgpuBackend {
             //     halation — mirrors the CPU filming order.
             if let Some(ds) = diffusion_state.as_ref() {
                 ds.encode_passes(&mut encoder, &buf_b);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             // 1b. Camera lens blur on raw, after camera diffusion and before halation.
             if let Some(bs) = camera_lens_blur_state.as_ref() {
                 bs.encode(&mut encoder);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             // 1b. Halation in-place on buf_b. Uses buf_a as blur scratch (the
             //     input RGB image is no longer needed), buf_c / buf_d for the
             //     scatter outputs and halation accumulator.
             if let Some(hs) = halation_state.as_ref() {
                 hs.encode(&mut encoder);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             // 2. log10 in-place on buf_b: raw → log_raw (3 channels per thread).
             let (log10_pipe, log10_bg, _keepalive) = &bg_log10;
@@ -1222,22 +1231,26 @@ impl WgpuBackend {
             if let Some(ds) = dir_state.as_ref() {
                 let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
                 ds.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             // 3c. Grain (in-place on buf_a, optional post-blur via buf_b mid).
             if let Some(gs) = grain_state.as_ref() {
                 let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
                 gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             if let Some(state) = &layered_grain_state {
                 state.encode(&mut encoder, n_pixels);
             }
         }
+        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         // 4 + 5. Printing: print_spectral (buf_a → buf_b) then the print
         //     density curve (buf_b → buf_a). Skipped for scan_film — the
         //     scan pass consumes the film density already in buf_a.
         if !p.scan_film {
             // 4. Print spectral: buf_a → buf_b (log_raw_print)
             dispatch(&mut encoder, &print_pipe.pipeline, &bg_print, n_pixels);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             if let (Some(l2l), Some(ds), Some(l2g)) = (
                 enlarger_log_to_linear_state.as_ref(),
                 enlarger_diffusion_state.as_ref(),
@@ -1246,6 +1259,7 @@ impl WgpuBackend {
                 l2l.encode_passes(&mut encoder, n_pixels);
                 ds.encode_passes(&mut encoder, &buf_b);
                 l2g.encode_passes(&mut encoder, n_pixels);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
             }
             // 5. Density curve (print, raw curves): buf_b → buf_a (density_print)
             dispatch(
@@ -1257,19 +1271,23 @@ impl WgpuBackend {
         }
         // 6. Scan spectral: buf_a → buf_b (unclipped linear RGB)
         dispatch(&mut encoder, &scan_pipe.pipeline, &bg_scan, n_pixels);
+        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         // 6b. Glare (in place on buf_b).
         if let Some(gs) = glare_state.as_ref() {
             let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
             gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         }
         // 6c. Output gamut compression (in place on buf_b) — after glare,
         //     before unsharp, mirroring the CPU scanning order.
         if let Some(gs) = gamut_state.as_ref() {
             gs.encode_passes(&mut encoder, n_pixels, workgroup_size);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         }
         // 6d. Scanner lens blur — after glare/gamut, before unsharp.
         if let Some(bs) = scanner_lens_blur_state.as_ref() {
             bs.encode(&mut encoder);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         }
         // 6d. Unsharp mask — last in-flight pass. Writes the final image
         //     back to buf_b so the readback path below is unchanged.
@@ -1283,6 +1301,7 @@ impl WgpuBackend {
                 &buf_b,
                 img_bytes as u64,
             );
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
         }
         // 6e. Final optional sRGB encode. This mirrors
         // Pipeline::apply_post_scan so the resident WGSL path can return
@@ -1298,11 +1317,11 @@ impl WgpuBackend {
         }
         // Everything since function entry: CPU-side param prep, buffer
         // creation/uploads, and command encoding.
-        let cpu_setup_ms = t_start.elapsed().as_secs_f32() * 1000.0;
+        let cpu_setup_ms = t_start.elapsed().as_secs_f32() * 1000.0 - yielded_ms;
         self.queue.submit(Some(encoder.finish()));
 
-        // Single sync point at the end. Map buf_b directly on the zero-copy
-        // path, or the staging buffer otherwise.
+        // Final readback sync. Background work also synchronizes at yield points.
+        // Map buf_b directly on the zero-copy path, or the staging buffer otherwise.
         let map_target = readback.as_ref().unwrap_or(&buf_b);
         let slice = map_target.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1320,6 +1339,7 @@ impl WgpuBackend {
         let out = ImageBuf::from_data(image.width, image.height, f32_to_scalars(out_f32));
         tracing::debug!(
             cpu_setup_ms = format!("{cpu_setup_ms:.1}"),
+            yielded_ms = format!("{yielded_ms:.1}"),
             gpu_wait_ms = format!("{gpu_wait_ms:.1}"),
             readback_ms = format!(
                 "{:.1}",
@@ -1328,6 +1348,24 @@ impl WgpuBackend {
             "film chain timings"
         );
         out
+    }
+
+    fn yield_gpu(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        permit: &mut Option<crate::scheduler::Permit>,
+    ) -> f32 {
+        if let Some(permit) = permit.as_mut().filter(|permit| !permit.is_interactive()) {
+            let started = std::time::Instant::now();
+            let next = self.device.create_command_encoder(&Default::default());
+            let ready = std::mem::replace(encoder, next);
+            let submitted = self.queue.submit(Some(ready.finish()));
+            self.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
+            permit.yield_to_higher_priority();
+            return started.elapsed().as_secs_f32() * 1000.;
+        }
+        0.
     }
 
     /// Get-or-compile a pipeline by shader source + binding layout. Cached by
@@ -3333,4 +3371,84 @@ fn is_uniform(xs: &[f64]) -> bool {
         }
     }
     true
+}
+
+#[cfg(all(test, feature = "wgpu-backend"))]
+mod scheduling_tests {
+    use super::*;
+    use crate::scheduler::{self, Priority, Scheduler};
+    use std::{
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
+    use wgpu::util::DeviceExt;
+
+    #[test]
+    fn yielding_submits_the_prefix_and_preserves_buffers_for_resuming() {
+        let Some(backend) = WgpuBackend::new() else {
+            return;
+        };
+        let backend = Arc::new(backend);
+        let scheduler = Scheduler::default();
+        let task = scheduler.task(Priority::Background);
+        let _scope = task.enter();
+        let mut permit = scheduler::gpu_permit();
+        let source = backend
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[1u32, 2, 3, 4]),
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
+        let intermediate = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let readback = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = backend.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&source, 0, &intermediate, 0, 16);
+        let foreground = scheduler.task(Priority::Interactive);
+        let gpu = backend.clone();
+        let buffer = intermediate.clone();
+        let worker = thread::spawn(move || {
+            let _scope = foreground.enter();
+            let _permit = scheduler::gpu_permit();
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[42u32, 43, 44, 45]));
+            let submitted = gpu.queue.submit([]);
+            gpu.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !permit.as_ref().unwrap().should_yield() {
+            assert!(Instant::now() < deadline, "foreground did not queue");
+            thread::yield_now();
+        }
+        backend.yield_gpu(&mut encoder, &mut permit);
+        worker.join().unwrap();
+        encoder.copy_buffer_to_buffer(&intermediate, 0, &readback, 0, 16);
+        let submitted = backend.queue.submit(Some(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+        backend
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let mapped = readback.slice(..).get_mapped_range();
+        assert_eq!(bytemuck::cast_slice::<_, u32>(&mapped), &[42, 43, 44, 45]);
+        drop(mapped);
+        readback.unmap();
+    }
 }

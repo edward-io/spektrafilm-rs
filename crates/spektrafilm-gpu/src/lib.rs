@@ -1,4 +1,5 @@
 pub mod cpu_backend;
+pub mod scheduler;
 #[cfg(feature = "cuda-backend")]
 pub mod cuda_backend;
 #[cfg(feature = "wgpu-backend")]
@@ -127,7 +128,8 @@ pub trait ComputeBackend: Send + Sync {
     }
 
     /// Optional fused fast-path: runs filming + printing + scanning as a single
-    /// GPU-resident command buffer (one upload at start, one readback at end).
+    /// GPU-resident chain (one upload at start, one readback at end). Scheduled
+    /// background work may submit separate command buffers between stages.
     /// Returns `None` to fall back to per-stage trait methods. CPU backend
     /// always returns `None`; wgpu implements it.
     fn try_run_film_chain(&self, _params: &FilmChainParams<'_>) -> Option<ImageBuf> {

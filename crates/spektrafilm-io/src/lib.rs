@@ -384,7 +384,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
             p.height,
             p.data.into_iter().flat_map(|v| [v; 3]).collect::<Vec<_>>(),
         ),
-        Intermediate::ThreeColor(p) => (p.width, p.height, p.data.into_iter().flatten().collect()),
+        Intermediate::ThreeColor(p) => (p.width, p.height, p.data.into_flattened()),
         Intermediate::FourColor(p) => (
             p.width,
             p.height,
