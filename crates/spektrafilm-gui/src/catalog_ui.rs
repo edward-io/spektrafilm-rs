@@ -1,14 +1,16 @@
 //! Read-only Lightroom Classic catalog browser: a thumbnail grid in the left
 //! panel that feeds the selected photo, with its crop, into the editor.
-use crate::{inspector, theme};
+use crate::{file_menu, icons, inspector, theme};
 use eframe::egui::{self, RichText};
 use spektrafilm_gpu::scheduler::{Priority, Scheduler, Task};
 use spektrafilm_io::lightroom::{Catalog, Photo, THUMBNAIL_PX};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::mpsc,
 };
+
+const THUMBNAIL_CACHE_LIMIT: usize = 256;
 
 pub enum Action {
     Select(Photo),
@@ -24,13 +26,17 @@ pub struct Browser {
     loading: Option<mpsc::Receiver<Result<Catalog, String>>>,
     error: Option<String>,
     accepted_only: bool,
+    /// Catalog notices are folded into one line until expanded.
+    show_notices: bool,
     visible: Vec<usize>,
     pub selected: Option<usize>,
     scroll_to_selected: bool,
     thumbnails: HashMap<i64, Option<egui::TextureHandle>>,
+    thumbnail_order: VecDeque<i64>,
+    thumbnail_generation: u64,
     pending_thumbnails: HashSet<i64>,
-    thumbnail_tx: mpsc::SyncSender<(i64, PathBuf, u16)>,
-    thumbnail_rx: mpsc::Receiver<(i64, Option<image::RgbaImage>)>,
+    thumbnail_tx: mpsc::SyncSender<(u64, i64, PathBuf, u16)>,
+    thumbnail_rx: mpsc::Receiver<(u64, i64, Option<image::RgbaImage>)>,
     /// Photos with settings saved in Spektrafilm, marked in the list.
     pub edited: HashSet<i64>,
 }
@@ -44,6 +50,26 @@ impl Drop for Browser {
 impl Browser {
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_catalog(
+        path: PathBuf,
+        photos: Vec<Photo>,
+        selected: usize,
+        ctx: &egui::Context,
+        scheduler: &Scheduler,
+    ) -> Self {
+        let mut browser = Self::open(path.clone(), ctx, scheduler);
+        browser.loading = None;
+        browser.catalog = Some(Catalog {
+            path,
+            photos,
+            schema_version: Some("1504001".into()),
+        });
+        browser.filter();
+        browser.selected = Some(selected);
+        browser
     }
 
     pub(super) fn source_thumbnail(
@@ -61,6 +87,7 @@ impl Browser {
         if photo.path != path || self.thumbnails.get(&photo.id).is_some_and(Option::is_some) {
             return;
         }
+        let id = photo.id;
         let Some(image) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
             preview.size[0] as u32,
             preview.size[1] as u32,
@@ -74,10 +101,10 @@ impl Browser {
             (preview.size[0] as f32 * scale).round().max(1.) as u32,
             (preview.size[1] as f32 * scale).round().max(1.) as u32,
         );
-        self.thumbnails.insert(
-            photo.id,
+        self.cache_thumbnail(
+            id,
             Some(ctx.load_texture(
-                format!("catalog-{}", photo.id),
+                format!("catalog-{id}"),
                 egui::ColorImage::from_rgba_unmultiplied(
                     [thumbnail.width() as usize, thumbnail.height() as usize],
                     thumbnail.as_raw(),
@@ -87,24 +114,37 @@ impl Browser {
         );
     }
 
+    fn cache_thumbnail(&mut self, id: i64, texture: Option<egui::TextureHandle>) {
+        if texture.is_none() && self.thumbnails.get(&id).is_some_and(Option::is_some) {
+            return;
+        }
+        self.thumbnails.insert(id, texture);
+        self.thumbnail_order.retain(|cached| *cached != id);
+        self.thumbnail_order.push_back(id);
+        if self.thumbnail_order.len() > THUMBNAIL_CACHE_LIMIT {
+            let oldest = self.thumbnail_order.pop_front().unwrap();
+            self.thumbnails.remove(&oldest);
+        }
+    }
+
     pub fn open(path: PathBuf, ctx: &egui::Context, scheduler: &Scheduler) -> Self {
-        let (thumbnail_tx, requests) = mpsc::sync_channel::<(i64, PathBuf, u16)>(24);
+        let (thumbnail_tx, requests) = mpsc::sync_channel::<(u64, i64, PathBuf, u16)>(24);
         let (results, thumbnail_rx) = mpsc::channel();
         let repaint = ctx.clone();
-        let thumbnail_task = scheduler.task(Priority::Background);
+        let thumbnail_task = scheduler.task(Priority::Visible);
         let task = thumbnail_task.clone();
         std::thread::spawn(move || {
-            let _scope = task.enter();
-            while let Ok((id, path, orientation)) = requests.recv() {
-                let image = {
-                    let Ok(_cpu) = task.cpu() else { break };
-                    std::panic::catch_unwind(|| {
-                        spektrafilm_io::lightroom::thumbnail(&path, orientation)
+            while let Ok((generation, id, path, orientation)) = requests.recv() {
+                let Ok(_cpu) = task.cpu() else { break };
+                let image = task
+                    .run(|| {
+                        std::panic::catch_unwind(|| {
+                            spektrafilm_io::lightroom::thumbnail(&path, orientation)
+                        })
                     })
                     .ok()
-                    .and_then(Result::ok)
-                };
-                if results.send((id, image)).is_err() {
+                    .and_then(Result::ok);
+                if results.send((generation, id, image)).is_err() {
                     break;
                 }
                 repaint.request_repaint();
@@ -118,10 +158,13 @@ impl Browser {
             loading: None,
             error: None,
             accepted_only: false,
+            show_notices: false,
             visible: Vec::new(),
             selected: None,
             scroll_to_selected: false,
             thumbnails: HashMap::new(),
+            thumbnail_order: VecDeque::new(),
+            thumbnail_generation: 0,
             pending_thumbnails: HashSet::new(),
             thumbnail_tx,
             thumbnail_rx,
@@ -175,7 +218,46 @@ impl Browser {
         Some(Action::Select(self.catalog.as_ref()?.photos[index].clone()))
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<Action> {
+    pub(super) fn preload_photos(&self, radius: u8) -> Vec<Photo> {
+        let Some(catalog) = &self.catalog else {
+            return vec![];
+        };
+        let Some(position) = self
+            .selected
+            .and_then(|selected| self.visible.iter().position(|&index| index == selected))
+        else {
+            return vec![];
+        };
+        let eligible = |index: &usize| {
+            let photo = &catalog.photos[*index];
+            photo.available && photo.geometry.is_ok() && spektrafilm_io::is_raw(&photo.path)
+        };
+        let mut next = self.visible[position + 1..]
+            .iter()
+            .copied()
+            .filter(eligible)
+            .take(radius as usize);
+        let mut previous = self.visible[..position]
+            .iter()
+            .rev()
+            .copied()
+            .filter(eligible)
+            .take(radius as usize);
+        let mut photos = Vec::new();
+        for _ in 0..radius {
+            for index in [next.next(), previous.next()].into_iter().flatten() {
+                photos.push(catalog.photos[index].clone());
+            }
+        }
+        photos
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        preload_radius: &mut u8,
+    ) -> Option<Action> {
         let mut action = None;
         if let Some(rx) = &self.loading {
             match rx.try_recv() {
@@ -183,6 +265,11 @@ impl Browser {
                     self.loading = None;
                     match result {
                         Ok(catalog) => {
+                            // A refresh can change paths/orientation and must retry failed reads.
+                            self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
+                            self.thumbnails.clear();
+                            self.thumbnail_order.clear();
+                            self.pending_thumbnails.clear();
                             let selected_id = self
                                 .selected
                                 .and_then(|i| self.catalog.as_ref()?.photos.get(i))
@@ -207,17 +294,12 @@ impl Browser {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        while let Ok((id, image)) = self.thumbnail_rx.try_recv() {
-            self.pending_thumbnails.remove(&id);
-            if image.is_none() && self.thumbnails.get(&id).is_some_and(Option::is_some) {
+        while let Ok((generation, id, image)) = self.thumbnail_rx.try_recv() {
+            if generation != self.thumbnail_generation {
                 continue;
             }
-            if self.thumbnails.len() >= 256 {
-                if let Some(id) = self.thumbnails.keys().next().copied() {
-                    self.thumbnails.remove(&id);
-                }
-            }
-            self.thumbnails.insert(
+            self.pending_thumbnails.remove(&id);
+            self.cache_thumbnail(
                 id,
                 image.map(|image| {
                     ctx.load_texture(
@@ -254,6 +336,14 @@ impl Browser {
                 {
                     self.refresh(ctx);
                 }
+                ui.menu_button(RichText::new(icons::GEAR_SIX).font(icons::font(13.0)), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Preload each side").on_hover_text("Decode this many RAWs ahead and behind in the current filter. Zero disables preloading. Neighbours use up to 2 GiB of memory.");
+                        ui.add(egui::DragValue::new(preload_radius).range(0..=8).speed(0.1));
+                    });
+                })
+                .response
+                .on_hover_text("Catalog settings");
             });
         });
         let catalog_stats = self.catalog.as_ref().map(|catalog| {
@@ -325,28 +415,75 @@ impl Browser {
         let Some(catalog) = &self.catalog else {
             return action;
         };
+        let warn = ui.visuals().warn_fg_color;
+        let mut notices = Vec::new();
         if let Some(warning) = catalog.compatibility_warning() {
-            notice(ui, ui.visuals().warn_fg_color, &warning);
+            notices.push((warn, warning));
         }
         let unavailable = catalog_stats.map_or(0, |(_, _, u)| u);
         if unavailable > 0 {
-            notice(
-                ui,
+            notices.push((
                 theme::TEXT_WEAK,
-                &format!(
+                format!(
                     "{unavailable} photo{} skipped: original not found. Connect the drive, then ⟳.",
                     if unavailable == 1 { "" } else { "s" }
                 ),
-            );
+            ));
         }
         if let Some(photo) = self.selected.and_then(|i| catalog.photos.get(i))
             && photo.framing_warning
         {
-            notice(
-                ui,
-                ui.visuals().warn_fg_color,
-                "Lightroom lens and perspective corrections aren't imported, so framing may differ.",
+            notices.push((
+                warn,
+                "Lightroom lens and perspective corrections aren't imported, so framing may differ."
+                    .into(),
+            ));
+        }
+        if !notices.is_empty() {
+            let color = if notices.iter().any(|(c, _)| *c == warn) {
+                warn
+            } else {
+                theme::TEXT_WEAK
+            };
+            let summary = format!(
+                "{} notice{}",
+                notices.len(),
+                if notices.len() == 1 { "" } else { "s" }
             );
+            // Phosphor glyphs need their own family; Inter maps those code points too.
+            let caret = if self.show_notices {
+                icons::CARET_DOWN
+            } else {
+                icons::CARET_RIGHT
+            };
+            let response = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new("●").size(8.0).color(color));
+                    ui.label(
+                        RichText::new(caret)
+                            .font(icons::font(11.0))
+                            .color(theme::TEXT_CAPTION),
+                    );
+                    ui.label(RichText::new(summary).small().color(theme::TEXT_CAPTION));
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = if self.show_notices {
+                response
+            } else {
+                let all = notices.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>();
+                response.on_hover_text(all.join("\n\n"))
+            };
+            if response.clicked() {
+                self.show_notices = !self.show_notices;
+            }
+            if self.show_notices {
+                for (color, text) in &notices {
+                    notice(ui, *color, text);
+                }
+            }
         }
         ui.add_space(2.0);
 
@@ -427,13 +564,20 @@ impl Browser {
             for position in range {
                 let index = self.visible[position];
                 let photo = &catalog.photos[index];
-                if !self.thumbnails.contains_key(&photo.id)
-                    && !self.pending_thumbnails.contains(&photo.id)
-                {
+                if self.thumbnails.contains_key(&photo.id) {
+                    // Keep on-screen images ahead of older cached thumbnails.
+                    self.thumbnail_order.retain(|cached| *cached != photo.id);
+                    self.thumbnail_order.push_back(photo.id);
+                } else if !self.pending_thumbnails.contains(&photo.id) {
                     let orientation = photo.geometry.as_ref().map(|g| g.orientation).unwrap_or(1);
                     if self
                         .thumbnail_tx
-                        .try_send((photo.id, photo.path.clone(), orientation))
+                        .try_send((
+                            self.thumbnail_generation,
+                            photo.id,
+                            photo.path.clone(),
+                            orientation,
+                        ))
                         .is_ok()
                     {
                         self.pending_thumbnails.insert(photo.id);
@@ -449,6 +593,9 @@ impl Browser {
                     self.selected == Some(index),
                     self.edited.contains(&photo.id),
                 );
+                if let Some(error) = file_menu::show(&response, &photo.path) {
+                    self.error = Some(error);
+                }
                 if response.clicked() {
                     response.surrender_focus();
                     next_position = Some(position);
@@ -614,6 +761,199 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn visible_thumbnails_survive_cache_turnover_without_reloading() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut browser = Browser::test_catalog(
+            "/test.lrcat".into(),
+            photos(THUMBNAIL_CACHE_LIMIT + 32),
+            0,
+            &ctx,
+            &Scheduler::default(),
+        );
+        let (requests_tx, requests_rx) = mpsc::sync_channel(24);
+        let (results_tx, results_rx) = mpsc::channel();
+        browser.thumbnail_tx = requests_tx;
+        browser.thumbnail_rx = results_rx;
+        let preview = crate::PreviewTextureData {
+            size: [4, 2],
+            rgba: vec![255; 32],
+        };
+        for index in 0..THUMBNAIL_CACHE_LIMIT {
+            browser.selected = Some(index);
+            let path = browser.catalog.as_ref().unwrap().photos[index].path.clone();
+            browser.source_thumbnail(&ctx, &path, &preview);
+        }
+        // Put the old policy's next victim on screen, regardless of hash order.
+        let visible_id = *browser.thumbnails.keys().next().unwrap();
+        browser
+            .catalog
+            .as_mut()
+            .unwrap()
+            .photos
+            .swap(0, visible_id as usize);
+        browser.selected = None;
+        let texture_id = browser.thumbnails[&visible_id].as_ref().unwrap().id();
+        for frame in 0..33 {
+            if frame > 0 {
+                results_tx
+                    .send((
+                        browser.thumbnail_generation,
+                        (THUMBNAIL_CACHE_LIMIT + frame - 1) as i64,
+                        Some(image::RgbaImage::new(4, 2)),
+                    ))
+                    .unwrap();
+            }
+            let width = if frame < 16 {
+                260.
+            } else {
+                [210., 480., 333.][frame % 3]
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 700.),
+                    )),
+                    time: Some(frame as f64 / 60.),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("catalog")
+                        .exact_width(width)
+                        .show(ctx, |ui| browser.show(ui, ctx, &mut 0));
+                },
+            );
+            assert_eq!(
+                browser
+                    .thumbnails
+                    .get(&visible_id)
+                    .and_then(Option::as_ref)
+                    .map(egui::TextureHandle::id),
+                Some(texture_id),
+                "visible thumbnail disappeared on frame {frame}"
+            );
+            assert!(
+                requests_rx.try_iter().all(|(_, id, _, _)| id != visible_id),
+                "visible thumbnail was requeued on frame {frame}"
+            );
+        }
+        assert_eq!(browser.thumbnails.len(), THUMBNAIL_CACHE_LIMIT);
+    }
+
+    #[test]
+    fn refresh_invalidates_thumbnails_and_ignores_late_results_from_the_old_catalog() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut browser = Browser::test_catalog(
+            "/test.lrcat".into(),
+            photos(2),
+            0,
+            &ctx,
+            &Scheduler::default(),
+        );
+        let (requests_tx, requests_rx) = mpsc::sync_channel(24);
+        let (results_tx, results_rx) = mpsc::channel();
+        browser.thumbnail_tx = requests_tx;
+        browser.thumbnail_rx = results_rx;
+        browser.cache_thumbnail(
+            0,
+            Some(ctx.load_texture(
+                "old",
+                egui::ColorImage::new([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            )),
+        );
+        browser.cache_thumbnail(1, None);
+        browser.pending_thumbnails.insert(0);
+        let generation = browser.thumbnail_generation;
+        let (tx, rx) = mpsc::channel();
+        browser.loading = Some(rx);
+        let mut updated = photos(2);
+        updated[0].geometry.as_mut().unwrap().orientation = 6;
+        updated[0].path = "/moved/photo.ARW".into();
+        tx.send(Ok(Catalog {
+            path: browser.path.clone(),
+            photos: updated,
+            schema_version: None,
+        }))
+        .unwrap();
+        results_tx
+            .send((generation, 0, Some(image::RgbaImage::new(1, 1))))
+            .unwrap();
+        results_tx.send((generation, 1, None)).unwrap();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| browser.show(ui, ctx, &mut 0));
+        });
+        assert_eq!(browser.thumbnail_generation, generation + 1);
+        assert!(browser.thumbnails.is_empty());
+        assert!(browser.thumbnail_order.is_empty());
+        let requests: Vec<_> = requests_rx.try_iter().collect();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|(g, _, _, _)| *g == generation + 1));
+        assert!(requests.iter().any(|(_, id, path, orientation)| *id == 0
+            && *path == PathBuf::from("/moved/photo.ARW")
+            && *orientation == 6));
+    }
+
+    #[test]
+    fn thumbnail_cache_updates_preserve_other_entries_and_failed_loads_preserve_good_images() {
+        let ctx = egui::Context::default();
+        let mut browser = Browser::test_catalog(
+            "/test.lrcat".into(),
+            photos(1),
+            0,
+            &ctx,
+            &Scheduler::default(),
+        );
+        let texture = ctx.load_texture(
+            "thumbnail",
+            egui::ColorImage::new([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        for id in 0..THUMBNAIL_CACHE_LIMIT as i64 {
+            browser.cache_thumbnail(id, Some(texture.clone()));
+        }
+        let last = THUMBNAIL_CACHE_LIMIT as i64 - 1;
+        browser.cache_thumbnail(last, Some(texture.clone()));
+        browser.cache_thumbnail(last, None);
+        assert_eq!(browser.thumbnails.len(), THUMBNAIL_CACHE_LIMIT);
+        assert!(browser.thumbnails.contains_key(&0));
+        assert_eq!(
+            browser.thumbnails[&last].as_ref().unwrap().id(),
+            texture.id()
+        );
+
+        browser.cache_thumbnail(last + 1, None);
+        assert_eq!(browser.thumbnails.len(), THUMBNAIL_CACHE_LIMIT);
+        assert_eq!(browser.thumbnail_order.len(), THUMBNAIL_CACHE_LIMIT);
+        assert!(!browser.thumbnails.contains_key(&0));
+        assert!(browser.thumbnails[&(last + 1)].is_none());
+    }
+
+    #[test]
+    fn preload_order_follows_the_filter_and_skips_non_raw_and_missing_files() {
+        let ctx = egui::Context::default();
+        let mut photos = photos(9);
+        photos[5].path.set_extension("jpg");
+        photos[7].available = false;
+        photos[1].flag = -1;
+        for i in [0, 2, 4, 6, 8] {
+            photos[i].flag = 1;
+        }
+        let mut browser =
+            Browser::test_catalog("/test.lrcat".into(), photos, 4, &ctx, &Scheduler::default());
+        let ids = |photos: Vec<Photo>| photos.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(browser.preload_photos(2)), [6, 3, 8, 2]);
+        browser.accepted_only = true;
+        browser.filter();
+        assert_eq!(ids(browser.preload_photos(2)), [6, 2, 8, 0]);
+        browser.selected = Some(0);
+        assert_eq!(ids(browser.preload_photos(2)), [2, 4]);
+        assert!(browser.preload_photos(0).is_empty());
+    }
+
     /// The panel must keep the width the user chose: list rows that overflow
     /// the scroll area (e.g. by ignoring its scrollbar) make egui widen the
     /// panel again on the next frame.
@@ -648,7 +988,7 @@ mod tests {
                     |ctx| {
                         panel_width = egui::SidePanel::left("catalog")
                             .exact_width(width)
-                            .show(ctx, |ui| browser.show(ui, ctx))
+                            .show(ctx, |ui| browser.show(ui, ctx, &mut 2))
                             .response
                             .rect
                             .width();

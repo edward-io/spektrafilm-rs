@@ -30,6 +30,8 @@ struct Params {
     coefficients0: [f32; 4],
     coefficients1: [f32; 4],
     flags: [f32; 4],
+    transform0: [f32; 4],
+    transform1: [f32; 4],
 }
 impl Renderer {
     pub fn new(state: &egui_wgpu::RenderState) -> Arc<Self> {
@@ -182,9 +184,54 @@ impl Renderer {
         }
         let uv0 = (visible.min - rect.min) / rect.size();
         let uv1 = (visible.max - rect.min) / rect.size();
-        let coeff = coefficients(development.unwrap_or(1.));
+        let params = self.params(image, opacity, interpolation, development, fade);
         let params = Params {
             uv: [uv0.x, uv0.y, uv1.x, uv1.y],
+            ..params
+        };
+        self.draw(painter, visible, params, image, previous);
+    }
+
+    /// Paint `image` over the whole clip rect through `to_image`, which maps a
+    /// screen position to image pixels (e.g. the image rotated under the crop
+    /// tool). Screen pixels outside the image stay transparent.
+    pub fn paint_mapped(
+        self: &Arc<Self>,
+        painter: &egui::Painter,
+        image: &Arc<Image>,
+        interpolation: &str,
+        to_image: impl Fn(egui::Pos2) -> egui::Pos2,
+    ) {
+        let visible = painter.clip_rect();
+        if !visible.is_positive() {
+            return;
+        }
+        let size = egui::vec2(image.size[0] as f32, image.size[1] as f32);
+        // Affine: image uv from viewport uv, from three mapped corners.
+        let uv = |p: egui::Pos2| (to_image(p).to_vec2() / size).to_pos2();
+        let origin = uv(visible.left_top());
+        let x = uv(visible.right_top()) - origin;
+        let y = uv(visible.left_bottom()) - origin;
+        let params = Params {
+            uv: [0., 0., 1., 1.],
+            transform0: [x.x, y.x, x.y, y.y],
+            transform1: [origin.x, origin.y, 1., 0.],
+            ..self.params(image, 1., interpolation, None, 1.)
+        };
+        self.draw(painter, visible, params, image, None);
+    }
+
+    fn params(
+        &self,
+        image: &Image,
+        opacity: f32,
+        interpolation: &str,
+        development: Option<f32>,
+        fade: f32,
+    ) -> Params {
+        let coeff = coefficients(development.unwrap_or(1.));
+        Params {
+            uv: [0., 0., 1., 1.],
             options: [
                 opacity,
                 INTERPOLATIONS
@@ -199,7 +246,19 @@ impl Renderer {
             coefficients0: coeff[..4].try_into().unwrap(),
             coefficients1: coeff[4..8].try_into().unwrap(),
             flags: [coeff[8], self.linear_framebuffer as u8 as f32, 0., 0.],
-        };
+            transform0: [1., 0., 0., 1.],
+            transform1: [0.; 4],
+        }
+    }
+
+    fn draw(
+        self: &Arc<Self>,
+        painter: &egui::Painter,
+        visible: egui::Rect,
+        params: Params,
+        image: &Arc<Image>,
+        previous: Option<&Arc<Image>>,
+    ) {
         let uniform = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -381,6 +440,8 @@ mod tests {
                 coefficients0: coeff[..4].try_into().unwrap(),
                 coefficients1: coeff[4..8].try_into().unwrap(),
                 flags: [coeff[8], 0., 0., 0.],
+                transform0: [1., 0., 0., 1.],
+                transform1: [0.; 4],
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,

@@ -2,7 +2,7 @@
 #[path = "color_registry.rs"]
 mod registry;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Transfer {
     Linear,
     Srgb,

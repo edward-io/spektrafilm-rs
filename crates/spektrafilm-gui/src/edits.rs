@@ -36,6 +36,8 @@ pub struct PhotoEdit {
     /// RAW development options; the Lightroom crop is always re-read from the
     /// catalog instead.
     pub raw: spektrafilm_io::RawOptions,
+    /// Crop and straightening; `None` (never cropped here) uses Lightroom's.
+    pub crop: Option<spektrafilm_io::crop::Crop>,
 }
 
 impl Default for PhotoEdit {
@@ -48,6 +50,7 @@ impl Default for PhotoEdit {
             scan_for_print_restore: None,
             rotation: 0,
             raw: Default::default(),
+            crop: None,
         }
     }
 }
@@ -364,7 +367,7 @@ fn migrate(version: i64, document: Value) -> Result<Value> {
 
 /// Overlay `update` on `base`, keeping keys only `base` has (fields from a
 /// newer build that this one doesn't know about).
-fn merge(base: &mut Value, update: Value) {
+pub(crate) fn merge(base: &mut Value, update: Value) {
     match (base, update) {
         (Value::Object(base), Value::Object(update)) => {
             for (key, value) in update {
@@ -396,6 +399,8 @@ mod tests {
         let mut edit = PhotoEdit::default();
         edit.film = "kodak_portra_400".into();
         edit.params.camera.exposure_compensation_ev = 1.5;
+        edit.params.camera.tone.shadows = 75.;
+        edit.params.camera.tone.highlights = -45.;
         edit.rotation = 3;
         store.save(catalog, 7, &edit, 0).unwrap();
 

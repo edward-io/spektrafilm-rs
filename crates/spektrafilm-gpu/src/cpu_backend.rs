@@ -72,19 +72,21 @@ fn dgemm_blas(
     #[cfg(target_os = "windows")]
     {
         let _ = ldb;
-        c.par_chunks_exact_mut(n).enumerate().for_each(|(row, crow)| {
-            for col in 0..n {
-                let mut sum = 0.0f64;
-                for kk in 0..k {
-                    let bv = match trans_b {
-                        Transpose::None => b[kk * n + col],
-                        Transpose::Ordinary => b[col * k + kk],
-                    };
-                    sum += a[row * k + kk] * bv;
+        c.par_chunks_exact_mut(n)
+            .enumerate()
+            .for_each(|(row, crow)| {
+                for col in 0..n {
+                    let mut sum = 0.0f64;
+                    for kk in 0..k {
+                        let bv = match trans_b {
+                            Transpose::None => b[kk * n + col],
+                            Transpose::Ordinary => b[col * k + kk],
+                        };
+                        sum += a[row * k + kk] * bv;
+                    }
+                    crow[col] = sum;
                 }
-                crow[col] = sum;
-            }
-        });
+            });
     }
 }
 

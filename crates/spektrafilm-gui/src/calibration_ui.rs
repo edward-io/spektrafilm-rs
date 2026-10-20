@@ -73,41 +73,44 @@ impl App {
         std::thread::Builder::new()
             .name("spektrafilm-calibration".into())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || -> Result<Output, String> {
-                        let _scope = task.enter();
-                        let _cpu = task.cpu().map_err(|e| e.to_string())?;
-                        let film = profile::load_profile_by_name(&data, &film)
-                            .map_err(|e| e.to_string())?;
-                        match action {
-                            Action::Base => {
-                                let (base, ev) = spektrafilm_core::calibration::detect_base(
-                                    image.as_deref().ok_or("load an image first")?,
-                                    film,
-                                    &p,
-                                )?;
-                                Ok(Output::Base(base, ev))
-                            }
-                            Action::Device => Ok(Output::Device(
-                                spektrafilm_core::calibration::blind_calibration(
-                                    image.as_deref().ok_or("load an image first")?,
-                                    film,
-                                    &p,
-                                )?,
-                            )),
-                            Action::Printer => {
-                                let paper = profile::load_profile_by_name(&data, &paper)
+                let result = task
+                    .run(|| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<Output, String> {
+                                let _cpu = task.cpu().map_err(|e| e.to_string())?;
+                                let film = profile::load_profile_by_name(&data, &film)
                                     .map_err(|e| e.to_string())?;
-                                Ok(Output::Printer(
-                                    spektrafilm_core::calibration::neutral_print_balance(
-                                        film, paper, &p, &data,
-                                    )?,
-                                ))
-                            }
-                        }
-                    },
-                ))
-                .unwrap_or_else(|panic| Err(panic_message(panic)));
+                                match action {
+                                    Action::Base => {
+                                        let (base, ev) =
+                                            spektrafilm_core::calibration::detect_base(
+                                                image.as_deref().ok_or("load an image first")?,
+                                                film,
+                                                &p,
+                                            )?;
+                                        Ok(Output::Base(base, ev))
+                                    }
+                                    Action::Device => Ok(Output::Device(
+                                        spektrafilm_core::calibration::blind_calibration(
+                                            image.as_deref().ok_or("load an image first")?,
+                                            film,
+                                            &p,
+                                        )?,
+                                    )),
+                                    Action::Printer => {
+                                        let paper = profile::load_profile_by_name(&data, &paper)
+                                            .map_err(|e| e.to_string())?;
+                                        Ok(Output::Printer(
+                                            spektrafilm_core::calibration::neutral_print_balance(
+                                                film, paper, &p, &data,
+                                            )?,
+                                        ))
+                                    }
+                                }
+                            },
+                        ))
+                    })
+                    .unwrap_or_else(|panic| Err(panic_message(panic)));
                 let _ = tx.send(result);
             })
             .map_err(|e| self.status = format!("Calibration could not start: {e}"))

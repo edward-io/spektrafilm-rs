@@ -47,6 +47,10 @@ enum Commands {
         /// Geometry imported from Lightroom (JSON); no color adjustments are applied.
         #[arg(long)]
         lightroom_geometry: Option<String>,
+        /// Crop and straighten after rotation (JSON, as saved by the GUI). Grain
+        /// and other spatial effects keep the size they have in the whole frame.
+        #[arg(long)]
+        crop: Option<String>,
         /// Output image path.
         #[arg(short, long)]
         output: PathBuf,
@@ -187,6 +191,7 @@ fn main() -> Result<()> {
             input,
             rotate_quarter_turns,
             lightroom_geometry,
+            crop,
             output,
             film,
             paper,
@@ -230,6 +235,7 @@ fn main() -> Result<()> {
                 lens_database.as_deref(),
                 rotate_quarter_turns,
                 lightroom_geometry.as_deref(),
+                crop.as_deref(),
             )?;
         }
         Commands::ListProfiles { data_dir } => {
@@ -297,6 +303,7 @@ fn cmd_process(
     lens_database: Option<&Path>,
     rotate_quarter_turns: u8,
     lightroom_geometry: Option<&str>,
+    crop: Option<&str>,
 ) -> Result<()> {
     let total_start = Instant::now();
 
@@ -347,21 +354,19 @@ fn cmd_process(
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
-    let loaded = spektrafilm_io::load(
-        input,
-        &spektrafilm_io::RawOptions {
-            decoder: raw_decoder.into(),
-            white_balance: white_balance.into(),
-            temperature,
-            tint,
-            lens_correction,
-            lens_database: lens_database.map(Path::to_path_buf),
-            lightroom_geometry: lightroom_geometry
-                .map(serde_json::from_str)
-                .transpose()
-                .context("parsing Lightroom geometry")?,
-        },
-    )?;
+    let raw_options = spektrafilm_io::RawOptions {
+        decoder: raw_decoder.into(),
+        white_balance: white_balance.into(),
+        temperature,
+        tint,
+        lens_correction,
+        lens_database: lens_database.map(Path::to_path_buf),
+        lightroom_geometry: lightroom_geometry
+            .map(serde_json::from_str)
+            .transpose()
+            .context("parsing Lightroom geometry")?,
+    };
+    let loaded = spektrafilm_io::load(input, &raw_options)?;
     if !input_overrides[0] {
         params.io.input_color_space = loaded.color_space;
     }
@@ -376,10 +381,32 @@ fn cmd_process(
             .into(),
         encoded: saving_cctf_encoding.unwrap_or(params.io.output_cctf_encoding),
     };
+    let crop: Option<spektrafilm_io::crop::Crop> = crop
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing crop")?;
+    let metadata = loaded
+        .metadata
+        .with_edit_settings(&spektrafilm_io::EditSettings {
+            film: film_name,
+            paper: &print_stock,
+            params: &params,
+            raw: &raw_options,
+            rotation: rotate_quarter_turns % 4,
+            crop: crop.unwrap_or_default(),
+        })?;
     let image = if rotate_quarter_turns == 0 {
         loaded.pixels
     } else {
         loaded.pixels.rotated_quarter_turns(rotate_quarter_turns)
+    };
+    let image = match crop {
+        Some(crop) => {
+            params.camera.film_format_mm *=
+                crop.long_side_fraction(image.width as f64, image.height as f64) as f32;
+            crop.apply(&image)?
+        }
+        None => image,
     };
     eprintln!(
         "Image loaded: {}x{} in {} ms",
@@ -427,7 +454,7 @@ fn cmd_process(
         pipeline.params.io.output_cctf_encoding,
         output,
         &save_options,
-        &loaded.metadata,
+        &metadata,
         data_dir,
     )?;
     eprintln!(

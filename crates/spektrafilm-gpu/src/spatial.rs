@@ -49,7 +49,7 @@ impl State {
         let y = groups.div_ceil(self.pixel_grid_limit).max(1);
         [groups.div_ceil(y), y, 1]
     }
-    fn dispatch<T: bytemuck::Pod>(
+    pub(super) fn dispatch<T: bytemuck::Pod>(
         &mut self,
         b: &WgpuBackend,
         shader: &'static str,

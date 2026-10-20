@@ -2,6 +2,15 @@ use crate::params::*;
 
 impl RuntimeParams {
     pub fn validate(&self) -> Result<(), String> {
+        if !self
+            .camera
+            .tone
+            .values()
+            .iter()
+            .all(|v| v.is_finite() && (-100. ..=100.).contains(v))
+        {
+            return Err("input tone controls must be finite and between -100 and 100".into());
+        }
         spektrafilm_math::illuminants::get(&self.enlarger.illuminant)?;
         spektrafilm_math::illuminants::get(&self.film_render.convert.scan_illuminant)?;
         crate::spectral_service::taking_filter(&self.camera.color_filter)?;

@@ -8,6 +8,8 @@ struct Params {
     coefficients0:vec4<f32>, // neutral, yellow, magenta, cyan
     coefficients1:vec4<f32>, // receiver, silver, anti, warm
     flags:vec4<f32>, // stain, linear framebuffer, unused, unused
+    transform0:vec4<f32>, // optional affine map from uv: x row, y row
+    transform1:vec4<f32>, // offset, enabled (pixels outside the image are transparent)
 }
 @group(0) @binding(0) var image:texture_2d<f32>;
 @group(0) @binding(1) var previous:texture_2d<f32>;
@@ -80,9 +82,14 @@ fn developing(rgb:vec3<f32>)->vec3<f32> {
     return exp(-clamp(d,vec3<f32>(0.),vec3<f32>(8.))/2.2);
 }
 @fragment fn fs_main(in:Vertex)->@location(0) vec4<f32> {
-    var rgb=sample_image(in.uv,false);
+    var uv=in.uv;
+    if p.transform1.z>0.5 {
+        uv=vec2<f32>(dot(p.transform0.xy,in.uv),dot(p.transform0.zw,in.uv))+p.transform1.xy;
+        if any(uv<vec2<f32>(0.)) || any(uv>vec2<f32>(1.)) {return vec4<f32>(0.);}
+    }
+    var rgb=sample_image(uv,false);
     if p.options.z>=0. {rgb=developing(rgb);}
-    if p.options.w<1. {rgb=mix(sample_image(in.uv,true),rgb,p.options.w);}
+    if p.options.w<1. {rgb=mix(sample_image(uv,true),rgb,p.options.w);}
     rgb=clamp(rgb,vec3<f32>(0.),vec3<f32>(1.));
     // egui composites in gamma space; match it on either framebuffer format.
     rgb*=p.options.x;

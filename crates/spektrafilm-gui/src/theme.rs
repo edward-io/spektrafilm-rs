@@ -48,6 +48,16 @@ fn fonts() -> FontDefinitions {
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
     proportional.insert(0, "Inter".into());
     let fallbacks = proportional[1..].to_vec();
+    // Icons get their own family: Inter has glyphs of its own at some of the
+    // private-use code points Phosphor uses.
+    fonts.font_data.insert(
+        "phosphor".into(),
+        Arc::new(egui_phosphor::Variant::Regular.font_data()),
+    );
+    fonts.families.insert(
+        FontFamily::Name(crate::icons::FAMILY.into()),
+        vec!["phosphor".into()],
+    );
     let mono = fonts.families.entry(FontFamily::Monospace).or_default();
     mono.insert(0, "JetBrainsMono".into());
     fonts.families.insert(

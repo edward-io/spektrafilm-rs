@@ -2,8 +2,8 @@
 //!
 //! Opening a photo restores its saved look and history. A photo without saved
 //! settings starts from the startup defaults (never from whatever was on screen
-//! before), and only gets rows once it is edited; "Apply previous settings"
-//! (P) copies the last photo's look on purpose. Every recorded history step is
+//! before), and only gets rows once it is edited; Copy / Paste settings (C, P)
+//! carries a look across on purpose. Every recorded history step is
 //! saved, together with the photo's look and its current history position.
 //! Standalone images get the same history in memory.
 use super::*;
@@ -22,6 +22,7 @@ impl App {
             scan_for_print_restore: self.scan_for_print_restore,
             rotation: self.rotation,
             raw,
+            crop: self.committed_crop_option(),
         }
     }
 
@@ -194,6 +195,11 @@ impl App {
                 on_off(current.scan_for_print_restore.is_some())
             );
         }
+        if let (Some(old), Some(new)) = (previous.crop, current.crop)
+            && old != new
+        {
+            return crop_ui::describe(&old, &new);
+        }
         let pointers = inspector::diff_pointers(&previous.params, &current.params);
         let mut names: Vec<String> = Vec::new();
         for pointer in &pointers {
@@ -291,6 +297,8 @@ impl App {
             let geometry = self.raw_options.lightroom_geometry.take();
             self.raw_options = edit.raw;
             self.raw_options.lightroom_geometry = geometry;
+            self.crop = edit.crop;
+            self.crop_tool = None;
         }
         self.dirty = true;
         self.pending_dirty = self.render_job.is_some();
@@ -298,7 +306,7 @@ impl App {
 
     /// Startup defaults if saved, otherwise factory settings with the stock's
     /// own defaults: what "Reset to defaults" restores.
-    fn default_edit(&self) -> PhotoEdit {
+    pub(super) fn default_edit(&self) -> PhotoEdit {
         if let Ok(project) = project::Project::load(&project::default_path()) {
             return PhotoEdit {
                 film: project.film,
@@ -307,6 +315,7 @@ impl App {
                 scan_for_print_restore: project.scan_for_print_restore,
                 rotation: 0,
                 raw: project.raw,
+                crop: None,
             };
         }
         // Factory settings: the default stocks, never whatever is on screen.
@@ -326,24 +335,16 @@ impl App {
         self.record_step();
     }
 
-    /// Apply the look of the photo viewed before this one (P), as one step.
-    pub(crate) fn apply_previous_edit(&mut self) {
-        let Some(edit) = self.previous_edit.clone() else {
-            return;
-        };
-        self.apply_edit(edit, false);
-        self.pending_label = Some("Apply previous settings".into());
-        self.record_step();
-    }
-
+    /// Copy this photo's look (C). It stays copied until the next copy.
     pub(crate) fn copy_photo_edit(&mut self) {
         self.copied_edit = Some(self.current_edit());
-        self.status = "Settings copied".into();
+        self.status = "Settings copied. Press P on another photo to paste them.".into();
     }
 
-    /// Paste the copied look (not rotation or RAW options) as one history step.
+    /// Paste the copied look (P; not rotation or RAW options) as one history step.
     pub(crate) fn paste_photo_edit(&mut self) {
         let Some(edit) = self.copied_edit.clone() else {
+            self.status = "Nothing copied yet: press C on a photo to copy its settings.".into();
             return;
         };
         self.apply_edit(edit, false);
@@ -385,14 +386,29 @@ fn snapshot_state(snapshot: &Snapshot) -> serde_json::Value {
         "paper": snapshot.print,
         "params": *snapshot.params,
         "scan_for_print_restore": snapshot.scan_for_print_restore,
+        "crop": snapshot.crop,
     })
 }
 
 fn state_snapshot(state: &serde_json::Value) -> Option<Snapshot> {
+    let mut params = state.get("params")?.clone();
+    // Old steps need the same neutral fields as RuntimeParams deserialization,
+    // or Undo followed by recording would create a phantom edit and lose Redo.
+    if let Some(camera) = params
+        .get_mut("camera")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let mut tone =
+            serde_json::to_value(spektrafilm_core::params::ToneParams::default()).ok()?;
+        if let Some(saved) = camera.remove("tone") {
+            edits::merge(&mut tone, saved);
+        }
+        camera.insert("tone".into(), tone);
+    }
     Some(Snapshot {
         film: state.get("film")?.as_str()?.to_owned(),
         print: state.get("paper")?.as_str()?.to_owned(),
-        params: Arc::new(state.get("params")?.clone()),
+        params: Arc::new(params),
         scan_for_print_restore: serde_json::from_value(
             state
                 .get("scan_for_print_restore")
@@ -400,6 +416,7 @@ fn state_snapshot(state: &serde_json::Value) -> Option<Snapshot> {
                 .unwrap_or_default(),
         )
         .ok()?,
+        crop: serde_json::from_value(state.get("crop").cloned().unwrap_or_default()).ok()?,
     })
 }
 
@@ -556,6 +573,7 @@ mod tests {
         open(&mut app, &catalog, &a);
         let default_ev = ev(&app);
         app.params.camera.exposure_compensation_ev = 1.25;
+        app.params.camera.tone.shadows = 65.;
         app.commit_photo_edit();
 
         // B has no saved settings, so it starts from the defaults, not A's look.
@@ -581,6 +599,7 @@ mod tests {
         assert_eq!(ev(&app), -0.5);
         select(&mut app, &a);
         assert_eq!(ev(&app), 1.25);
+        assert_eq!(app.params.camera.tone.shadows, 65.);
         let edited = app.edit_store.as_ref().unwrap().edited(&catalog).unwrap();
         assert_eq!(edited, std::collections::HashSet::from([1, 2]));
 
@@ -592,33 +611,70 @@ mod tests {
     }
 
     #[test]
-    fn apply_previous_copies_the_last_photos_look_as_one_saved_step() {
+    fn old_history_defaults_do_not_create_edits_or_discard_redo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app(&dir.path().join("edits.sqlite"));
+        app.rebase_history();
+        let mut state = snapshot_state(&app.snapshot());
+        state["params"]["camera"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tone");
+        let start = state_snapshot(&state).unwrap();
+        app.history.reset(start.clone(), "Start");
+        state["params"]["camera"]["exposure_compensation_ev"] = serde_json::json!(1.);
+        // A delta saved over an old history base may contain only one new leaf.
+        state["params"]["camera"]["tone"] = serde_json::json!({"shadows":65.});
+        let next = state_snapshot(&state).unwrap();
+        app.history.commit(next.clone(), "Exposure".into());
+        app.apply_snapshot(next);
+        let previous = app.history.undo().unwrap();
+        app.apply_snapshot(previous);
+        assert!(app.params.camera.tone.is_identity());
+        assert!(!app.record_step(), "adding neutral defaults is not an edit");
+        assert!(
+            app.history.can_redo(),
+            "upgrading old steps must preserve Redo"
+        );
+        assert_eq!(app.history.steps().len(), 2);
+        let next = app.history.redo().unwrap();
+        app.apply_snapshot(next);
+        assert_eq!(app.params.camera.tone.shadows, 65.);
+        assert!(
+            !app.record_step(),
+            "partial tone groups must also gain neutral defaults"
+        );
+    }
+
+    #[test]
+    fn copied_settings_paste_onto_another_photo_as_one_saved_step() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("edits.sqlite");
         let catalog = write_catalog(dir.path());
         let (a, b) = (photo(dir.path(), 1), photo(dir.path(), 2));
         let mut app = new_app(&store);
         open(&mut app, &catalog, &a);
-        assert!(
-            app.previous_edit.is_none(),
-            "nothing to apply on the first photo"
-        );
+        app.paste_photo_edit();
+        assert!(!app.history.can_undo(), "nothing to paste yet");
         app.params.camera.exposure_compensation_ev = 1.25;
+        app.params.camera.tone.shadows = 65.;
         app.film_name = "kodak_portra_400".into();
         app.commit_photo_edit();
+        app.copy_photo_edit();
 
+        // Passing through other photos doesn't change what was copied.
         select(&mut app, &b);
         let default_ev = ev(&app);
-        app.apply_previous_edit();
+        select(&mut app, &a);
+        select(&mut app, &b);
+        app.paste_photo_edit();
         assert_eq!(ev(&app), 1.25);
+        assert_eq!(app.params.camera.tone.shadows, 65.);
         assert_eq!(app.film_name, "kodak_portra_400");
-        assert_eq!(app.history.undo_label(), Some("Apply previous settings"));
+        assert_eq!(app.history.undo_label(), Some("Paste settings"));
         app.undo();
-        assert_eq!(
-            ev(&app),
-            default_ev,
-            "applying the previous look is undoable"
-        );
+        assert_eq!(ev(&app), default_ev, "pasting is undoable");
+        assert!(app.params.camera.tone.is_identity());
         app.redo();
         app.leave_photo();
         drop(app);
@@ -626,6 +682,7 @@ mod tests {
         let mut app = new_app(&store);
         open(&mut app, &catalog, &b);
         assert_eq!(ev(&app), 1.25, "the applied look was saved for B");
+        assert_eq!(app.params.camera.tone.shadows, 65.);
     }
 
     #[test]
@@ -742,6 +799,7 @@ mod tests {
             film: "kodak_gold_200".into(),
             print: "kodak_portra_endura".into(),
             scan_for_print_restore: None,
+            crop: None,
         };
         let mut app = app;
         assert_eq!(

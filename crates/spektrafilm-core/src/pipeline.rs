@@ -286,7 +286,7 @@ impl Pipeline {
         let ref_illuminant_f64 = select_illuminant_f64(&film.info.reference_illuminant);
         spectral_service::apply_camera_bandpass(
             &mut sensitivity,
-            ref_illuminant_f64,
+            &ref_illuminant_f64,
             params.camera.filter_uv,
             params.camera.filter_ir,
         );
@@ -312,7 +312,7 @@ impl Pipeline {
                     &spectra,
                     &sensitivity,
                     &film.data.hanatos2025_adaptation_window_params,
-                    ref_illuminant_f64,
+                    &ref_illuminant_f64,
                 )
             } else {
                 spectral_service::compute_tc_lut(&spectra, &sensitivity)
@@ -321,7 +321,7 @@ impl Pipeline {
                 spectral_service::apply_surface(
                     &mut lut,
                     &film.data.hanatos2025_adaptation_surface_params,
-                    ref_illuminant,
+                    &ref_illuminant,
                 );
             }
             lut
@@ -332,14 +332,18 @@ impl Pipeline {
             } else {
                 spectral_service::load_method(data_dir, method)?
             };
-            spectral_service::compute_reflectance_tc_lut(&spectra, &sensitivity, ref_illuminant_f64)
+            spectral_service::compute_reflectance_tc_lut(
+                &spectra,
+                &sensitivity,
+                &ref_illuminant_f64,
+            )
         };
         let spec = &params.io.input_gamut_compress;
         let mut compressor = crate::input_gamut::InputGamutCompress::build(
             if spec.active { &spec.algorithm } else { "off" },
             spec.knee,
         )?;
-        let white = spektrafilm_math::spectral::illuminant_to_xy(select_illuminant("D65"));
+        let white = spektrafilm_math::spectral::illuminant_to_xy(&select_illuminant("D65"));
         compressor.set_boundary(&spec.boundary, spec.hull_detail as f64, [white.0, white.1])?;
         let tc_lut = Some(compressor.remap(&tc_lut, [white.0, white.1]));
 
@@ -360,7 +364,7 @@ impl Pipeline {
         let midgray_raw = |scale: f64| -> [f64; 3] {
             enlarger::midgray_raw_hanatos(
                 tc_lut.as_ref().expect("spectral LUT built"),
-                select_illuminant(&front_illuminant),
+                &select_illuminant(&front_illuminant),
                 params.settings.use_cat16,
                 scale,
             )
@@ -507,6 +511,8 @@ impl Pipeline {
     }
 
     fn passthrough(&self, mut image: ImageBuf) -> ImageBuf {
+        use rayon::prelude::*;
+
         let input = spektrafilm_math::transfer::get(&self.params.io.input_color_space)
             .expect("validated input");
         let output = spektrafilm_math::transfer::get(&self.params.io.output_color_space)
@@ -515,7 +521,7 @@ impl Pipeline {
             &self.params.io.input_color_space,
             &self.params.io.output_color_space,
         );
-        for px in image.pixels_mut() {
+        image.par_pixels_mut().for_each(|px| {
             let decoded = std::array::from_fn::<_, 3, _>(|c| {
                 if self.params.io.input_cctf_decoding {
                     input.transfer.decode(px[c] as f64)
@@ -532,7 +538,7 @@ impl Pipeline {
                         v
                     });
             }
-        }
+        });
         image
     }
 
@@ -578,7 +584,7 @@ impl Pipeline {
                 &meter,
                 lut,
                 &self.params.io.input_color_space,
-                select_illuminant(&self.front_illuminant),
+                &select_illuminant(&self.front_illuminant),
                 self.params.settings.use_cat16,
             )
         } else {
@@ -781,7 +787,7 @@ impl Pipeline {
                 &params,
                 backend,
                 self.tc_lut.as_ref(),
-                select_illuminant(&self.front_illuminant),
+                &select_illuminant(&self.front_illuminant),
                 color_ref.filming_exposure_correction,
             );
             print_stage_timing(stage_timings, "filming.expose", t);
@@ -916,8 +922,8 @@ impl Pipeline {
         {
             return None;
         }
-        // Bake the exposure scale (auto-exposure × manual EV compensation)
-        // into the front-pass matrix. Both upsamplers (hanatos and mallett)
+        // Without input tone, bake camera exposure into the front-pass matrix.
+        // Both upsamplers (hanatos and mallett)
         // are homogeneous in the input RGB, so scaling the matrix is
         // equivalent to scaling the input — saves a separate "scale" compute
         // pass at the head of the chain. Auto-exposure metering itself stays
@@ -937,6 +943,22 @@ impl Pipeline {
         if self.params.camera.exposure_compensation_ev != 0.0 {
             exposure_scale_f64 *= 2.0f64.powf(self.params.camera.exposure_compensation_ev as f64);
         }
+        let input_tone = if !self.params.converts_film() && !self.params.camera.tone.is_identity() {
+            let tone = spektrafilm_gpu::InputToneGpuParams {
+                curve: self
+                    .params
+                    .camera
+                    .tone
+                    .curve(&self.params.io.input_color_space),
+                camera_gain: exposure_scale_f64,
+                regional: !self.params.debug.lut_mode,
+            };
+            // The nonlinear tone curve must see camera exposure before conversion.
+            exposure_scale_f64 = 1.;
+            Some(tone)
+        } else {
+            None
+        };
         // B&W/slide filming exposure correction is a linear scale on the raw
         // film exposure (CPU: `raw *= factor` before log10). Since both
         // upsamplers are homogeneous in the input RGB, folding it into the
@@ -961,7 +983,7 @@ impl Pipeline {
             let ref_illuminant = select_illuminant(&self.front_illuminant);
             let mut rgb_to_adapted = spektrafilm_math::spectral::build_rgb_to_adapted_xyz(
                 &self.params.io.input_color_space,
-                ref_illuminant,
+                &ref_illuminant,
                 self.params.settings.use_cat16,
             );
             fold_exposure(&mut rgb_to_adapted);
@@ -1410,6 +1432,7 @@ impl Pipeline {
             image,
             front,
             input_transfer,
+            input_tone,
             output_transfer: spektrafilm_math::transfer::get(&self.params.io.output_color_space)
                 .ok()?
                 .transfer,
@@ -1489,12 +1512,83 @@ impl Pipeline {
     }
 }
 
-fn select_illuminant(name: &str) -> &'static [f32] {
+fn select_illuminant(name: &str) -> [f32; 81] {
     spektrafilm_math::illuminants::get_f32(name).expect("validated illuminant")
 }
 
-fn select_illuminant_f64(name: &str) -> &'static [f64] {
+fn select_illuminant_f64(name: &str) -> [f64; 81] {
     spektrafilm_math::illuminants::get(name).expect("validated illuminant")
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+    use spektrafilm_math::{precision::from_f64, transfer};
+
+    #[test]
+    fn parallel_input_conversion_matches_serial_for_color_spaces_and_encodings() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let film = crate::profile::load_profile_by_name(&data, "kodak_gold_200").unwrap();
+        let paper = crate::profile::load_profile_by_name(&data, "kodak_portra_endura").unwrap();
+        let image = ImageBuf::from_data(
+            41,
+            17,
+            (0..41 * 17 * 3)
+                .map(|i| {
+                    from_f64(if i % 127 == 0 {
+                        -0.
+                    } else {
+                        (i % 257) as f64 / 127. - 0.1
+                    })
+                })
+                .collect(),
+        );
+        for input in ["sRGB", "ProPhoto RGB", "ACEScg"] {
+            for output in ["sRGB", "ProPhoto RGB", "ACEScg"] {
+                for decode in [false, true] {
+                    for encode in [false, true] {
+                        let mut params = RuntimeParams::default();
+                        params.workflow.route = "input".into();
+                        params.io.input_color_space = input.into();
+                        params.io.output_color_space = output.into();
+                        params.io.input_cctf_decoding = decode;
+                        params.io.output_cctf_encoding = encode;
+                        let matrix = transfer::rgb_matrix(input, output);
+                        let mut expected = image.clone();
+                        for px in expected.pixels_mut() {
+                            let linear: [f64; 3] = std::array::from_fn(|c| {
+                                if decode {
+                                    transfer::get(input).unwrap().transfer.decode(px[c] as f64)
+                                } else {
+                                    px[c] as f64
+                                }
+                            });
+                            for c in 0..3 {
+                                let value = (0..3).map(|k| matrix[c][k] * linear[k]).sum();
+                                px[c] = from_f64(if encode {
+                                    transfer::get(output).unwrap().transfer.encode(value)
+                                } else {
+                                    value
+                                });
+                            }
+                        }
+                        let actual = Pipeline::new(film.clone(), paper.clone(), params)
+                            .process(image.clone(), &spektrafilm_gpu::cpu_backend::CpuBackend);
+                        assert_eq!((actual.width, actual.height), (image.width, image.height));
+                        assert_eq!(actual.data.len(), expected.data.len());
+                        assert!(
+                            actual
+                                .data
+                                .iter()
+                                .zip(&expected.data)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{input} -> {output}, decode={decode}, encode={encode}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1519,6 +1613,17 @@ mod metering_cache_tests {
         let scale = pipeline.auto_exposure_scale(&image);
         assert_eq!(scale, pipeline.auto_exposure_scale(&image));
         let key = pipeline.meter_cache.lock().unwrap().unwrap().0;
+        let mut toned = params.clone();
+        toned.camera.tone.shadows = 80.;
+        toned.camera.tone.highlights = -60.;
+        assert_eq!(
+            pipeline
+                .clone()
+                .with_params(toned)
+                .auto_exposure_scale(&image),
+            scale
+        );
+        assert_eq!(pipeline.meter_cache.lock().unwrap().unwrap().0, key);
         let mut brighter = image.clone();
         for v in &mut brighter.data {
             *v *= 2.;

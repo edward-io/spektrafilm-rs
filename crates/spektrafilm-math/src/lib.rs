@@ -10,6 +10,7 @@ pub mod pchip3d;
 pub mod precision;
 pub mod spectral;
 pub mod stats;
+pub mod tone;
 pub mod vforce;
 
 pub use precision::Scalar;

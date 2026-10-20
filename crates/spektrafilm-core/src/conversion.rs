@@ -25,7 +25,7 @@ impl Conversion {
         let model = FilmConverter::new(
             &dyes,
             &film.data.base_density,
-            spektrafilm_math::illuminants::get(&p.film_render.convert.scan_illuminant)?,
+            &spektrafilm_math::illuminants::get(&p.film_render.convert.scan_illuminant)?,
             &p.io.input_color_space,
             maximum,
         );

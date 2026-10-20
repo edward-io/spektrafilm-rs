@@ -24,7 +24,7 @@ fn white(name: &str) -> Result<[f64; 2], String> {
         "E" => [1. / 3., 1. / 3.],
         _ => {
             let (x, y) = spektrafilm_math::spectral::illuminant_to_xy(
-                spektrafilm_math::illuminants::get_f32(name)?,
+                &spektrafilm_math::illuminants::get_f32(name)?,
             );
             [x, y]
         }

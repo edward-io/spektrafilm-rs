@@ -14,6 +14,8 @@ pub struct AppSettings {
     pub tab: inspector::Tab,
     pub auto_preview: bool,
     pub gpu_export: bool,
+    pub export_format: project::ExportFormat,
+    pub preload_radius: u8,
     pub lut: lut_ui::Settings,
     pub save_options: spektrafilm_io::SaveOptions,
     pub last_catalog: Option<PathBuf>,
@@ -26,6 +28,8 @@ impl Default for AppSettings {
             tab: Default::default(),
             auto_preview: true,
             gpu_export: true,
+            export_format: Default::default(),
+            preload_radius: preload::DEFAULT_RADIUS,
             lut: Default::default(),
             save_options: Default::default(),
             last_catalog: None,
@@ -46,6 +50,8 @@ impl App {
             tab: self.tab,
             auto_preview: self.auto_preview,
             gpu_export: self.gpu_export,
+            export_format: self.export_format,
+            preload_radius: self.preload_radius,
             lut: self.lut.clone(),
             save_options: self.save_options.clone(),
             last_catalog: self.last_catalog.clone(),
@@ -57,6 +63,8 @@ impl App {
         self.tab = settings.tab;
         self.auto_preview = settings.auto_preview;
         self.gpu_export = settings.gpu_export;
+        self.export_format = settings.export_format;
+        self.preload_radius = settings.preload_radius.min(8);
         self.lut = settings.lut;
         self.save_options = settings.save_options;
         self.last_catalog = settings.last_catalog;
@@ -109,6 +117,35 @@ mod tests {
     }
 
     #[test]
+    fn export_format_defaults_and_dialog_filenames_remain_compatible() {
+        let mut app = app();
+        assert_eq!(app.export_format, project::ExportFormat::Jpeg);
+        assert_eq!(app.image_save_name(), "spektrafilm.jpg");
+        app.image_path = Some(PathBuf::from("DSC05014.ARW"));
+        app.film_name = "kodak_gold_200".into();
+        for (format, extension) in [
+            (project::ExportFormat::Jpeg, "jpg"),
+            (project::ExportFormat::Tiff, "tif"),
+            (project::ExportFormat::Png, "png"),
+            (project::ExportFormat::Exr, "exr"),
+        ] {
+            app.export_format = format;
+            assert_eq!(
+                app.image_save_name(),
+                format!("DSC05014_kodak_gold_200_spektra.{extension}")
+            );
+        }
+        let mut legacy = serde_json::to_value(app.settings()).unwrap();
+        legacy.as_object_mut().unwrap().remove("export_format");
+        legacy.as_object_mut().unwrap().remove("preload_radius");
+        legacy["save_options"]["jpeg_quality"] = 77.into();
+        app.apply_settings(serde_json::from_value(legacy).unwrap());
+        assert_eq!(app.export_format, project::ExportFormat::Jpeg);
+        assert_eq!(app.save_options.jpeg_quality, 77);
+        assert_eq!(app.preload_radius, preload::DEFAULT_RADIUS);
+    }
+
+    #[test]
     fn preferences_survive_a_restart_and_reopen_the_last_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = dir.path().join("test.lrcat");
@@ -121,6 +158,8 @@ mod tests {
         first.tab = inspector::Tab::Print;
         first.auto_preview = false;
         first.save_options.jpeg_quality = 77;
+        first.export_format = project::ExportFormat::Tiff;
+        first.preload_radius = 3;
         first.last_catalog = Some(catalog.clone());
         first.store_settings(&mut storage);
 
@@ -131,6 +170,8 @@ mod tests {
         assert_eq!(second.tab, inspector::Tab::Print);
         assert!(!second.auto_preview);
         assert_eq!(second.save_options.jpeg_quality, 77);
+        assert_eq!(second.export_format, project::ExportFormat::Tiff);
+        assert_eq!(second.preload_radius, 3);
         assert_eq!(
             second.catalog.as_ref().map(|c| c.path()),
             Some(catalog.as_path())

@@ -278,12 +278,13 @@ pub(crate) fn cached_noise_gradient(
     input: &LutSpace,
     gain: Option<f64>,
 ) -> std::sync::Arc<NoiseGradientInput> {
-    type Key = (String, u64);
+    type Key = (&'static str, transfer::Transfer, u64);
     type Cache = std::collections::VecDeque<(Key, std::sync::Arc<NoiseGradientInput>)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (
-        input.name.to_owned(),
+        input.primaries,
+        input.curve,
         gain.unwrap_or(input.auto_gain).to_bits(),
     );
     {
@@ -297,11 +298,44 @@ pub(crate) fn cached_noise_gradient(
     }
     let result = std::sync::Arc::new(noise_gradient_input(input, gain, 512, 512));
     let mut entries = cache.lock().unwrap();
+    entries.retain(|(existing, _)| *existing != key);
     if entries.len() >= 4 {
         entries.pop_front();
     }
     entries.push_back((key, result.clone()));
     result
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn noise_gradient_cache_tracks_primaries_and_transfer_instead_of_display_names() {
+        let mut input = LutSpace {
+            name: "cache audit",
+            primaries: "sRGB",
+            tag: "test",
+            input_role: true,
+            output_role: true,
+            curve: transfer::Transfer::Linear,
+            auto_gain: 1.,
+            midgray_linear: 0.18,
+            output_gain: 1.,
+        };
+        let linear = cached_noise_gradient(&input, Some(1.));
+        input.curve = transfer::Transfer::Srgb;
+        let encoded = cached_noise_gradient(&input, Some(1.));
+        assert_ne!(linear.encoded, encoded.encoded);
+        input.primaries = "ACEScg";
+        let wide = cached_noise_gradient(&input, Some(1.));
+        assert_ne!(encoded.encoded, wide.encoded);
+        input.name = "same processing, different label";
+        assert!(std::sync::Arc::ptr_eq(
+            &wide,
+            &cached_noise_gradient(&input, None)
+        ));
+    }
 }
 
 pub struct NoisePolarSample {

@@ -293,6 +293,16 @@ pub fn expose(
     let exp_comp = from_f32(2.0f32.powf(params.camera.exposure_compensation_ev));
     rgb.data.par_iter_mut().for_each(|v| *v *= exp_comp);
 
+    if !params.camera.tone.is_identity() && !params.converts_film() && params.route() != "input" {
+        let curve = params.camera.tone.curve(&params.io.input_color_space);
+        // A LUT lattice has no image space, so it bakes the uniform-region curve.
+        if params.debug.lut_mode {
+            curve.apply_pointwise(&mut rgb);
+        } else {
+            curve.apply(&mut rgb);
+        }
+    }
+
     // RGB → film raw exposure
     let mut raw = if let Some(lut) = tc_lut {
         // Full Hanatos2025 spectral upsampling with CAT02 adaptation.
@@ -513,7 +523,7 @@ pub fn process(
     tc_lut: Option<&TcLut>,
 ) -> ImageBuf {
     let ref_illuminant = select_illuminant(&film.info.reference_illuminant);
-    let log_raw = expose(image, film, params, backend, tc_lut, ref_illuminant, 1.0);
+    let log_raw = expose(image, film, params, backend, tc_lut, &ref_illuminant, 1.0);
     develop(&log_raw, film, params, backend)
 }
 
@@ -521,7 +531,7 @@ pub fn input_colorspace_to_xyz(name: &str) -> [[f32; 3]; 3] {
     spectral::colorspace_to_xyz(name)
 }
 
-pub(crate) fn select_illuminant(name: &str) -> &'static [f32] {
+pub(crate) fn select_illuminant(name: &str) -> [f32; 81] {
     spektrafilm_math::illuminants::get_f32(name).expect("validated illuminant")
 }
 

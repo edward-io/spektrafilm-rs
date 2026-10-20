@@ -243,22 +243,28 @@ fn build(w: usize, h: usize) -> PreviewTextureData {
     PreviewTextureData { size: [w, h], rgba }
 }
 pub fn cached(w: usize, h: usize) -> Arc<PreviewTextureData> {
-    type Entry = ([usize; 2], Arc<PreviewTextureData>);
-    static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
+    static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    cached_in(&CACHE, w, h)
+}
+
+type Entry = ([usize; 2], Arc<PreviewTextureData>);
+
+fn cached_in(cache: &Mutex<Vec<Entry>>, w: usize, h: usize) -> Arc<PreviewTextureData> {
     let long = w.max(h).max(1);
     let w = ((w as f64 * 1024. / long as f64).round_ties_even() as usize).max(1);
     let h = ((h as f64 * 1024. / long as f64).round_ties_even() as usize).max(1);
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some((_, image)) = cache
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(size, _)| *size == [w, h])
     {
-        return image.clone();
+        let mut entries = cache.lock().unwrap();
+        if let Some(index) = entries.iter().position(|(size, _)| *size == [w, h]) {
+            let entry = entries.remove(index);
+            let image = entry.1.clone();
+            entries.push(entry);
+            return image;
+        }
     }
     let result = Arc::new(build(w, h));
     let mut entries = cache.lock().unwrap();
+    entries.retain(|(size, _)| *size != [w, h]);
     if entries.len() >= 8 {
         entries.remove(0);
     }
@@ -268,6 +274,43 @@ pub fn cached(w: usize, h: usize) -> Arc<PreviewTextureData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_evicts_the_least_recently_used_aspect_and_bounds_duplicate_inserts() {
+        let cache = Mutex::new(Vec::new());
+        let first = cached_in(&cache, 1024, 1);
+        for h in 2..=8 {
+            cached_in(&cache, 1024, h);
+        }
+        assert!(Arc::ptr_eq(&first, &cached_in(&cache, 2048, 2)));
+        cached_in(&cache, 1024, 9);
+        assert_eq!(cache.lock().unwrap().len(), 8);
+        assert!(Arc::ptr_eq(&first, &cached_in(&cache, 1024, 1)));
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(size, _)| *size == [1024, 2])
+        );
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    cached_in(&cache, 1024, 10);
+                });
+            }
+        });
+        let entries = cache.lock().unwrap();
+        assert_eq!(entries.len(), 8);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(size, _)| *size == [1024, 10])
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn paper_back_matches_python_default_texture() {
         let fixture: serde_json::Value =

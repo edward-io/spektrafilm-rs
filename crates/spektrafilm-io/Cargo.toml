@@ -10,6 +10,7 @@ precision-f64 = ["spektrafilm-math/precision-f64"]
 [dependencies]
 spektrafilm-math.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 rayon.workspace = true
 image.workspace = true
 exr.workspace = true
@@ -27,9 +28,6 @@ tar = "0.4"
 tempfile = "3"
 moxcms = { version = "0.8.1", features = ["extended_range"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [build-dependencies]
 cc = "1"

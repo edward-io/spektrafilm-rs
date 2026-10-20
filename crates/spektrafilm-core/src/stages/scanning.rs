@@ -75,18 +75,10 @@ fn scanner_lut_bounds(profile: &Profile, params: &RuntimeParams) -> ([f64; 3], [
     (dm, dx)
 }
 
-/// Build a 17³ log_xyz LUT (matching Python's `cmy_to_log_xyz`),
-/// tetrahedral-interpolate per pixel, then apply `10^log_xyz → CAT →
-/// xyz_to_rgb` to get RGB. Glare is added after this returns in RGB
-/// space — algebraically equivalent to Python's add_glare-in-XYZ
-/// because the matrices are linear (see comment in `scan()` below).
-///
-/// This LUTs the *same intermediate quantity* Python LUTs
-/// (`cmy_to_log_xyz`), not the post-`10^x`/post-matrix RGB output —
-/// keeps the tetrahedral interpolating the smoother log10-domain surface
-/// for bit-identical parity with Python's LUT path.
+/// Integrate scan log-XYZ directly, or interpolate it when the LUT is enabled.
+/// Keeping XYZ available lets scanner correction run before CAT and RGB.
 #[allow(clippy::too_many_arguments)]
-fn scan_spectral_via_lut(
+fn scan_spectral_xyz(
     density_cmy: &ImageBuf,
     channel_density: &[[f64; 3]],
     base_density: &[f64],
@@ -100,8 +92,18 @@ fn scan_spectral_via_lut(
     steps: usize,
     color_ref: &crate::color_reference::ColorReference,
     monochrome: bool,
+    use_lut: bool,
 ) -> ImageBuf {
-    let one_dimensional = if monochrome {
+    let direct = (!use_lut).then(|| {
+        spektrafilm_gpu::cpu_backend::scan_log_xyz_cpu(
+            density_cmy,
+            channel_density,
+            base_density,
+            illuminant,
+            normalization,
+        )
+    });
+    let one_dimensional = if use_lut && monochrome {
         let axis: Vec<_> = (0..1024)
             .map(|i| data_min[0] + (data_max[0] - data_min[0]) * i as f64 / 1023.)
             .collect();
@@ -122,7 +124,7 @@ fn scan_spectral_via_lut(
     } else {
         None
     };
-    let prepared = if one_dimensional.is_none() {
+    let prepared = if use_lut && one_dimensional.is_none() {
         let grid = build_lut_grid(steps, data_min, data_max);
         Some(TetrahedralLut {
             size: steps,
@@ -144,7 +146,9 @@ fn scan_spectral_via_lut(
         scale / (data_max[2] - data_min[2]),
     ];
     let interpolated = one_dimensional.or_else(|| {
-        backend.tetrahedral3d(density_cmy, prepared.as_ref().unwrap(), data_min, data_max)
+        prepared
+            .as_ref()
+            .and_then(|lut| backend.tetrahedral3d(density_cmy, lut, data_min, data_max))
     });
     let mut out = density_cmy.clone();
     out.data
@@ -155,14 +159,14 @@ fn scan_spectral_via_lut(
             let r = (src[0] as f64 - data_min[0]) * inv[0];
             let g = (src[1] as f64 - data_min[1]) * inv[1];
             let b = (src[2] as f64 - data_min[2]) * inv[2];
-            let log_xyz = if let Some(interpolated) = &interpolated {
+            let log_xyz = if let Some(direct) = &direct {
+                std::array::from_fn(|c| direct[index * 3 + c])
+            } else if let Some(interpolated) = &interpolated {
                 std::array::from_fn(|c| interpolated.data[index * 3 + c] as f64)
             } else {
                 prepared.as_ref().unwrap().sample([r, g, b])
             };
-            // Post-LUT: 10^log_xyz → CAT → xyz_to_rgb, mirroring Python's
-            // `_density_to_rgb` AFTER the LUT call. bw_correction and
-            // glare run after this returns (RGB space).
+            // The luminance remap needs XYZ before chromatic adaptation.
             let mut xyz = [
                 10.0f64.powf(log_xyz[0]),
                 10.0f64.powf(log_xyz[1]),
@@ -270,13 +274,11 @@ pub fn scan(
     // space after this returns (the existing post-step at the bottom
     // of this function), so swapping to the LUT path is glare-safe.
     // The faithful B&W/slide luminance remap (color_ref.has_remap) applies
-    // per-pixel on the scan XYZ inside scan_spectral_via_lut — so route
-    // through the LUT path when it's active (the LUT result matches the
-    // direct spectral path to sub-LSB, and only this path exposes the
-    // pre-CAT XYZ hook). Otherwise honour use_scanner_lut.
+    // before chromatic adaptation. Correction alone must not silently enable
+    // a coarse LUT when direct integration was selected.
     let mut rgb = if color_ref.has_remap() || params.settings.use_scanner_lut {
         let (data_min, data_max) = scanner_lut_bounds(profile, params);
-        scan_spectral_via_lut(
+        scan_spectral_xyz(
             density_cmy,
             &channel_density,
             &base_density,
@@ -290,6 +292,7 @@ pub fn scan(
             params.settings.lut_resolution as usize,
             color_ref,
             profile.is_bw(),
+            params.settings.use_scanner_lut,
         )
     } else {
         backend.scan_spectral(
@@ -439,7 +442,7 @@ pub fn process(
     scan(density_cmy, profile, params, backend, color_ref, gamut)
 }
 
-pub fn select_illuminant_f64(name: &str) -> &'static [f64] {
+pub fn select_illuminant_f64(name: &str) -> [f64; 81] {
     spektrafilm_math::illuminants::get(name).expect("validated illuminant")
 }
 fn output_colorspace_from_xyz_f64(name: &str) -> [[f64; 3]; 3] {

@@ -2,6 +2,7 @@
 //! https://github.com/lensfun/lensfun/blob/v0.3.4/include/lensfun/lensfun.h.in
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use spektrafilm_math::{image::ImageBuf, precision::from_f64};
 use std::{
     ffi::{CString, c_void},
@@ -185,25 +186,7 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
             coords.as_mut_ptr(),
         ) != 0
         {
-            for (i, p) in image.data.chunks_exact_mut(3).enumerate() {
-                for c in 0..3 {
-                    let x = coords[i * 6 + c * 2].clamp(0., (image.width - 1) as f32);
-                    let y = coords[i * 6 + c * 2 + 1].clamp(0., (image.height - 1) as f32);
-                    let (x0, y0) = (x.floor() as u32, y.floor() as u32);
-                    let (x1, y1) = (
-                        (x0 + 1).min(image.width - 1),
-                        (y0 + 1).min(image.height - 1),
-                    );
-                    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-                    let at = |x, y| pixels[((y * image.width + x) * 3) as usize + c];
-                    p[c] = from_f64(
-                        (at(x0, y0) * (1. - fx) * (1. - fy)
-                            + at(x1, y0) * fx * (1. - fy)
-                            + at(x0, y1) * (1. - fx) * fy
-                            + at(x1, y1) * fx * fy) as f64,
-                    );
-                }
-            }
+            resample_geometry(image, &pixels, &coords);
         } else {
             for (a, b) in image.data.iter_mut().zip(pixels) {
                 *a = from_f64(b as f64);
@@ -213,9 +196,81 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
     }
 }
 
+fn resample_geometry(image: &mut ImageBuf, pixels: &[f32], coords: &[f32]) {
+    let (width, height) = (image.width, image.height);
+    image.par_pixels_mut().enumerate().for_each(|(i, p)| {
+        for c in 0..3 {
+            let x = coords[i * 6 + c * 2].clamp(0., (width - 1) as f32);
+            let y = coords[i * 6 + c * 2 + 1].clamp(0., (height - 1) as f32);
+            let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+            let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+            let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+            let at = |x, y| pixels[((y * width + x) * 3) as usize + c];
+            p[c] = from_f64(
+                (at(x0, y0) * (1. - fx) * (1. - fy)
+                    + at(x1, y0) * fx * (1. - fy)
+                    + at(x0, y1) * (1. - fx) * fy
+                    + at(x1, y1) * fx * fy) as f64,
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_geometry_preserves_serial_samples_and_edge_clamping() {
+        for (width, height) in [(1, 1), (1, 7), (9, 1), (37, 29)] {
+            let count = width as usize * height as usize * 3;
+            let pixels: Vec<f32> = (0..count)
+                .map(|i| (i * 997 % 4093) as f32 / 512. - 1.)
+                .collect();
+            let coords: Vec<f32> = (0..count)
+                .flat_map(|i| {
+                    [
+                        (i * 7 % (width + 4) as usize) as f32 - 2.25,
+                        (i * 11 % (height + 4) as usize) as f32 - 1.5,
+                    ]
+                })
+                .collect();
+            let mut expected = ImageBuf::new(width, height);
+            for (i, p) in expected.pixels_mut().enumerate() {
+                for c in 0..3 {
+                    let x = coords[i * 6 + c * 2].clamp(0., (width - 1) as f32);
+                    let y = coords[i * 6 + c * 2 + 1].clamp(0., (height - 1) as f32);
+                    let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+                    let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+                    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+                    let at = |x, y| pixels[((y * width + x) * 3) as usize + c];
+                    p[c] = from_f64(
+                        (at(x0, y0) * (1. - fx) * (1. - fy)
+                            + at(x1, y0) * fx * (1. - fy)
+                            + at(x0, y1) * (1. - fx) * fy
+                            + at(x1, y1) * fx * fy) as f64,
+                    );
+                }
+            }
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut actual = ImageBuf::new(width, height);
+                pool.install(|| resample_geometry(&mut actual, &pixels, &coords));
+                assert!(
+                    actual
+                        .data
+                        .iter()
+                        .zip(&expected.data)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{width}x{height}, {threads} threads changed a lens-corrected sample"
+                );
+            }
+        }
+    }
+
     #[test]
     fn installed_lensfun_corrects_a_known_lens() {
         if std::env::var_os("SPEKTRAFILM_LENSFUN_DATABASE").is_none()

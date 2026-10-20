@@ -269,12 +269,11 @@ fn install_archive(root: &Path, compressed: &[u8]) -> Result<PathBuf> {
         name.to_str().context("Non-UTF8 Lensfun cache directory")?
     )?;
     pointer.as_file().sync_all()?;
-    let installed = stage.keep();
     pointer
         .persist(root.join(CURRENT))
         .map_err(|e| e.error)
         .context("Publishing the downloaded Lensfun database")?;
-    Ok(installed)
+    Ok(stage.keep())
 }
 /// Discover a compatible database, downloading a managed copy when necessary.
 pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -344,6 +343,17 @@ mod tests {
         let reused = ensure_at(root.path(), || bail!("offline: fetch must not run")).unwrap();
         assert_eq!(reused, path);
     }
+    #[test]
+    fn failed_publication_removes_the_unpublished_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        // A directory at CURRENT forces publication to fail without filling a disk.
+        fs::create_dir(root.path().join(CURRENT)).unwrap();
+        let bytes = archive(&[("camera.xml", XML.as_bytes(), false)]);
+        assert!(install_archive(root.path(), &bytes).is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(root.path().join(CURRENT).is_dir());
+    }
+
     #[test]
     fn a_failed_download_can_be_retried() {
         let root = tempfile::tempdir().unwrap();

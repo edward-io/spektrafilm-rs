@@ -302,7 +302,7 @@ pub fn detect_base(
         spektrafilm_model::convert::FilmConverter::new(
             &dyes,
             &spectrum,
-            illum,
+            &illum,
             &p.io.input_color_space,
             [1.; 3],
         )
@@ -406,6 +406,7 @@ pub fn neutral_print_balance(
     data_dir: &Path,
 ) -> Result<[f32; 2], String> {
     let mut q = p.clone();
+    q.camera.tone = Default::default();
     q.workflow.route = "input > film > print > scan".into();
     q.io.scan_film = false;
     q.settings.use_enlarger_lut = false;

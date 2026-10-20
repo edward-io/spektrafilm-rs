@@ -160,7 +160,7 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
                 white_xyz(6504.),
             );
             let cs = transfer::get("ACES2065-1").unwrap();
-            for p in pixels.data.chunks_exact_mut(3) {
+            pixels.par_pixels_mut().for_each(|p| {
                 let rgb = [p[0] as f64, p[1] as f64, p[2] as f64];
                 let mul = |m: &[[f64; 3]; 3], v: [f64; 3]| {
                     std::array::from_fn::<_, 3, _>(|i| {
@@ -174,7 +174,7 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
                 if options.white_balance == "custom" {
                     p[1] = from_f64((p[1] as f32 * options.tint as f32) as f64);
                 }
-            }
+            });
         }
         let converted = started.elapsed();
         let native = little_exif::metadata::Metadata::new_from_path(path)

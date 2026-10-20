@@ -195,6 +195,16 @@ impl Geometry {
         Ok(())
     }
 
+    /// The orientation without Lightroom's crop: the whole frame, which the
+    /// editor's own crop ([`crate::crop::Crop::from_lightroom`]) then frames.
+    pub fn orientation_only(&self) -> Self {
+        Self {
+            orientation: self.orientation,
+            crop: [0., 0., 1., 1.],
+            angle: 0.,
+        }
+    }
+
     pub fn apply(&self, image: ImageBuf, source_orientation: u16) -> Result<ImageBuf> {
         self.validate()?;
         ensure!(image.width > 0 && image.height > 0, "empty source image");
@@ -285,7 +295,7 @@ impl Geometry {
     }
 }
 
-fn orient([x, y]: [f64; 2], w: f64, h: f64, orientation: u16) -> [f64; 2] {
+pub(crate) fn orient([x, y]: [f64; 2], w: f64, h: f64, orientation: u16) -> [f64; 2] {
     match orientation {
         2 => [w - x, y],
         3 => [w - x, h - y],

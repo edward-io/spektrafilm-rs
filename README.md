@@ -17,6 +17,9 @@ See the [changelog](#changelog) for changes from the original Rust fork,
 [reference status and limits](docs/upstream-sync.md), and
 [validation checklist](docs/parity-checklist.md) for the supporting evidence.
 
+The [image processing optimization design](docs/processing-optimization-design.md)
+describes proposed profiling and scheduling experiments inspired by Halide.
+
 ## Build and run
 
 Requires Rust **1.89 or newer**, a C++ toolchain, `pkg-config`, and GLib
@@ -96,6 +99,9 @@ use **Previous / Next**, or press the left/right arrow keys to browse.
 Unavailable originals are skipped. Connect the photo drive and press
 **Refresh** to update availability, flags and geometry.
 
+Right-click the main preview or a catalog thumbnail to **Copy path** to the
+original photo or **Show in Finder**.
+
 Catalogs are opened read-only. Original files are developed by Spektrafilm,
 with Lightroom's crop, straighten angle, rotation and flips applied. Lightroom
 color, exposure, white balance and other tonal adjustments are not imported.
@@ -128,6 +134,22 @@ SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG="/path/to/catalog.lrcat" \
   cargo test --release -p spektrafilm-gui benchmark_catalog_load -- --ignored --nocapture
 ```
 
+For paired CPU/GPU display-preparation measurements, including transfers and
+the combined resize/display time on the same six RAWs:
+
+```sh
+SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG="/path/to/catalog.lrcat" \
+  cargo test --release -p spektrafilm-gui preview_gpu_benchmark -- --ignored --nocapture
+```
+
+To compare source-image selection with and without decoded neighbours (the film
+render is excluded), warm two RAWs on each side and measure navigation:
+
+```sh
+SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG="/path/to/catalog.lrcat" \
+  cargo test --release -p spektrafilm-gui benchmark_preloaded_navigation -- --ignored --nocapture
+```
+
 ## GUI and RAW development
 
 Open or drop JPEG, PNG, TIFF, EXR or camera RAW files. RAW support includes the
@@ -143,6 +165,10 @@ The GUI exposes film/paper, exposure, optical effects, layered grain, color,
 crop/resize, RAW development and output controls. Project files preserve these
 settings; Python GUI state JSON can be imported. Loading and rendering run in
 background workers, with progress and errors in the bottom status bar.
+**Input → Tone** provides Highlights, Shadows, Whites and Blacks before film
+simulation. These edits persist with each photo and apply to CPU/GPU previews
+and exports. See the [tone curve design](docs/input-tone-controls-design.md)
+for the equations and behavior near black and in HDR highlights.
 Hover over control labels, section headings or dropdown entries for a short explanation.
 Slider tracks and numeric editors do not show the control’s explanation.
 Set **Preview long edge (px)** in the right sidebar to change preview size.
@@ -153,7 +179,17 @@ Current-image loading, edits and display preparation take priority over exports
 and background catalog thumbnails. CPU and wgpu work use separate scheduling
 lanes. A waiting foreground render can interrupt a wgpu export between processing
 stages, with intermediate buffers retained on the GPU. A running stage still
-finishes first; no speculative image preloading is enabled.
+finishes first.
+The catalog's **Preload each side** control decodes two neighbouring RAWs in each
+direction by default, following the current filter and each photo's saved RAW
+settings and crop/rotation. Set it to 0 to disable it. Preloads start while
+foreground work is idle and use a lower-priority worker, with up to 2 GiB for
+neighbours in addition to the current original; the nearest images are retained first. Warming skips decoding
+on selection; display preparation and the film render still run in the foreground.
+On supported shared-memory GPUs, larger display previews use GPU color conversion
+and RGBA packing with reusable buffers. RAW development and antialiased resizing
+remain on the CPU; small previews and already encoded sRGB use the CPU as well.
+This changes display preparation only, leaving saved image pixels untouched.
 Auto preview can be disabled for manual rendering. Changing the RAW decoder,
 white balance or lens settings automatically reloads the RAW in the background.
 Lens correction reports whether the database is downloaded, installed locally or not
@@ -166,6 +202,18 @@ valid when the project is saved in another folder.
 **Save preview** writes the bounded preview. **Export** renders the original at
 full resolution on the GPU; disable GPU export under File export for the f64
 CPU path. Both support cancellation (a GPU dispatch finishes before cancelling).
+Choose **Output → File export → File format** for JPEG (the default), TIFF, PNG
+or OpenEXR. The choice sets both save dialogs' default filename and is remembered
+between launches and in projects.
+JPEG, PNG and TIFF exports retain readable source EXIF, update the dimensions,
+orientation and color tags, and omit private camera MakerNotes whose offsets
+refer to the original file. EXIF `UserComment` contains a versioned JSON recipe
+with the film/paper, processing parameters, RAW options, crop/rotation and output
+settings. An existing user comment is preserved as its original bytes in
+`original_user_comment`. OpenEXR stores the recipe in its `spektrafilm` text
+attribute. This records the settings; loading an exported image does not yet
+restore them into the editor. Read a JPEG/PNG/TIFF recipe with
+`exiftool -b -EXIF:UserComment image.tif`.
 The LUT export panel supports individual files, stage bundles and diagnostic
 reports; Build from bundle spec supports multi-paper/ZIP delivery. Place
 `spektrafilm-f64` next to the GUI or set `SPEKTRAFILM_F64_CLI` for CPU/LUT export.

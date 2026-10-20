@@ -17,6 +17,8 @@ pub struct Snapshot {
     pub film: String,
     pub print: String,
     pub scan_for_print_restore: Option<[bool; 3]>,
+    /// `None` before a catalog photo's Lightroom crop has been read.
+    pub crop: Option<spektrafilm_io::crop::Crop>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +156,7 @@ mod tests {
             film: "f".into(),
             print: "p".into(),
             scan_for_print_restore: None,
+            crop: None,
         }
     }
     fn observe(h: &mut History, v: i32) -> bool {

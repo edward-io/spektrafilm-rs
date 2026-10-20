@@ -41,7 +41,7 @@ fn clear_film_fit_recovers_color_and_scan_level() {
     let truth = FilmConverter::new(
         &dyes,
         &stock::tune_base(&film.data.base_density, &base, true),
-        illum,
+        &illum,
         "sRGB",
         [3.; 3],
     )
@@ -58,7 +58,7 @@ fn clear_film_fit_recovers_color_and_scan_level() {
     let actual = FilmConverter::new(
         &dyes,
         &stock::tune_base(&film.data.base_density, &fitted, true),
-        illum,
+        &illum,
         "sRGB",
         [3.; 3],
     )

@@ -8,11 +8,17 @@ mod conversion;
 #[path = "fft_diffusion.rs"]
 mod fft_diffusion;
 #[cfg(feature = "wgpu-backend")]
+#[path = "input_tone.rs"]
+mod input_tone;
+#[cfg(feature = "wgpu-backend")]
 #[path = "layered_grain.rs"]
 mod layered_grain;
 #[cfg(feature = "wgpu-backend")]
 #[path = "pchip.rs"]
 mod pchip;
+#[cfg(feature = "wgpu-backend")]
+#[path = "preview.rs"]
+mod preview;
 #[cfg(feature = "wgpu-backend")]
 #[path = "spatial.rs"]
 mod spatial;
@@ -102,10 +108,12 @@ fn f32_to_scalars(v: Vec<f32>) -> Vec<spektrafilm_math::precision::Scalar> {
 pub struct WgpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Cache compiled compute pipelines keyed by shader source pointer.
-    /// `&'static str` is fine because all our shader sources come from `include_str!`.
-    pipeline_cache: std::sync::Mutex<std::collections::HashMap<usize, CachedPipeline>>,
+    /// Sources are static; include their length and the complete binding layout.
+    pipeline_cache: std::sync::Mutex<
+        std::collections::HashMap<(usize, usize, Vec<wgpu::BindGroupLayoutEntry>), CachedPipeline>,
+    >,
     diffusion_cache: std::sync::Mutex<fft_diffusion::Cache>,
+    preview_buffers: std::sync::Mutex<preview::Buffers>,
 }
 
 #[cfg(feature = "wgpu-backend")]
@@ -182,20 +190,20 @@ impl WgpuBackend {
             queue,
             pipeline_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             diffusion_cache: Default::default(),
+            preview_buffers: Default::default(),
         })
     }
 
-    /// Get or compile + cache a pipeline keyed by shader source pointer.
-    /// All shader sources come from `include_str!` so the pointer is stable.
-    fn get_or_compile_pipeline<F>(
+    fn get_or_compile_pipeline(
         &self,
         shader_source: &'static str,
-        layout_entries_fn: F,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<usize, CachedPipeline>>
-    where
-        F: FnOnce() -> Vec<wgpu::BindGroupLayoutEntry>,
-    {
-        let key = shader_source.as_ptr() as usize;
+        entries: Vec<wgpu::BindGroupLayoutEntry>,
+    ) -> CachedPipelineRef {
+        let key = (
+            shader_source.as_ptr() as usize,
+            shader_source.len(),
+            entries,
+        );
         let mut cache = self.pipeline_cache.lock().unwrap();
         if !cache.contains_key(&key) {
             let shader = self
@@ -204,12 +212,11 @@ impl WgpuBackend {
                     label: Some("compute_shader"),
                     source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source)),
                 });
-            let entries = layout_entries_fn();
             let bind_group_layout =
                 self.device
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                         label: Some("compute_layout"),
-                        entries: &entries,
+                        entries: &key.2,
                     });
             let pipeline_layout =
                 self.device
@@ -229,14 +236,18 @@ impl WgpuBackend {
                     cache: None,
                 });
             cache.insert(
-                key,
+                key.clone(),
                 CachedPipeline {
                     bind_group_layout,
                     pipeline,
                 },
             );
         }
-        cache
+        let cached = cache.get(&key).unwrap();
+        CachedPipelineRef {
+            pipeline: cached.pipeline.clone(),
+            layout: cached.bind_group_layout.clone(),
+        }
     }
 
     /// Generic GPU compute dispatch helper.
@@ -280,12 +291,9 @@ impl WgpuBackend {
                 count: None,
             })
             .collect();
-        let entries_for_compile = layout_entries.clone();
-        let cache = self.get_or_compile_pipeline(shader_source, || entries_for_compile);
-        let key = shader_source.as_ptr() as usize;
-        let cached = cache.get(&key).expect("pipeline just inserted");
+        let cached = self.get_or_compile_pipeline(shader_source, layout_entries);
         let pipeline = &cached.pipeline;
-        let bind_group_layout = &cached.bind_group_layout;
+        let bind_group_layout = &cached.layout;
         let t_compile = t_start.elapsed();
 
         // Create GPU buffers
@@ -379,12 +387,22 @@ impl WgpuBackend {
     /// mallett matmul), highlight boost, camera diffusion/lens blur,
     /// halation, density curves, DIR, grain, print spectral, enlarger
     /// diffusion, scan spectral, glare, gamut compression, scanner lens blur,
-    /// and unsharp with ping-pong image storage. Interactive renders use one
-    /// command buffer; scheduled background work yields between stages.
-    /// Only one upload at the start and one readback at the end.
+    /// and unsharp with ping-pong image storage. Drag frames use one command
+    /// buffer; other scheduled work submits stage by stage so more urgent work
+    /// can go first, and stops early when cancelled (returning a blank image
+    /// the caller discards). Only one upload at the start and one readback at
+    /// the end.
     pub fn run_film_chain(&self, p: &crate::FilmChainParams<'_>) -> ImageBuf {
+        self.film_chain(p)
+            .unwrap_or_else(|_| ImageBuf::new(p.image.width, p.image.height))
+    }
+
+    fn film_chain(
+        &self,
+        p: &crate::FilmChainParams<'_>,
+    ) -> Result<ImageBuf, crate::scheduler::Cancelled> {
         use wgpu::util::DeviceExt;
-        let mut gpu = crate::scheduler::gpu_permit();
+        let mut gpu = GpuTurn::new(crate::scheduler::gpu_permit_cancellable()?);
         let t_start = std::time::Instant::now();
         let mut yielded_ms = 0.;
         // Pull all references into locals so the existing body below
@@ -1168,6 +1186,10 @@ impl WgpuBackend {
         let post_scan_state = p
             .output_cctf_encoding
             .then(|| color_transfer::build(self, n_pixels, p.output_transfer, true, 1., &buf_b));
+        let input_tone_state = p
+            .input_tone
+            .as_ref()
+            .map(|tone| input_tone::build(self, [image.width, image.height], tone, &buf_a, &buf_b));
 
         // Interactive frames batch everything; lower priorities have stage boundaries.
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -1186,14 +1208,19 @@ impl WgpuBackend {
 
         if let Some(state) = &input_transfer_state {
             state.encode_passes(&mut encoder, n_pixels);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
+        }
+        if let Some(state) = &input_tone_state {
+            // Uses buf_b as scratch; the front pass below overwrites it.
+            state.encode_passes(&mut encoder);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         }
         if let Some(state) = &convert_state {
             state.encode(&mut encoder, n_pixels, &buf_a, &buf_b);
         } else {
             // 1. Front pass (hanatos or mallett): buf_a (rgb in) → buf_b (raw)
             dispatch(&mut encoder, &front_pipe.pipeline, &bg_front, n_pixels);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             // 1a. Highlight boost on raw, before optical scatter.
             if let Some(hs) = highlight_state.as_ref() {
                 hs.encode_passes(&mut encoder);
@@ -1202,19 +1229,19 @@ impl WgpuBackend {
             //     halation — mirrors the CPU filming order.
             if let Some(ds) = diffusion_state.as_ref() {
                 ds.encode_passes(&mut encoder, &buf_b);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             // 1b. Camera lens blur on raw, after camera diffusion and before halation.
             if let Some(bs) = camera_lens_blur_state.as_ref() {
                 bs.encode(&mut encoder);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             // 1b. Halation in-place on buf_b. Uses buf_a as blur scratch (the
             //     input RGB image is no longer needed), buf_c / buf_d for the
             //     scatter outputs and halation accumulator.
             if let Some(hs) = halation_state.as_ref() {
                 hs.encode(&mut encoder);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             // 2. log10 in-place on buf_b: raw → log_raw (3 channels per thread).
             let (log10_pipe, log10_bg, _keepalive) = &bg_log10;
@@ -1231,26 +1258,26 @@ impl WgpuBackend {
             if let Some(ds) = dir_state.as_ref() {
                 let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
                 ds.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             // 3c. Grain (in-place on buf_a, optional post-blur via buf_b mid).
             if let Some(gs) = grain_state.as_ref() {
                 let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
                 gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             if let Some(state) = &layered_grain_state {
                 state.encode(&mut encoder, n_pixels);
             }
         }
-        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         // 4 + 5. Printing: print_spectral (buf_a → buf_b) then the print
         //     density curve (buf_b → buf_a). Skipped for scan_film — the
         //     scan pass consumes the film density already in buf_a.
         if !p.scan_film {
             // 4. Print spectral: buf_a → buf_b (log_raw_print)
             dispatch(&mut encoder, &print_pipe.pipeline, &bg_print, n_pixels);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             if let (Some(l2l), Some(ds), Some(l2g)) = (
                 enlarger_log_to_linear_state.as_ref(),
                 enlarger_diffusion_state.as_ref(),
@@ -1259,7 +1286,7 @@ impl WgpuBackend {
                 l2l.encode_passes(&mut encoder, n_pixels);
                 ds.encode_passes(&mut encoder, &buf_b);
                 l2g.encode_passes(&mut encoder, n_pixels);
-                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+                yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
             }
             // 5. Density curve (print, raw curves): buf_b → buf_a (density_print)
             dispatch(
@@ -1271,23 +1298,23 @@ impl WgpuBackend {
         }
         // 6. Scan spectral: buf_a → buf_b (unclipped linear RGB)
         dispatch(&mut encoder, &scan_pipe.pipeline, &bg_scan, n_pixels);
-        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+        yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         // 6b. Glare (in place on buf_b).
         if let Some(gs) = glare_state.as_ref() {
             let wg_xy = (image.width.div_ceil(16), image.height.div_ceil(16));
             gs.encode_passes(&mut encoder, n_pixels, workgroup_size, wg_xy);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         }
         // 6c. Output gamut compression (in place on buf_b) — after glare,
         //     before unsharp, mirroring the CPU scanning order.
         if let Some(gs) = gamut_state.as_ref() {
             gs.encode_passes(&mut encoder, n_pixels, workgroup_size);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         }
         // 6d. Scanner lens blur — after glare/gamut, before unsharp.
         if let Some(bs) = scanner_lens_blur_state.as_ref() {
             bs.encode(&mut encoder);
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         }
         // 6d. Unsharp mask — last in-flight pass. Writes the final image
         //     back to buf_b so the readback path below is unchanged.
@@ -1301,7 +1328,7 @@ impl WgpuBackend {
                 &buf_b,
                 img_bytes as u64,
             );
-            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu);
+            yielded_ms += self.yield_gpu(&mut encoder, &mut gpu)?;
         }
         // 6e. Final optional sRGB encode. This mirrors
         // Pipeline::apply_post_scan so the resident WGSL path can return
@@ -1347,29 +1374,47 @@ impl WgpuBackend {
             ),
             "film chain timings"
         );
-        out
+        Ok(out)
     }
 
+    /// A stage boundary. Preemptible work submits what it has encoded so far
+    /// and waits for the previous stage, so the GPU always has one stage
+    /// queued while this checks for cancellation and more urgent work. When
+    /// yielding it drains the queue first, so the other work starts on an idle
+    /// GPU. Returns the milliseconds spent waiting.
     fn yield_gpu(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        permit: &mut Option<crate::scheduler::Permit>,
-    ) -> f32 {
-        if let Some(permit) = permit.as_mut().filter(|permit| !permit.is_interactive()) {
-            let started = std::time::Instant::now();
-            let next = self.device.create_command_encoder(&Default::default());
-            let ready = std::mem::replace(encoder, next);
-            let submitted = self.queue.submit(Some(ready.finish()));
+        turn: &mut GpuTurn,
+    ) -> Result<f32, crate::scheduler::Cancelled> {
+        let Some(permit) = turn
+            .permit
+            .as_mut()
+            .filter(|permit| permit.is_preemptible())
+        else {
+            return Ok(0.);
+        };
+        let started = std::time::Instant::now();
+        let next = self.device.create_command_encoder(&Default::default());
+        let ready = std::mem::replace(encoder, next);
+        let submitted = self.queue.submit(Some(ready.finish()));
+        if let Some(previous) = turn.in_flight.replace(submitted.clone()) {
+            self.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(previous));
+        }
+        if permit.is_cancelled() {
+            return Err(crate::scheduler::Cancelled);
+        }
+        if permit.should_yield() {
             self.device
                 .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
-            permit.yield_to_higher_priority();
-            return started.elapsed().as_secs_f32() * 1000.;
+            turn.in_flight = None;
+            permit.yield_to_higher_priority()?;
         }
-        0.
+        Ok(started.elapsed().as_secs_f32() * 1000.)
     }
 
-    /// Get-or-compile a pipeline by shader source + binding layout. Cached by
-    /// shader source pointer.
+    /// Get-or-compile a pipeline by shader source and binding layout.
     fn cached_pipeline(
         &self,
         shader_source: &'static str,
@@ -1389,54 +1434,7 @@ impl WgpuBackend {
                 count: None,
             })
             .collect();
-        let entries_for_compile = entries;
-        let mut cache = self.pipeline_cache.lock().unwrap();
-        let key = shader_source.as_ptr() as usize;
-        if !cache.contains_key(&key) {
-            let shader = self
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("compute_shader"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source)),
-                });
-            let bind_group_layout =
-                self.device
-                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some("compute_layout"),
-                        entries: &entries_for_compile,
-                    });
-            let pipeline_layout =
-                self.device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("compute_pipeline_layout"),
-                        bind_group_layouts: &[&bind_group_layout],
-                        push_constant_ranges: &[],
-                    });
-            let pipeline = self
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("compute_pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &shader,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-            cache.insert(
-                key,
-                CachedPipeline {
-                    bind_group_layout,
-                    pipeline,
-                },
-            );
-        }
-        // Drop the guard but the underlying Arc keeps the entries alive.
-        // Return cloned handles.
-        let cached = cache.get(&key).unwrap();
-        CachedPipelineRef {
-            pipeline: cached.pipeline.clone(),
-            layout: cached.bind_group_layout.clone(),
-        }
+        self.get_or_compile_pipeline(shader_source, entries)
     }
 }
 
@@ -1445,6 +1443,51 @@ impl WgpuBackend {
 struct CachedPipelineRef {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+}
+
+#[cfg(all(test, feature = "wgpu-backend"))]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn pipelines_distinguish_layouts_and_reuse_identical_requests() {
+        let Some(gpu) = WgpuBackend::new() else {
+            return;
+        };
+        const SHADER: &str = "@compute @workgroup_size(1) fn main() {}";
+        let read = wgpu::BufferBindingType::Storage { read_only: true };
+        let write = wgpu::BufferBindingType::Storage { read_only: false };
+        let a = gpu.cached_pipeline(SHADER, &[read]);
+        let b = gpu.cached_pipeline(SHADER, &[write]);
+        let again = gpu.cached_pipeline(SHADER, &[read]);
+        assert_eq!(gpu.pipeline_cache.lock().unwrap().len(), 2);
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // A layout from either request must remain valid after the other is cached.
+        for cached in [a, b, again] {
+            let bindings = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &cached.layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&cached.pipeline);
+                pass.set_bind_group(0, &bindings, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            gpu.queue.submit(Some(encoder.finish()));
+        }
+        gpu.device.poll(wgpu::Maintain::Wait);
+    }
 }
 
 #[cfg(feature = "wgpu-backend")]
@@ -1479,8 +1522,36 @@ impl GpuBuffer {
     }
 }
 
+/// The film chain's hold on the GPU, and its last submitted stage.
+#[cfg(feature = "wgpu-backend")]
+struct GpuTurn {
+    permit: Option<crate::scheduler::Permit>,
+    in_flight: Option<wgpu::SubmissionIndex>,
+}
+
+#[cfg(feature = "wgpu-backend")]
+impl GpuTurn {
+    fn new(permit: Option<crate::scheduler::Permit>) -> Self {
+        Self {
+            permit,
+            in_flight: None,
+        }
+    }
+}
+
 #[cfg(feature = "wgpu-backend")]
 impl ComputeBackend for WgpuBackend {
+    fn display_preview(
+        &self,
+        image: &ImageBuf,
+        color: &str,
+        encoded: bool,
+        transform: bool,
+        max_size: usize,
+    ) -> Option<crate::DisplayPreview> {
+        self.display_preview_gpu(image, color, encoded, transform, max_size)
+    }
+
     fn colorspace_convert(&self, img: &ImageBuf, matrix: &[[f32; 3]; 3]) -> ImageBuf {
         cpu_backend::CpuBackend.colorspace_convert(img, matrix)
     }
@@ -3393,7 +3464,7 @@ mod scheduling_tests {
         let scheduler = Scheduler::default();
         let task = scheduler.task(Priority::Background);
         let _scope = task.enter();
-        let mut permit = scheduler::gpu_permit();
+        let mut turn = GpuTurn::new(scheduler::gpu_permit());
         let source = backend
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3428,11 +3499,11 @@ mod scheduling_tests {
                 .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
         });
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !permit.as_ref().unwrap().should_yield() {
+        while !turn.permit.as_ref().unwrap().should_yield() {
             assert!(Instant::now() < deadline, "foreground did not queue");
             thread::yield_now();
         }
-        backend.yield_gpu(&mut encoder, &mut permit);
+        backend.yield_gpu(&mut encoder, &mut turn).unwrap();
         worker.join().unwrap();
         encoder.copy_buffer_to_buffer(&intermediate, 0, &readback, 0, 16);
         let submitted = backend.queue.submit(Some(encoder.finish()));

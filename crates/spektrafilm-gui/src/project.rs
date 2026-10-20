@@ -3,6 +3,37 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use spektrafilm_core::params::RuntimeParams;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    #[default]
+    Jpeg,
+    Tiff,
+    Png,
+    Exr,
+}
+
+impl ExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jpeg => "JPEG",
+            Self::Tiff => "TIFF",
+            Self::Png => "PNG",
+            Self::Exr => "OpenEXR",
+        }
+    }
+
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Jpeg => &["jpg", "jpeg"],
+            Self::Tiff => &["tif", "tiff"],
+            Self::Png => &["png"],
+            Self::Exr => &["exr"],
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DisplayParams {
@@ -47,6 +78,7 @@ pub struct Project {
     pub rotation: u8,
     pub auto_preview: bool,
     pub gpu_export: bool,
+    pub export_format: ExportFormat,
     pub lut: crate::lut_ui::Settings,
     pub display: DisplayParams,
     pub scan_for_print_restore: Option<[bool; 3]>,
@@ -57,6 +89,8 @@ pub struct Project {
     pub zoom: f32,
     pub pan: [f32; 2],
     pub raw: spektrafilm_io::RawOptions,
+    /// The photo's crop; `None` uses its Lightroom crop, if any.
+    pub crop: Option<spektrafilm_io::crop::Crop>,
     pub output: spektrafilm_io::SaveOptions,
 }
 impl Default for Project {
@@ -66,6 +100,7 @@ impl Default for Project {
             rotation: 0,
             auto_preview: true,
             gpu_export: true,
+            export_format: Default::default(),
             lut: Default::default(),
             display: Default::default(),
             scan_for_print_restore: None,
@@ -80,6 +115,7 @@ impl Default for Project {
             zoom: 1.,
             pan: [0., 0.],
             raw: Default::default(),
+            crop: None,
             output: Default::default(),
         }
     }
@@ -194,8 +230,15 @@ mod tests {
             std::env::temp_dir().join(format!("spektrafilm-project-{}.json", std::process::id()));
         let mut p = Project::default();
         p.params.camera.exposure_compensation_ev = 1.5;
+        p.params.camera.tone = spektrafilm_core::params::ToneParams {
+            highlights: -65.,
+            shadows: 80.,
+            whites: 25.,
+            blacks: -15.,
+        };
         p.raw.tint = 12.;
         p.gpu_export = false;
+        p.export_format = ExportFormat::Exr;
         p.rotation = 3;
         p.display.output_interpolation = "blackman".into();
         p.display.compare_split = true;
@@ -206,8 +249,10 @@ mod tests {
         p.save(&path).unwrap();
         let loaded = Project::load(&path).unwrap();
         assert_eq!(loaded.params.camera.exposure_compensation_ev, 1.5);
+        assert_eq!(loaded.params.camera.tone.values(), [80., -65., 25., -15.]);
         assert_eq!(loaded.raw.tint, 12.);
         assert!(!loaded.gpu_export);
+        assert_eq!(loaded.export_format, ExportFormat::Exr);
         assert_eq!(loaded.rotation, 3);
         assert_eq!(loaded.display.output_interpolation, "blackman");
         assert!(loaded.display.compare_split);
@@ -215,6 +260,25 @@ mod tests {
         assert!(!loaded.display.animate);
         assert_eq!(loaded.lut.input, "Sony S-Log3");
         assert!(loaded.lut.qa);
+        let mut legacy = serde_json::to_value(&p).unwrap();
+        legacy.as_object_mut().unwrap().remove("export_format");
+        legacy["params"]["camera"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tone");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            Project::load(&path).unwrap().export_format,
+            ExportFormat::Jpeg
+        );
+        assert!(
+            Project::load(&path)
+                .unwrap()
+                .params
+                .camera
+                .tone
+                .is_identity()
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

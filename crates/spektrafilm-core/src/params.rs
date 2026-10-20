@@ -67,12 +67,40 @@ impl Default for DiffusionFilterParams {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToneParams {
+    pub highlights: f32,
+    pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+}
+
+impl ToneParams {
+    pub fn values(&self) -> [f32; 4] {
+        [self.shadows, self.highlights, self.whites, self.blacks]
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.values() == [0.; 4]
+    }
+
+    pub fn curve(&self, input_color_space: &str) -> spektrafilm_math::tone::ToneCurve {
+        let luma = spektrafilm_math::transfer::get(input_color_space)
+            .expect("validated input color space")
+            .to_xyz[1];
+        spektrafilm_math::tone::ToneCurve::new(self.values().map(|v| v as f64), luma)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraParams {
     #[serde(default = "default_none_filter")]
     pub color_filter: String,
     #[serde(default)]
     pub exposure_compensation_ev: f32,
+    #[serde(default)]
+    pub tone: ToneParams,
     #[serde(default = "default_true")]
     pub auto_exposure: bool,
     #[serde(default = "default_center_weighted")]
@@ -94,6 +122,7 @@ impl Default for CameraParams {
         Self {
             color_filter: default_none_filter(),
             exposure_compensation_ev: 0.0,
+            tone: ToneParams::default(),
             auto_exposure: true,
             auto_exposure_method: "center_weighted".into(),
             lens_blur_um: 0.0,

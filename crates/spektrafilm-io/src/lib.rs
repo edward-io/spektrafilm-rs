@@ -1,5 +1,7 @@
 //! Shared application image I/O. Quantization and clipping happen only here.
 mod color;
+pub mod crop;
+mod export_metadata;
 mod lens;
 mod lens_api;
 pub mod lens_database;
@@ -12,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use spektrafilm_math::{image::ImageBuf, precision::from_f64};
 use std::{fs::File, io::BufWriter, path::Path};
 
+pub use export_metadata::EditSettings;
+
 #[derive(Clone, Default)]
 pub struct Metadata {
     pub source_orientation: u16,
@@ -20,6 +24,8 @@ pub struct Metadata {
     pub exif: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
     pub iptc: Option<Vec<u8>>,
+    /// An export snapshot; opening a rendered image does not apply its recipe.
+    pub edit_settings: Option<serde_json::Value>,
 }
 pub struct LoadedImage {
     pub pixels: ImageBuf,
@@ -207,6 +213,7 @@ fn load_source(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
             decoder.xmp_metadata()?
         },
         iptc: decoder.iptc_metadata()?,
+        edit_settings: None,
     };
     let embedded_icc = decoder.icc_profile()?.or(tiff_icc);
     let mut image = image::DynamicImage::from_decoder(decoder)?;
@@ -338,40 +345,12 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         bail!("unknown RAW white balance mode: {}", options.white_balance);
     }
     if options.white_balance != "camera" && options.white_balance != "as_shot" {
-        // A camera-space neutral from the selected Planckian white point.
-        let t = if options.white_balance == "daylight" {
-            6504.
-        } else if options.white_balance == "tungsten" {
-            2850.
-        } else {
-            options.temperature
-        }
-        .clamp(1667., 25000.);
-        let x = if t <= 4000. {
-            -0.2661239e9 / t.powi(3) - 0.2343589e6 / t.powi(2) + 0.8776956e3 / t + 0.179910
-        } else {
-            -3.0258469e9 / t.powi(3) + 2.1070379e6 / t.powi(2) + 0.2226347e3 / t + 0.240390
+        let temperature = match options.white_balance.as_str() {
+            "daylight" => 6504.,
+            "tungsten" => 2850.,
+            _ => options.temperature,
         };
-        let y = if t <= 2222. {
-            -1.1063814 * x.powi(3) - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
-        } else if t <= 4000. {
-            -0.9549476 * x.powi(3) - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
-        } else {
-            3.0817580 * x.powi(3) - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
-        };
-        let xyz = [x / y, 1., (1. - x - y) / y];
-        for c in 0..4 {
-            let neutral: f64 = (0..3).map(|i| raw.xyz_to_cam[c][i] as f64 * xyz[i]).sum();
-            raw.wb_coeffs[c] = if neutral > 1e-9 {
-                (1. / neutral) as f32
-            } else {
-                1.
-            };
-        }
-        let g = raw.wb_coeffs[1];
-        for v in &mut raw.wb_coeffs {
-            *v /= g;
-        }
+        planckian_white_balance(&mut raw, temperature)?;
     }
     let mut dev = RawDevelop::default();
     dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb));
@@ -428,6 +407,47 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         color_space: "sRGB".into(),
         encoded: false,
     })
+}
+
+/// Set `raw`'s white balance so a Planckian illuminant at `temperature` K
+/// develops to neutral.
+fn planckian_white_balance(raw: &mut rawler::RawImage, temperature: f64) -> Result<()> {
+    // A camera-space neutral from the selected Planckian white point.
+    let t = temperature.clamp(1667., 25000.);
+    let x = if t <= 4000. {
+        -0.2661239e9 / t.powi(3) - 0.2343589e6 / t.powi(2) + 0.8776956e3 / t + 0.179910
+    } else {
+        -3.0258469e9 / t.powi(3) + 2.1070379e6 / t.powi(2) + 0.2226347e3 / t + 0.240390
+    };
+    let y = if t <= 2222. {
+        -1.1063814 * x.powi(3) - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+    } else if t <= 4000. {
+        -0.9549476 * x.powi(3) - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+    } else {
+        3.0817580 * x.powi(3) - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
+    };
+    let xyz = [x / y, 1., (1. - x - y) / y];
+    // The matrix RawDevelop itself uses. Rawler leaves the deprecated
+    // `xyz_to_cam` zeroed for most cameras, which would disable WB.
+    let xyz_to_cam = raw
+        .develop_params()
+        .map_err(|e| anyhow::anyhow!("RAW develop: {e:?}"))?
+        .color_matrices[0]
+        .matrix;
+    for c in 0..4 {
+        let neutral: f64 = (0..3).map(|i| xyz_to_cam[c][i] as f64 * xyz[i]).sum();
+        raw.wb_coeffs[c] = if neutral > 1e-9 {
+            (1. / neutral) as f32
+        } else {
+            // Three-colour sensors have no fourth row; it repeats green.
+            raw.wb_coeffs[1]
+        };
+    }
+    let g = raw.wb_coeffs[1];
+    for v in &mut raw.wb_coeffs {
+        *v /= g;
+    }
+    Ok(())
 }
 
 fn orient_raw(image: ImageBuf, orientation: rawler::decoders::Orientation) -> ImageBuf {
@@ -503,6 +523,7 @@ fn save_pixels(
     options: &SaveOptions,
     metadata: &Metadata,
     data_dir: &Path,
+    recipe: Option<&str>,
 ) -> Result<()> {
     let ext = extension(path);
     let icc = icc(data_dir, options);
@@ -522,6 +543,12 @@ fn save_pixels(
             });
             let mut exr = Image::from_channels((w as usize, h as usize), channels);
             exr.attributes.chromaticities = Some(chromaticities);
+            if let Some(recipe) = recipe {
+                exr.layer_data.attributes.other.insert(
+                    "spektrafilm".into(),
+                    exr::prelude::AttributeValue::Text(recipe.into()),
+                );
+            }
             exr.write().to_file(path)?;
         } else if options.bit_depth == 32 {
             let channels = SpecificChannels::rgb(|Vec2(x, y)| {
@@ -534,6 +561,12 @@ fn save_pixels(
             });
             let mut exr = Image::from_channels((w as usize, h as usize), channels);
             exr.attributes.chromaticities = Some(chromaticities);
+            if let Some(recipe) = recipe {
+                exr.layer_data.attributes.other.insert(
+                    "spektrafilm".into(),
+                    exr::prelude::AttributeValue::Text(recipe.into()),
+                );
+            }
             exr.write().to_file(path)?;
         } else {
             bail!("EXR bit depth must be 16 or 32");
@@ -734,6 +767,12 @@ fn save_file(
     data_dir: &Path,
 ) -> Result<()> {
     let mut metadata = metadata.clone();
+    let recipe = export_metadata::recipe(
+        &metadata,
+        options,
+        &extension(path),
+        [image.width, image.height],
+    )?;
     if extension(path) != "exr" {
         metadata.xmp = Some(xmp::saving_profile(
             metadata.xmp.as_deref(),
@@ -755,7 +794,7 @@ fn save_file(
             metadata.jpeg_segments.push(segment);
         }
     }
-    save_pixels(image, path, options, &metadata, data_dir)?;
+    save_pixels(image, path, options, &metadata, data_dir, recipe.as_deref())?;
     if extension(path) == "exr" {
         return Ok(());
     }
@@ -799,10 +838,18 @@ fn save_file(
                     | 0xa005
                     | 0x8773
                     | 0x02bc
+                    | 0x927c
             ) {
                 output.set_tag(tag.clone());
             }
         }
+    }
+    // MakerNotes can point outside their blob into the original file.
+    output.remove_tag(ExifTag::MakerNote(Vec::new()));
+    if let Some(recipe) = recipe {
+        let mut comment = b"ASCII\0\0\0".to_vec();
+        comment.extend_from_slice(recipe.as_bytes());
+        output.set_tag(ExifTag::UserComment(comment));
     }
     output.set_tag(ExifTag::Orientation(vec![1]));
     output.set_tag(ExifTag::Software("spektrafilm-rs".into()));
@@ -822,6 +869,12 @@ fn save_file(
             "Adobe RGB (1998)" => output.set_tag(ExifTag::InteroperabilityIndex("R03".into())),
             _ => {}
         }
+    }
+    if matches!(extension(path).as_str(), "jpg" | "jpeg") {
+        anyhow::ensure!(
+            output.encode()?.len() <= u16::MAX as usize - 8,
+            "EXIF metadata exceeds JPEG's 64 KiB limit; export as TIFF or PNG"
+        );
     }
     output
         .write_to_file(path)
@@ -914,6 +967,27 @@ fn jpeg_metadata_segments(path: &Path) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planckian_white_balance_uses_the_develop_matrix() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic.dng");
+        let mut raw = rawler::decode_file(&path).unwrap();
+        // Like most non-DNG decoders in rawler 0.8, which leave this zeroed.
+        raw.xyz_to_cam = [[0.; 3]; 4];
+        let coefficients = |raw: &mut rawler::RawImage, t| {
+            planckian_white_balance(raw, t).unwrap();
+            raw.wb_coeffs
+        };
+        let warm = coefficients(&mut raw, 3000.);
+        let cool = coefficients(&mut raw, 9000.);
+        assert_eq!((warm[1], cool[1]), (1., 1.), "normalised to green");
+        // Correcting a warm light boosts blue relative to red, and vice versa.
+        assert!(
+            warm[2] / warm[0] > cool[2] / cool[0],
+            "{warm:?} vs {cool:?}"
+        );
+        assert!(warm.iter().chain(&cool).all(|v| v.is_finite() && *v > 0.));
+    }
     #[test]
     fn float_exports_preserve_highlights_and_metadata() {
         use little_exif::{exif_tag::ExifTag, metadata::Metadata as Exif};

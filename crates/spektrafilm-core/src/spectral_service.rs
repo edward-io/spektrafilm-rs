@@ -271,7 +271,7 @@ pub fn compute_reflectance_tc_lut(
 
     let neutral = reconstructed_neutral(
         reflectance_lut,
-        spektrafilm_math::illuminants::get("D65").expect("D65"),
+        &spektrafilm_math::illuminants::get("D65").expect("D65"),
     );
     let response: [f64; 3] = std::array::from_fn(|c| {
         (0..n_wl)
@@ -481,6 +481,8 @@ impl SpectraLut {
     /// scipy.ndimage.gaussian_filter on the wavelength axis (float32 output,
     /// radius round(4*sigma), half-sample symmetric boundary).
     pub fn blur_wavelengths(&mut self, sigma: f64) {
+        use rayon::prelude::*;
+
         if sigma <= 0. {
             return;
         }
@@ -493,22 +495,26 @@ impl SpectraLut {
             *v /= total;
         }
         let n = self.n_wavelengths;
-        for row in self.data.chunks_exact_mut(n) {
-            let input = row.to_vec();
-            for k in 0..n {
-                row[k] = kernel
-                    .iter()
-                    .enumerate()
-                    .map(|(i, w)| {
-                        let mut j = (k as isize + i as isize - radius).rem_euclid(2 * n as isize);
-                        if j >= n as isize {
-                            j = 2 * n as isize - 1 - j;
-                        }
-                        *w * input[j as usize] as f64
-                    })
-                    .sum::<f64>() as f32;
-            }
-        }
+        self.data.par_chunks_exact_mut(n).for_each_init(
+            || vec![0.; n],
+            |input, row| {
+                input.copy_from_slice(row);
+                for k in 0..n {
+                    row[k] = kernel
+                        .iter()
+                        .enumerate()
+                        .map(|(i, w)| {
+                            let mut j =
+                                (k as isize + i as isize - radius).rem_euclid(2 * n as isize);
+                            if j >= n as isize {
+                                j = 2 * n as isize - 1 - j;
+                            }
+                            *w * input[j as usize] as f64
+                        })
+                        .sum::<f64>() as f32;
+                }
+            },
+        );
     }
 }
 
@@ -570,6 +576,63 @@ pub fn apply_surface(lut: &mut TcLut, params: &[Vec<f64>], illu: &[f32]) {
                 let raw: f64 = params[c].iter().zip(terms).map(|(p, t)| p * t).sum();
                 let surface = raw / (1. + (raw / 2.).powi(2)).sqrt();
                 lut.data[(i * lut.size + j) * 3 + c] *= 2f64.powf(surface);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_wavelength_blur_matches_serial_at_boundaries_and_across_spectra() {
+        for n in [1, 7, 81] {
+            let original: Vec<f32> = (0..25 * n)
+                .map(|i| (i * 37 % 257) as f32 / 31. - 0.5)
+                .collect();
+            for sigma in [0., 0.25, 1., 2.5] {
+                let mut expected = original.clone();
+                if sigma > 0. {
+                    let radius = (4f64 * sigma + 0.5) as isize;
+                    let mut kernel: Vec<f64> = (-radius..=radius)
+                        .map(|i| (-0.5 * (i as f64 / sigma).powi(2)).exp())
+                        .collect();
+                    let total: f64 = kernel.iter().sum();
+                    kernel.iter_mut().for_each(|v| *v /= total);
+                    for row in expected.chunks_exact_mut(n) {
+                        let input = row.to_vec();
+                        for k in 0..n {
+                            row[k] = kernel
+                                .iter()
+                                .enumerate()
+                                .map(|(i, w)| {
+                                    let mut j = (k as isize + i as isize - radius)
+                                        .rem_euclid(2 * n as isize);
+                                    if j >= n as isize {
+                                        j = 2 * n as isize - 1 - j;
+                                    }
+                                    *w * input[j as usize] as f64
+                                })
+                                .sum::<f64>() as f32;
+                        }
+                    }
+                }
+                let mut actual = SpectraLut {
+                    size: 5,
+                    n_wavelengths: n,
+                    data: original.clone(),
+                };
+                actual.blur_wavelengths(sigma);
+                assert_eq!(actual.data.len(), expected.len());
+                assert!(
+                    actual
+                        .data
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "wavelengths={n}, sigma={sigma}"
+                );
             }
         }
     }

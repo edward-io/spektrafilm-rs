@@ -24,12 +24,16 @@ const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key
 const ROTATE_LEFT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
 const ROTATE_RIGHT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 const SPLIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Y);
-const APPLY_PREVIOUS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::P);
+/// Plain keys: egui turns ⌘C / ⌘V (even with Shift) into clipboard events.
+/// Opens the crop tool, and applies the crop when it is open.
+const CROP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::R);
+const COPY_SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::C);
+const PASTE_SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::P);
 const FULL_SCREEN: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::CTRL), Key::F);
-/// Plain F, which is also what arrives for macOS fn/Globe+F: the fn key itself
-/// never reaches the app.
-const FULL_SCREEN_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
+/// Plain F fits the image; fn/Globe+F (macOS) toggles full screen. Both arrive
+/// as F, so [`fn_key_held`] tells them apart.
+const FIT_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F);
 /// Held to show the unprocessed input in place of the render.
 const BEFORE_KEY: Key = Key::Backslash;
 /// Space reserved under the image for the floating canvas toolbar.
@@ -99,14 +103,14 @@ impl App {
 
     pub(crate) fn save_preview_enabled(&self) -> bool {
         self.output_image.is_some()
-            && self.load_job.is_none()
+            && !self.image_loading()
             && self.render_job.is_none()
             && !self.dirty
             && !self.pending_dirty
     }
 
     fn export_enabled(&self) -> bool {
-        self.image_path.is_some() && self.load_job.is_none() && self.export_job.is_none()
+        self.image_path.is_some() && !self.image_loading() && self.export_job.is_none()
     }
 
     fn save_project_dialog(&mut self) {
@@ -138,15 +142,20 @@ impl App {
     fn save_defaults(&mut self) {
         let mut state = self.project_state();
         state.image = None;
+        state.crop = None;
         state.raw = self.raw_options.clone();
         state.raw.lightroom_geometry = None;
         self.status = match state.save(&project::default_path()) {
-            Ok(()) => "Saved startup defaults".into(),
+            Ok(()) => {
+                self.preload.invalidate_window();
+                "Saved startup defaults".into()
+            }
             Err(e) => format!("Save defaults error: {e:#}"),
         };
     }
 
     fn factory_defaults(&mut self) {
+        self.preload.invalidate_window();
         let input_color = self.params.io.input_color_space.clone();
         let input_encoded = self.params.io.input_cctf_decoding;
         self.params = RuntimeParams::default();
@@ -181,7 +190,7 @@ impl App {
         }
     }
 
-    fn zoom_fit(&mut self) {
+    pub(crate) fn zoom_fit(&mut self) {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
     }
@@ -214,6 +223,13 @@ impl App {
             film: self.film_name.clone(),
             print: self.print_name.clone(),
             scan_for_print_restore: self.scan_for_print_restore,
+            // While cropping, the crop is one step, recorded when it's applied.
+            // History keeps it in the unrotated frame: quarter turns aren't steps.
+            crop: self
+                .crop_tool
+                .as_ref()
+                .map_or(self.crop, |tool| Some(tool.original))
+                .map(|crop| crop.rotated_quarter_turns((4 - self.rotation % 4) % 4)),
         }
     }
 
@@ -236,6 +252,11 @@ impl App {
             self.print_dev_times = profile_dev_times(&self.data_dir, &self.print_name);
         }
         self.scan_for_print_restore = snapshot.scan_for_print_restore;
+        // Steps saved before cropping existed don't change the crop.
+        if let Some(crop) = snapshot.crop {
+            self.crop = Some(crop.rotated_quarter_turns(self.rotation));
+            self.crop_tool = None;
+        }
         self.dirty = true;
         self.pending_dirty = self.render_job.is_some();
     }
@@ -389,9 +410,25 @@ impl App {
         if pressed(&FULL_SCREEN) {
             toggle_full_screen(ctx);
         }
+        if !typing && self.crop_tool.is_some() {
+            let key = |key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
+            if key(Key::Escape) {
+                self.close_crop_tool(false);
+            } else if key(Key::Enter) || pressed(&CROP) {
+                self.close_crop_tool(true);
+            } else if key(Key::X) {
+                self.swap_crop_orientation();
+            }
+        } else if !typing && pressed(&CROP) && self.can_crop() {
+            self.open_crop_tool();
+        }
         if !typing {
-            if pressed(&FULL_SCREEN_KEY) {
-                toggle_full_screen(ctx);
+            if pressed(&FIT_KEY) {
+                if fn_key_held() {
+                    toggle_full_screen(ctx);
+                } else {
+                    self.zoom_fit();
+                }
             }
             let full_screen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             if full_screen
@@ -400,8 +437,11 @@ impl App {
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
-            if pressed(&APPLY_PREVIOUS) && self.image.is_some() {
-                self.apply_previous_edit();
+            if pressed(&COPY_SETTINGS) && self.image.is_some() {
+                self.copy_photo_edit();
+            }
+            if pressed(&PASTE_SETTINGS) && self.image.is_some() {
+                self.paste_photo_edit();
             }
             if pressed(&SPLIT) {
                 self.display.compare_split = !self.display.compare_split;
@@ -554,22 +594,26 @@ impl App {
                     let has_image = self.image.is_some();
                     if ui
                         .add_enabled(
-                            has_image && self.previous_edit.is_some(),
-                            egui::Button::new("Apply previous settings")
-                                .shortcut_text(shortcut(&APPLY_PREVIOUS)),
-                        )
-                        .on_hover_text(
-                            "Give this photo the look of the photo you viewed before it \
-                             (not its rotation or RAW options). Undoable.",
+                            self.can_crop(),
+                            egui::Button::new(if self.crop_tool.is_some() {
+                                "Apply crop"
+                            } else {
+                                "Crop & straighten"
+                            })
+                            .shortcut_text(shortcut(&CROP)),
                         )
                         .clicked()
                     {
                         ui.close_menu();
-                        self.apply_previous_edit();
+                        self.toggle_crop_tool();
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(has_image, egui::Button::new("Copy settings"))
+                        .add_enabled(
+                            has_image,
+                            egui::Button::new("Copy settings")
+                                .shortcut_text(shortcut(&COPY_SETTINGS)),
+                        )
                         .on_hover_text("Copy this photo's film, paper and settings.")
                         .clicked()
                     {
@@ -579,11 +623,12 @@ impl App {
                     if ui
                         .add_enabled(
                             has_image && self.copied_edit.is_some(),
-                            egui::Button::new("Paste settings"),
+                            egui::Button::new("Paste settings")
+                                .shortcut_text(shortcut(&PASTE_SETTINGS)),
                         )
                         .on_hover_text(
                             "Apply the copied film, paper and settings to this photo \
-                             (not its rotation or RAW options).",
+                             (not its rotation or RAW options). Undoable.",
                         )
                         .clicked()
                     {
@@ -617,7 +662,8 @@ impl App {
                 ui.menu_button("View", |ui| {
                     ui.set_min_width(240.0);
                     if ui
-                        .add(egui::Button::new("Fit to window").shortcut_text(shortcut(&FIT)))
+                        .add(egui::Button::new("Fit to window").shortcut_text(shortcut(&FIT_KEY)))
+                        .on_hover_text(format!("Also {}", shortcut(&FIT)))
                         .clicked()
                     {
                         ui.close_menu();
@@ -650,10 +696,16 @@ impl App {
                             } else {
                                 "Enter Full Screen"
                             })
-                            .shortcut_text(shortcut(&FULL_SCREEN_KEY)),
+                            .shortcut_text(
+                                if cfg!(target_os = "macos") {
+                                    "fn F".to_owned()
+                                } else {
+                                    shortcut(&FULL_SCREEN)
+                                },
+                            ),
                         )
                         .on_hover_text(format!(
-                            "Also fn+F or {}. Esc leaves full screen.",
+                            "Also {}. Esc leaves full screen.",
                             shortcut(&FULL_SCREEN)
                         ))
                         .clicked()
@@ -851,7 +903,7 @@ impl App {
     }
 
     pub(crate) fn empty_canvas(&mut self, ui: &mut egui::Ui) {
-        let loading = self.load_job.is_some();
+        let loading = self.image_loading();
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.5 - 80.0).max(0.0));
             if loading {
@@ -934,7 +986,13 @@ impl App {
                 .pivot(egui::Align2::CENTER_BOTTOM)
                 .show(&ctx, |ui| {
                     overlay_frame().show(ui, |ui| {
-                        ui.horizontal(|ui| self.toolbar(ui));
+                        ui.horizontal(|ui| {
+                            if self.crop_tool.is_some() {
+                                self.crop_toolbar(ui);
+                            } else {
+                                self.toolbar(ui);
+                            }
+                        });
                     });
                 });
         }
@@ -974,7 +1032,7 @@ impl App {
             .selectable_label(fit, "Fit")
             .on_hover_text(format!(
                 "Fit the print to the window ({})",
-                ui.ctx().format_shortcut(&FIT)
+                ui.ctx().format_shortcut(&FIT_KEY)
             ))
             .clicked()
         {
@@ -1025,14 +1083,30 @@ impl App {
 
         let has_image = self.image.is_some();
         if ui
-            .add_enabled(has_image, icons::RotateButton::new(false).compact())
+            .add_enabled(self.can_crop(), egui::Button::new(icons::icon(icons::CROP)))
+            .on_hover_text(format!(
+                "Crop and straighten ({})",
+                ui.ctx().format_shortcut(&CROP)
+            ))
+            .clicked()
+        {
+            self.open_crop_tool();
+        }
+        if ui
+            .add_enabled(
+                has_image,
+                egui::Button::new(icons::icon(icons::ARROW_COUNTER_CLOCKWISE)),
+            )
             .on_hover_text(tooltips::CONTROL_ROTATE)
             .clicked()
         {
             self.rotate_input(3);
         }
         if ui
-            .add_enabled(has_image, icons::RotateButton::new(true).compact())
+            .add_enabled(
+                has_image,
+                egui::Button::new(icons::icon(icons::ARROW_CLOCKWISE)),
+            )
             .on_hover_text(tooltips::CONTROL_ROTATE_2)
             .clicked()
         {
@@ -1245,7 +1319,7 @@ impl App {
                             );
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if self.load_job.is_some()
+                            if self.image_loading()
                                 || self.render_job.is_some()
                                 || self.export_job.is_some()
                                 || self.calibration_job.is_some()
@@ -1564,6 +1638,21 @@ fn relative_time(now: u64, at: u64) -> String {
     }
 }
 
+/// Whether fn/Globe is held. winit doesn't report it, so ask AppKit.
+#[cfg(target_os = "macos")]
+fn fn_key_held() -> bool {
+    use objc2::{class, msg_send};
+    const FUNCTION: usize = 1 << 23; // NSEventModifierFlagFunction
+    // SAFETY: +[NSEvent modifierFlags] is a class getter with no arguments.
+    let flags: usize = unsafe { msg_send![class!(NSEvent), modifierFlags] };
+    flags & FUNCTION != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fn_key_held() -> bool {
+    false
+}
+
 fn toggle_full_screen(ctx: &egui::Context) {
     let full_screen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full_screen));
@@ -1599,7 +1688,7 @@ fn overlay_frame() -> egui::Frame {
         })
 }
 
-fn toolbar_divider(ui: &mut egui::Ui) {
+pub(crate) fn toolbar_divider(ui: &mut egui::Ui) {
     ui.add_space(2.0);
     let height = ui.spacing().interact_size.y - 6.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, height), egui::Sense::hover());
@@ -1611,4 +1700,14 @@ fn toolbar_divider(ui: &mut egui::Ui) {
 fn status_is_error(status: &str) -> bool {
     let s = status.to_ascii_lowercase();
     s.contains("error") || s.contains("failed") || s.contains("could not")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fn_key_query_runs() {
+        // Exercises the AppKit call on macOS. The answer is the live keyboard
+        // state, so it isn't asserted.
+        let _ = super::fn_key_held();
+    }
 }

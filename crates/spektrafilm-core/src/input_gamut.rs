@@ -9,6 +9,7 @@
 
 use rayon::prelude::*;
 use spektrafilm_math::spectral::{self, CMF_X_F64, CMF_Y_F64, CMF_Z_F64, TcLut};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::gamut_compression::reinhard_knee;
 
@@ -87,6 +88,7 @@ pub struct InputGamutCompress {
     oklch: bool,
     knee: (f64, f64, f64),
     locus: Vec<[f64; 2]>,
+    oklch_table: OnceLock<Arc<Vec<f64>>>,
 }
 
 impl InputGamutCompress {
@@ -118,6 +120,7 @@ impl InputGamutCompress {
             } else {
                 Vec::new()
             },
+            oklch_table: OnceLock::new(),
         })
     }
 
@@ -130,7 +133,12 @@ impl InputGamutCompress {
         if !detail.is_finite() || detail <= 0. {
             return Err("input gamut hull detail must be positive".into());
         }
-        if boundary == "locus" || !self.active {
+        if !self.active {
+            return Ok(());
+        }
+        if boundary == "locus" {
+            self.locus = spectral_locus_xy();
+            self.oklch_table.take();
             return Ok(());
         }
         if boundary != "inscribed_hull" {
@@ -144,9 +152,10 @@ impl InputGamutCompress {
                 [t.cos(), t.sin()]
             })
             .collect();
+        let locus = spectral_locus_xy();
         let reach: Vec<_> = directions
             .iter()
-            .map(|&d| ray_polygon_distance(white, d, &self.locus))
+            .map(|&d| ray_polygon_distance(white, d, &locus))
             .collect();
         if reach.iter().any(|v| !v.is_finite()) {
             return Err("input gamut hull has no finite boundary".into());
@@ -179,6 +188,7 @@ impl InputGamutCompress {
             })
             .collect();
         self.locus.push(self.locus[0]);
+        self.oklch_table.take();
         Ok(())
     }
 
@@ -190,10 +200,54 @@ impl InputGamutCompress {
         if !self.active {
             xy
         } else if self.oklch {
-            compress_oklch(xy, self.knee, &self.locus)
+            compress_oklch(
+                xy,
+                self.knee,
+                self.oklch_table.get_or_init(|| oklch_table(&self.locus)),
+            )
         } else {
             compress_xy_radial(xy, reference_white, self.knee, &self.locus)
         }
+    }
+
+    fn xy_remap_coordinates(&self, size: usize, white: [f64; 2]) -> Arc<Vec<[f64; 2]>> {
+        #[derive(PartialEq, Eq)]
+        struct Key {
+            size: usize,
+            knee: [u64; 3],
+            white: [u64; 2],
+            locus: Vec<[u64; 2]>,
+        }
+        // Keep only the latest geometry; LUT values are always sampled afresh.
+        static CACHE: Mutex<Option<(Key, Arc<Vec<[f64; 2]>>)>> = Mutex::new(None);
+        let key = Key {
+            size,
+            knee: [self.knee.0, self.knee.1, self.knee.2].map(f64::to_bits),
+            white: white.map(f64::to_bits),
+            locus: self.locus.iter().map(|p| p.map(f64::to_bits)).collect(),
+        };
+        if let Some((cached_key, coordinates)) = CACHE.lock().unwrap().as_ref()
+            && *cached_key == key
+        {
+            return Arc::clone(coordinates);
+        }
+        let inv = 1.0 / (size as f64 - 1.0);
+        let coordinates = Arc::new(
+            (0..size * size)
+                .into_par_iter()
+                .map(|index| {
+                    let (x, y) = spectral::tc_to_xy(
+                        (index / size) as f64 * inv,
+                        (index % size) as f64 * inv,
+                    );
+                    let xy = compress_xy_radial([x, y], white, self.knee, &self.locus);
+                    let (tx, ty) = spectral::xy_to_tc(xy[0], xy[1]);
+                    [tx * (size as f64 - 1.0), ty * (size as f64 - 1.0)]
+                })
+                .collect(),
+        );
+        *CACHE.lock().unwrap() = Some((key, Arc::clone(&coordinates)));
+        coordinates
     }
 
     /// Bake the compression into a freshly resampled copy of `lut`. For each
@@ -210,22 +264,19 @@ impl InputGamutCompress {
         let ch = lut.channels;
         let inv = 1.0 / (size as f64 - 1.0);
         let mut data = vec![0.0f64; size * size * ch];
+        let coordinates = (!self.oklch).then(|| self.xy_remap_coordinates(size, ref_xy));
         let row_len = (size * ch).max(1);
         let write_row = |(i, row): (usize, &mut [f64])| {
             for (j, cell) in row.chunks_exact_mut(ch).enumerate() {
-                // Step 1: tc cell → CIE xy.
-                let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
-                // Step 2: compress.
-                let cxy = if self.oklch {
-                    compress_oklch([x, y], self.knee, &self.locus)
+                let [ci, cj] = if let Some(coordinates) = &coordinates {
+                    coordinates[i * size + j]
                 } else {
-                    compress_xy_radial([x, y], ref_xy, self.knee, &self.locus)
+                    let (x, y) = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
+                    let cxy = self.compress_xy([x, y], ref_xy);
+                    let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
+                    [tx * (size as f64 - 1.0), ty * (size as f64 - 1.0)]
                 };
-                // Step 3: compressed xy → tc.
-                let (tx, ty) = spectral::xy_to_tc(cxy[0], cxy[1]);
-                // Step 4: bilinear sample original LUT at (tx, ty) grid coords.
-                let sample =
-                    bilinear_sample(lut, tx * (size as f64 - 1.0), ty * (size as f64 - 1.0));
+                let sample = bilinear_sample(lut, ci, cj);
                 cell.copy_from_slice(&sample[..ch]);
             }
         };
@@ -300,6 +351,25 @@ mod tests {
         }
     }
 
+    fn serial_remap(spec: &InputGamutCompress, lut: &TcLut, white: [f64; 2]) -> Vec<f64> {
+        let inv = 1. / (lut.size as f64 - 1.);
+        let mut expected = Vec::with_capacity(lut.data.len());
+        for i in 0..lut.size {
+            for j in 0..lut.size {
+                let xy = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
+                let xy = spec.compress_xy([xy.0, xy.1], white);
+                let (tx, ty) = spectral::xy_to_tc(xy[0], xy[1]);
+                let sample = bilinear_sample(
+                    lut,
+                    tx * (lut.size as f64 - 1.),
+                    ty * (lut.size as f64 - 1.),
+                );
+                expected.extend_from_slice(&sample[..lut.channels]);
+            }
+        }
+        expected
+    }
+
     /// The baked tc_lut remap matches the upstream remap-resample
     /// (`remap_tc_lut_for_compression` with the `"xy"` algorithm) against the
     /// CIE 1931 2° locus, sampled with scipy `map_coordinates(order=1,
@@ -346,21 +416,7 @@ mod tests {
         for boundary in ["locus", "inscribed_hull"] {
             let mut spec = InputGamutCompress::build("xy", [0.815, 1., 1.2]).unwrap();
             spec.set_boundary(boundary, 5., white).unwrap();
-            let inv = 1. / (lut.size as f64 - 1.);
-            let mut expected = Vec::with_capacity(lut.data.len());
-            for i in 0..lut.size {
-                for j in 0..lut.size {
-                    let xy = spectral::tc_to_xy(i as f64 * inv, j as f64 * inv);
-                    let xy = spec.compress_xy([xy.0, xy.1], white);
-                    let (tx, ty) = spectral::xy_to_tc(xy[0], xy[1]);
-                    let sample = bilinear_sample(
-                        &lut,
-                        tx * (lut.size - 1) as f64,
-                        ty * (lut.size - 1) as f64,
-                    );
-                    expected.extend_from_slice(&sample);
-                }
-            }
+            let expected = serial_remap(&spec, &lut, white);
             for threads in [1, 4] {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -378,6 +434,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cached_xy_remap_tracks_geometry_and_samples_current_lut() {
+        let white = [0.3127, 0.3290];
+        for (knee, boundary, detail, ref_xy, size) in [
+            ([0.815, 1., 1.2], "locus", 5., white, 17),
+            ([0.815, 1., 1.2], "locus", 5., [0.3457, 0.3585], 17),
+            ([0.7, 1., 1.2], "locus", 5., [0.3457, 0.3585], 17),
+            ([0.7, 1.1, 1.2], "locus", 5., [0.3457, 0.3585], 17),
+            ([0.7, 1.1, 2.], "locus", 5., [0.3457, 0.3585], 17),
+            ([0.7, 1.1, 2.], "locus", 5., [0.3457, 0.3585], 19),
+            ([0.7, 1.1, 2.], "inscribed_hull", 5., [0.3457, 0.3585], 19),
+            ([0.7, 1.1, 2.], "inscribed_hull", 6., [0.3457, 0.3585], 19),
+        ] {
+            let mut spec = InputGamutCompress::build("xy", knee).unwrap();
+            spec.set_boundary(boundary, detail, white).unwrap();
+            for (channels, offset) in [(3, 0.), (3, 2.), (1, -0.5)] {
+                let lut = TcLut {
+                    size,
+                    channels,
+                    data: synthetic_lut(size)
+                        .data
+                        .chunks_exact(3)
+                        .flat_map(|p| p[..channels].iter().map(|v| v + offset))
+                        .collect(),
+                };
+                let expected = serial_remap(&spec, &lut, ref_xy);
+                let output = spec.remap(&lut, ref_xy);
+                assert_eq!(output.data.len(), expected.len());
+                assert!(
+                    output
+                        .data
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "stale mapping or LUT values: {knee:?}, {boundary}, {detail}, {ref_xy:?}, {size}, {channels}, {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oklch_tables_follow_each_compressors_boundary() {
+        let mut wide = InputGamutCompress::build("oklch", [0.7, 1., 1.2]).unwrap();
+        let mut narrow = InputGamutCompress::build("oklch", [0.7, 1., 1.2]).unwrap();
+        let square = |radius| {
+            vec![
+                [0.33 - radius, 0.33 - radius],
+                [0.33 + radius, 0.33 - radius],
+                [0.33 + radius, 0.33 + radius],
+                [0.33 - radius, 0.33 + radius],
+                [0.33 - radius, 0.33 - radius],
+            ]
+        };
+        wide.locus = square(0.2);
+        narrow.locus = square(0.05);
+        let xy = [0.7, 0.2];
+        let a = wide.compress_xy(xy, [0.3127, 0.329]);
+        let b = narrow.compress_xy(xy, [0.3127, 0.329]);
+        assert_ne!(a, b, "a different boundary must not reuse the first table");
+        assert_eq!(wide.compress_xy(xy, [0.3127, 0.329]), a);
+
+        narrow.set_boundary("locus", 5., [0.3127, 0.329]).unwrap();
+        let fresh = InputGamutCompress::build("oklch", [0.7, 1., 1.2]).unwrap();
+        assert_eq!(
+            narrow.compress_xy(xy, [0.3127, 0.329]),
+            fresh.compress_xy(xy, [0.3127, 0.329])
+        );
+    }
+
+    #[test]
+    fn changing_boundary_replaces_instead_of_repeatedly_smoothing_it() {
+        let mut changed = InputGamutCompress::build("xy", [0.7, 1., 1.2]).unwrap();
+        let mut fresh = InputGamutCompress::build("xy", [0.7, 1., 1.2]).unwrap();
+        let white = [0.3127, 0.329];
+        changed.set_boundary("inscribed_hull", 5., white).unwrap();
+        changed.set_boundary("inscribed_hull", 8., white).unwrap();
+        fresh.set_boundary("inscribed_hull", 8., white).unwrap();
+        assert_eq!(changed.locus, fresh.locus);
+        changed.set_boundary("locus", 5., white).unwrap();
+        assert_eq!(changed.locus, spectral_locus_xy());
     }
 
     /// An inactive ("off") compressor returns the LUT unchanged.
@@ -403,13 +541,23 @@ fn contains(p: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     }
     inside
 }
-fn compress_oklch(xy: [f64; 2], knee: (f64, f64, f64), locus: &[[f64; 2]]) -> [f64; 2] {
-    use crate::gamut_compression::{oklab_to_xyz, xyz_to_oklab};
-    const NL: usize = 64;
-    const NH: usize = 720;
-    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        use rayon::prelude::*;
+const NL: usize = 64;
+const NH: usize = 720;
+
+fn oklch_table(locus: &[[f64; 2]]) -> Arc<Vec<f64>> {
+    use crate::gamut_compression::oklab_to_xyz;
+    // Keep one shared boundary; each compressor retains its own immutable table.
+    static CACHE: Mutex<Option<(Vec<[u64; 2]>, Arc<Vec<f64>>)>> = Mutex::new(None);
+    let key = locus
+        .iter()
+        .map(|p| p.map(f64::to_bits))
+        .collect::<Vec<_>>();
+    if let Some((cached_key, table)) = CACHE.lock().unwrap().as_ref()
+        && *cached_key == key
+    {
+        return Arc::clone(table);
+    }
+    let table = Arc::new(
         (0..NL * NH)
             .into_par_iter()
             .map(|i| {
@@ -429,8 +577,14 @@ fn compress_oklch(xy: [f64; 2], knee: (f64, f64, f64), locus: &[[f64; 2]]) -> [f
                 }
                 lo
             })
-            .collect()
-    });
+            .collect(),
+    );
+    *CACHE.lock().unwrap() = Some((key, Arc::clone(&table)));
+    table
+}
+
+fn compress_oklch(xy: [f64; 2], knee: (f64, f64, f64), table: &[f64]) -> [f64; 2] {
+    use crate::gamut_compression::{oklab_to_xyz, xyz_to_oklab};
     let y = xy[1].max(1e-9);
     let lab = xyz_to_oklab([xy[0] / y, 1., (1. - xy[0] - xy[1]) / y]);
     let h = lab[2].atan2(lab[1]);

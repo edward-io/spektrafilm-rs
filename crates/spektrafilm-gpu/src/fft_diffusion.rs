@@ -20,9 +20,8 @@ impl Cache {
         self.hits += 1;
         Some(buffers)
     }
-    fn insert(&mut self, key: Vec<u32>, buffers: Vec<wgpu::Buffer>) {
-        const LIMIT: u64 = 1024 * 1024 * 1024;
-        if buffers.iter().map(wgpu::Buffer::size).sum::<u64>() > LIMIT {
+    fn insert(&mut self, key: Vec<u32>, buffers: Vec<wgpu::Buffer>, budget: u64) {
+        if buffers.iter().map(wgpu::Buffer::size).sum::<u64>() > budget {
             return;
         }
         self.entries.retain(|(k, _)| *k != key);
@@ -34,7 +33,7 @@ impl Cache {
                 .flat_map(|(_, v)| v)
                 .map(wgpu::Buffer::size)
                 .sum::<u64>()
-                > LIMIT
+                > budget
         {
             self.entries.pop_front();
         }
@@ -290,7 +289,7 @@ fn build_at_shape(
         b.diffusion_cache
             .lock()
             .unwrap()
-            .insert(key, spectra.clone());
+            .insert(key, spectra.clone(), 1024 * 1024 * 1024);
     }
     for c in 0..3 {
         let spectrum = &spectra[c as usize];
@@ -379,6 +378,40 @@ pub(super) fn apply(b: &WgpuBackend, image: &ImageBuf, plan: &crate::DiffusionGp
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spectra_cache_honors_lru_byte_budget_replacement_and_oversized_entries() {
+        let Some(gpu) = WgpuBackend::new() else {
+            return;
+        };
+        let make = |size| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let mut cache = Cache::default();
+        cache.insert(vec![1], vec![make(16)], 32);
+        cache.insert(vec![2], vec![make(16)], 32);
+        assert!(cache.get(&[1]).is_some());
+        cache.insert(vec![3], vec![make(16)], 32);
+        assert!(cache.get(&[2]).is_none());
+        assert!(cache.get(&[1]).is_some());
+        cache.insert(vec![1], vec![make(16)], 32);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get(&[3]).is_some());
+        cache.insert(vec![4], vec![make(36)], 32);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get(&[4]).is_none());
+        for id in 10..20 {
+            cache.insert(vec![id], vec![make(4)], 1024);
+        }
+        assert_eq!(cache.entries.len(), 8);
+        assert!(cache.get(&[11]).is_none());
+        assert!(cache.get(&[12]).is_some());
+    }
+
     #[test]
     fn overlap_save_matches_reflected_fft_across_tile_boundaries() {
         let Some(gpu) = WgpuBackend::new() else {

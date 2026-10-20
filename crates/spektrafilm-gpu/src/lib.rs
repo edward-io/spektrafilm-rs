@@ -1,7 +1,7 @@
 pub mod cpu_backend;
-pub mod scheduler;
 #[cfg(feature = "cuda-backend")]
 pub mod cuda_backend;
+pub mod scheduler;
 #[cfg(feature = "wgpu-backend")]
 pub mod wgpu_backend;
 
@@ -13,6 +13,18 @@ use spektrafilm_math::image::ImageBuf;
 /// Default implementations fall back to CPU. GPU backends override the
 /// spectral methods for massive speedups.
 pub trait ComputeBackend: Send + Sync {
+    /// Optional display-only conversion and RGBA packing; saved pixels are untouched.
+    fn display_preview(
+        &self,
+        _image: &ImageBuf,
+        _color_space: &str,
+        _encoded: bool,
+        _transform: bool,
+        _max_size: usize,
+    ) -> Option<DisplayPreview> {
+        None
+    }
+
     fn colorspace_convert(&self, img: &ImageBuf, matrix: &[[f32; 3]; 3]) -> ImageBuf;
     fn cctf_encode_srgb(&self, img: &ImageBuf) -> ImageBuf;
     fn cctf_decode_srgb(&self, img: &ImageBuf) -> ImageBuf;
@@ -205,12 +217,26 @@ pub trait ComputeBackend: Send + Sync {
     fn name(&self) -> &str;
 }
 
+pub struct DisplayPreview {
+    pub size: [usize; 2],
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InputToneGpuParams {
+    pub curve: spektrafilm_math::tone::ToneCurve,
+    pub camera_gain: f64,
+    /// Regional base for photographs; false applies the uniform-region curve.
+    pub regional: bool,
+}
+
 /// All inputs to the GPU-resident film chain. Bundled into a struct so the
 /// trait method stays object-safe and adding more optional stages (halation,
 /// DIR couplers, …) doesn't churn every callsite.
 pub struct FilmChainParams<'a> {
     pub image: &'a ImageBuf,
     pub input_transfer: spektrafilm_math::transfer::Transfer,
+    pub input_tone: Option<InputToneGpuParams>,
     pub output_transfer: spektrafilm_math::transfer::Transfer,
     /// RGB → film-raw front pass (the configured upsampler).
     pub front: FrontPass<'a>,

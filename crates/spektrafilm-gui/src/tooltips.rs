@@ -554,6 +554,13 @@ pub const CONTROL_AUTO_EXPOSURE: &str =
     "Estimate film exposure from image brightness before applying EV compensation.";
 pub const CONTROL_EV_COMPENSATION: &str =
     "Adjust film exposure in stops, with +1 EV doubling the exposure.";
+pub const SECTION_TONE: &str =
+    "Balance the photograph's tonal ranges after exposure and before film simulation.";
+pub const CONTROL_HIGHLIGHTS: &str = "Darken or brighten highlight detail before film exposure. Negative values restrain bright detail; the brightest tail is controlled by Whites.";
+pub const CONTROL_SHADOWS: &str =
+    "Lift or deepen shadow detail before film exposure, keeping middle gray and true black fixed.";
+pub const CONTROL_WHITES: &str = "Reduce or increase the brightest exposures before film simulation, preserving highlight headroom.";
+pub const CONTROL_BLACKS: &str = "Negative values deepen and clip the darkest tones. Positive values raise a neutral black floor, reducing saturation near black.";
 pub const CONTROL_FILM_FORMAT_MM: &str = "Set the film’s long edge in millimeters, which determines the physical scale of grain and optical effects.";
 pub const CONTROL_LENS_BLUR_UM: &str =
     "Soften the camera image using a Gaussian blur measured in film-plane micrometers.";
@@ -783,8 +790,10 @@ pub const MENU_CANVAS_INTERPOLATION: &str =
     "Choose how image pixels are resampled for preview zooming without changing export.";
 pub const MENU_SAVING_COLOR_SPACE: &str =
     "Convert rendered colors to this RGB color space before writing the image file.";
+pub const MENU_EXPORT_FORMAT: &str =
+    "Choose the default file type for Save preview and Export image.";
 pub const MENU_EXPORT_DEPTH: &str =
-    "Choose integer TIFF precision or 32-bit floating point for values beyond the display range.";
+    "Choose TIFF integer or floating-point precision, or EXR floating-point precision.";
 pub const MENU_LUT_FORMAT: &str =
     "Choose the LUT file format supported by the target camera or editing application.";
 pub const MENU_LUT_TOPOLOGY: &str =

@@ -9,13 +9,16 @@ mod calibration_ui;
 mod catalog_edits;
 mod catalog_ui;
 mod chrome;
+mod crop_ui;
 mod edits;
+mod file_menu;
 mod history;
 mod icons;
 mod inspector;
 mod lut_ui;
 mod names;
 mod paper_back;
+mod preload;
 mod project;
 mod settings;
 mod theme;
@@ -30,12 +33,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use eframe::egui;
+use project::ExportFormat;
 use rayon::prelude::*;
 use spektrafilm_core::params::RuntimeParams;
 use spektrafilm_core::pipeline::Pipeline;
 use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_gpu::scheduler::{self, Priority, Scheduler, Task};
+use spektrafilm_io::crop::Crop;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::to_f32;
 
@@ -233,13 +238,15 @@ struct App {
     scheduler: Scheduler,
     load_job: Option<LoadJob>,
     pending_load: Option<LoadRequest>,
-    image_cache: std::collections::VecDeque<CachedImage>,
+    preload: preload::Preloader,
+    preload_radius: u8,
     catalog: Option<catalog_ui::Browser>,
     preview_input: Vec<(u32, Arc<ImageBuf>)>,
     rendered_preview_limit: u32,
     render_path: String,
     auto_preview: bool,
     gpu_export: bool,
+    export_format: ExportFormat,
     lut: lut_ui::Settings,
     render_requested: bool,
     display: project::DisplayParams,
@@ -265,7 +272,19 @@ struct App {
     lens_database_status: LensDatabaseStatus,
     save_options: spektrafilm_io::SaveOptions,
     image_path: Option<PathBuf>,
+    /// The pixels the pipeline sees: `uncropped` with `applied_crop`.
     image: Option<Arc<ImageBuf>>,
+    /// The whole frame, after orientation and quarter turns.
+    uncropped: Option<Arc<ImageBuf>>,
+    source_stamp: Option<(u64, std::time::SystemTime)>,
+    /// The photo's crop; `None` until a catalog photo's Lightroom crop is read.
+    crop: Option<Crop>,
+    /// The crop `image` was made with (the whole frame while cropping).
+    applied_crop: Crop,
+    /// The crop tool, while it is open.
+    crop_tool: Option<crop_ui::CropTool>,
+    /// The next rendered frame develops from blank paper (a newly opened photo).
+    develop_next: bool,
     /// Last rendered preview in the selected output color space. Retained
     /// so the Save button can write it without re-running the pipeline.
     output_image: Option<ImageBuf>,
@@ -344,10 +363,8 @@ struct App {
     edit_store_failed: bool,
     /// The open catalog photo (catalog path, Lightroom photo id) that edits save to.
     current_photo: Option<(PathBuf, i64)>,
-    /// Settings captured by Photo → Copy settings.
+    /// Settings captured by Photo → Copy settings (C).
     copied_edit: Option<edits::PhotoEdit>,
-    /// The look of the catalog photo viewed before the current one (P).
-    previous_edit: Option<edits::PhotoEdit>,
     /// Whether the current photo's history already has rows in the store.
     history_persisted: bool,
     /// Label for the next history step when it isn't a control change.
@@ -374,6 +391,9 @@ struct LoadJob {
 
 struct LoadedPreview {
     source: SourceImage,
+    /// `source` cropped with `crop`.
+    image: Arc<ImageBuf>,
+    crop: Crop,
     input: Arc<ImageBuf>,
     preview: PreviewTextureData,
     paper: Arc<PreviewTextureData>,
@@ -389,24 +409,71 @@ struct SourceImage {
     stamp: Option<(u64, std::time::SystemTime)>,
 }
 
+#[derive(Clone)]
 struct LoadRequest {
     path: PathBuf,
     rotation: u8,
     color_override: Option<(String, bool)>,
     view_override: Option<(f32, egui::Vec2)>,
     raw_options: spektrafilm_io::RawOptions,
+    /// `None` reads the Lightroom crop, if any, once the frame size is known.
+    crop: Option<Crop>,
 }
 
-struct CachedImage {
-    path: PathBuf,
-    rotation: u8,
-    options: spektrafilm_io::RawOptions,
-    source: SourceImage,
+impl SourceImage {
+    fn load(
+        path: &Path,
+        options: &spektrafilm_io::RawOptions,
+        rotation: u8,
+        task: &Task,
+    ) -> Result<Self, String> {
+        task.check().map_err(|e| e.to_string())?;
+        let stamp = image_stamp(path);
+        // The whole frame; the editor's own crop starts from Lightroom's.
+        let mut options = options.clone();
+        options.lightroom_geometry = options
+            .lightroom_geometry
+            .map(|geometry| geometry.orientation_only());
+        let mut loaded = spektrafilm_io::load(path, &options).map_err(|e| format!("{e:#}"))?;
+        task.check().map_err(|e| e.to_string())?;
+        if rotation % 4 != 0 {
+            loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
+        }
+        task.check().map_err(|e| e.to_string())?;
+        if stamp != image_stamp(path) {
+            return Err(
+                "Original changed while it was being decoded; select it again to reload.".into(),
+            );
+        }
+        Ok(Self {
+            pixels: Arc::new(loaded.pixels),
+            metadata: loaded.metadata,
+            color_space: loaded.color_space,
+            encoded: loaded.encoded,
+            stamp,
+        })
+    }
 }
 
 fn image_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    use std::hash::{Hash, Hasher};
     let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.len(), metadata.modified().ok()?))
+    let mut identity = std::collections::hash_map::DefaultHasher::new();
+    metadata.len().hash(&mut identity);
+    metadata.created().ok().hash(&mut identity);
+    // Replacing or editing a file can preserve its size and modification time.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+            .hash(&mut identity);
+    }
+    Some((identity.finish(), metadata.modified().ok()?))
 }
 
 /// One in-flight preview render. The worker owns a Pipeline + the
@@ -511,13 +578,15 @@ impl App {
             scheduler: Scheduler::default(),
             load_job: None,
             pending_load: None,
-            image_cache: Default::default(),
+            preload: Default::default(),
+            preload_radius: preload::DEFAULT_RADIUS,
             catalog: None,
             preview_input: Vec::new(),
             rendered_preview_limit: 0,
             render_path: "Awaiting render".into(),
             auto_preview: true,
             gpu_export: true,
+            export_format: Default::default(),
             lut: Default::default(),
             render_requested: false,
             display: Default::default(),
@@ -538,6 +607,12 @@ impl App {
             save_options: Default::default(),
             image_path: None,
             image: None,
+            uncropped: None,
+            source_stamp: None,
+            crop: None,
+            applied_crop: Crop::FULL,
+            crop_tool: None,
+            develop_next: false,
             output_image: None,
             output_tex: None,
             input_tex: None,
@@ -583,7 +658,6 @@ impl App {
             edit_store_failed: false,
             current_photo: None,
             copied_edit: None,
-            previous_edit: None,
             history_persisted: false,
             pending_label: None,
             pointer_captions: Default::default(),
@@ -612,7 +686,9 @@ impl App {
             return;
         }
         self.leave_photo();
+        self.preload.stop();
         self.raw_options.lightroom_geometry = None;
+        self.crop = None;
         if let Some(catalog) = &mut self.catalog {
             catalog.selected = None;
         }
@@ -620,7 +696,12 @@ impl App {
     }
 
     fn clear_image(&mut self) {
+        self.preload.forget_current();
         self.image = None;
+        self.uncropped = None;
+        self.source_stamp = None;
+        self.applied_crop = Crop::FULL;
+        self.crop_tool = None;
         self.image_path = None;
         self.loaded_raw_options = None;
         self.output_image = None;
@@ -636,6 +717,7 @@ impl App {
     }
 
     fn open_catalog(&mut self, path: PathBuf) {
+        self.preload.stop();
         self.leave_photo();
         if let Some(job) = &mut self.load_job {
             job.discard();
@@ -653,13 +735,10 @@ impl App {
     }
 
     fn select_catalog_photo(&mut self, photo: spektrafilm_io::lightroom::Photo) {
-        // Save the outgoing photo and remember its look for "Apply previous
-        // settings", then open the incoming one with its own settings (or the
-        // defaults, if it has none).
+        self.preload.abandon_wait();
+        // Save the outgoing photo, then open the incoming one with its own
+        // settings (or the defaults, if it has none).
         self.commit_photo_edit();
-        if self.current_photo.is_some() {
-            self.previous_edit = Some(self.current_edit());
-        }
         self.current_photo = self
             .catalog
             .as_ref()
@@ -698,6 +777,7 @@ impl App {
         color_override: Option<(String, bool)>,
         view_override: Option<(f32, egui::Vec2)>,
     ) {
+        self.preload.abandon_wait();
         if let Some(render) = &mut self.render_job {
             render.discard();
         }
@@ -714,6 +794,7 @@ impl App {
             color_override,
             view_override,
             raw_options: self.raw_options.clone(),
+            crop: self.wanted_crop(),
         };
         if self.image_path.as_ref() != Some(&request.path)
             || self.export_raw_options().lightroom_geometry
@@ -741,7 +822,11 @@ impl App {
         if previous == &self.raw_options {
             return;
         }
-        let (path, rotation, view, options) = if let Some(request) = &self.pending_load {
+        let (path, rotation, view, options) = if let Some(request) = self
+            .pending_load
+            .as_ref()
+            .or_else(|| self.preload.waiting())
+        {
             (
                 &request.path,
                 request.rotation,
@@ -771,22 +856,21 @@ impl App {
     }
 
     fn start_image_load(&mut self, request: LoadRequest) {
+        let Some(request) = self.wait_for_preload(request) else {
+            return;
+        };
         let LoadRequest {
             path,
             rotation,
             color_override,
             view_override,
             raw_options: options,
+            crop,
         } = request;
         let display_transform = self.display.display_transform;
+        let backend = self.backend.clone();
         let preview_color = color_override.clone();
-        let cached = self
-            .image_cache
-            .iter()
-            .find(|cached| {
-                cached.path == path && cached.rotation == rotation && cached.options == options
-            })
-            .map(|cached| cached.source.clone());
+        let cached = self.preload.cached(&path, rotation, &options);
         let worker_path = path.clone();
         let loaded_options = options.clone();
         let task = self.scheduler.task(Priority::Interactive);
@@ -805,25 +889,17 @@ impl App {
                         match cached.filter(|source| stamp.is_some() && source.stamp == stamp) {
                             Some(source) => source,
                             None => {
-                                let mut loaded = spektrafilm_io::load(&worker_path, &options)
-                                    .map_err(|e| format!("{e:#}"))?;
-                                worker_task.check().map_err(|e| e.to_string())?;
-                                if rotation % 4 != 0 {
-                                    loaded.pixels = loaded.pixels.rotated_quarter_turns(rotation);
-                                }
-                                SourceImage {
-                                    pixels: Arc::new(loaded.pixels),
-                                    metadata: loaded.metadata,
-                                    color_space: loaded.color_space,
-                                    encoded: loaded.encoded,
-                                    stamp,
-                                }
+                                SourceImage::load(&worker_path, &options, rotation, &worker_task)?
                             }
                         };
+                    let crop = crop.unwrap_or_else(|| {
+                        crop_ui::lightroom_crop(&options, &source.pixels, rotation)
+                    });
+                    let image = crop_ui::cropped(&source.pixels, &crop)?;
                     drop(cpu);
                     let loaded = started.elapsed();
                     let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
-                    let input = Arc::new(spektrafilm_core::resize::preview(&source.pixels, 2048));
+                    let input = Arc::new(spektrafilm_core::resize::preview(&image, 2048));
                     drop(cpu);
                     let resized = started.elapsed();
                     let (color, encoded) =
@@ -837,7 +913,7 @@ impl App {
                         display_transform,
                     );
                     let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
-                    let preview = make_preview_texture_data(&input, &io, display_transform);
+                    let preview = prepare_preview_texture_data(&input, &io, display_transform, backend.as_ref());
                     drop(cpu);
                     let displayed = started.elapsed();
                     let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
@@ -845,6 +921,8 @@ impl App {
                     eprintln!("[spektrafilm] load {}: decode {:.1} ms, resize {:.1} ms, display {:.1} ms, paper {:.1} ms", worker_path.display(), loaded.as_secs_f64() * 1000., (resized - loaded).as_secs_f64() * 1000., (displayed - resized).as_secs_f64() * 1000., (started.elapsed() - displayed).as_secs_f64() * 1000.);
                     Ok(LoadedPreview {
                         source,
+                        image,
+                        crop,
                         input,
                         preview,
                         paper,
@@ -907,6 +985,8 @@ impl App {
             Ok(display) => {
                 let LoadedPreview {
                     source,
+                    image,
+                    crop,
                     input,
                     preview,
                     paper,
@@ -915,32 +995,15 @@ impl App {
                 if let Some(catalog) = &mut self.catalog {
                     catalog.source_thumbnail(&self.ctx, &job.path, &preview);
                 }
-                self.image_cache.retain(|cached| {
-                    cached.path != job.path
-                        || cached.options != job.raw_options
-                        || cached.rotation != job.rotation
-                });
-                self.image_cache.push_back(CachedImage {
-                    path: job.path.clone(),
-                    rotation: job.rotation,
-                    options: job.raw_options.clone(),
-                    source: source.clone(),
-                });
-                // Keep the current source plus at most 512 MiB of previously developed images.
-                let mut previous_bytes: usize = self
-                    .image_cache
-                    .iter()
-                    .rev()
-                    .skip(1)
-                    .map(|cached| std::mem::size_of_val(cached.source.pixels.data.as_slice()))
-                    .sum();
-                while previous_bytes > 512 * 1024 * 1024 {
-                    if let Some(cached) = self.image_cache.pop_front() {
-                        previous_bytes -=
-                            std::mem::size_of_val(cached.source.pixels.data.as_slice());
-                    }
-                }
+                self.preload.remember_current(
+                    job.path.clone(),
+                    job.rotation,
+                    job.raw_options.clone(),
+                    source.clone(),
+                );
                 let new_image = self.image_path.as_ref() != Some(&job.path);
+                // Rotating, cropping or redeveloping the same photo swaps in place.
+                self.develop_next = new_image;
                 self.loaded_raw_options = Some(job.raw_options);
                 self.metadata = source.metadata;
                 let (color, encoded) = job
@@ -948,8 +1011,21 @@ impl App {
                     .unwrap_or((source.color_space, source.encoded));
                 self.params.io.input_color_space = color;
                 self.params.io.input_cctf_decoding = encoded;
+                if !new_image {
+                    // A quarter turn of the same photo turns its crop too.
+                    let turns = (job.rotation + 4 - self.rotation) % 4;
+                    self.crop = self.crop.map(|crop| crop.rotated_quarter_turns(turns));
+                    if let Some(tool) = &mut self.crop_tool {
+                        tool.rotate(turns);
+                    }
+                }
                 self.rotation = job.rotation;
-                let img = source.pixels;
+                self.source_stamp = source.stamp;
+                self.uncropped = Some(source.pixels);
+                self.applied_crop = crop;
+                // A catalog photo's Lightroom crop, read now that its size is known.
+                self.crop.get_or_insert(crop);
+                let img = image;
                 self.status = format!(
                     "Loaded {} × {} ({:.1} MP) in {:.0} ms",
                     img.width,
@@ -1017,10 +1093,21 @@ impl App {
     }
 
     fn rotate_input(&mut self, turns: u8) {
-        let (Some(image), Some(path)) = (self.image.clone(), self.image_path.clone()) else {
+        if self.uncropped.is_none() || self.image_loading() {
+            return;
+        }
+        // The crop turns with the frame (`crop` follows when the job lands).
+        let crop = self.wanted_crop().unwrap_or(Crop::FULL);
+        self.reframe(turns, crop.rotated_quarter_turns(turns));
+    }
+
+    /// Rebuild the pipeline input from the whole frame: turn it clockwise by
+    /// `turns` quarter turns, then apply `crop`. The photo isn't decoded again.
+    fn reframe(&mut self, turns: u8, crop: Crop) {
+        let (Some(frame), Some(path)) = (self.uncropped.clone(), self.image_path.clone()) else {
             return;
         };
-        if self.load_job.is_some() {
+        if self.image_loading() {
             return;
         }
         let rotation = (self.rotation + turns) % 4;
@@ -1028,21 +1115,28 @@ impl App {
         let color = self.params.io.input_color_space.clone();
         let encoded = self.params.io.input_cctf_decoding;
         let display_transform = self.display.display_transform;
+        let backend = self.backend.clone();
         let ctx = self.ctx.clone();
         let (tx, rx) = mpsc::channel();
         let worker_color = color.clone();
-        let worker_path = path.clone();
+        let source_stamp = self.source_stamp;
         let task = self.scheduler.task(Priority::Interactive);
         let worker_task = task.clone();
         let handle = std::thread::Builder::new()
-            .name("spektrafilm-rotate".into())
+            .name("spektrafilm-reframe".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _scope = worker_task.enter();
                     let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
-                    let pixels = image.rotated_quarter_turns(turns);
+                    let pixels = if turns % 4 == 0 {
+                        frame
+                    } else {
+                        Arc::new(frame.rotated_quarter_turns(turns))
+                    };
                     worker_task.check().map_err(|e| e.to_string())?;
-                    let input = Arc::new(spektrafilm_core::resize::preview(&pixels, 2048));
+                    let image = crop_ui::cropped(&pixels, &crop)?;
+                    worker_task.check().map_err(|e| e.to_string())?;
+                    let input = Arc::new(spektrafilm_core::resize::preview(&image, 2048));
                     let mut io = spektrafilm_core::params::IoParams::default();
                     io.output_color_space = worker_color.clone();
                     io.output_cctf_encoding = encoded;
@@ -1051,16 +1145,23 @@ impl App {
                         io.output_cctf_encoding,
                         display_transform,
                     );
-                    let preview = make_preview_texture_data(&input, &io, display_transform);
+                    let preview = prepare_preview_texture_data(
+                        &input,
+                        &io,
+                        display_transform,
+                        backend.as_ref(),
+                    );
                     let paper = paper_back::cached(preview.size[0], preview.size[1]);
                     Ok(LoadedPreview {
                         source: SourceImage {
-                            pixels: Arc::new(pixels),
+                            pixels,
                             metadata,
                             color_space: worker_color,
                             encoded,
-                            stamp: image_stamp(&worker_path),
+                            stamp: source_stamp,
                         },
+                        image,
+                        crop,
                         input,
                         preview,
                         paper,
@@ -1088,7 +1189,12 @@ impl App {
                 if let Some(job) = &mut self.render_job {
                     job.discard();
                 }
-                self.status = "Rotating input…".into();
+                self.status = if turns % 4 == 0 {
+                    "Cropping…"
+                } else {
+                    "Rotating input…"
+                }
+                .into();
                 self.ctx.request_repaint();
             }
             Err(e) => self.status = format!("Rotate: {e}"),
@@ -1112,13 +1218,11 @@ impl App {
         let input_clone_ms = t_clone.elapsed().as_secs_f32() * 1000.0;
         let film_name = self.film_name.clone();
         let print_name = self.print_name.clone();
-        let params = self.params.clone();
-        let cache_key = preview_pipeline_cache_key(&film_name, &print_name, &params);
-        let pipeline_template = if self.pipeline_cache_key.as_deref() == Some(cache_key.as_str()) {
-            self.pipeline_cache.clone()
-        } else {
-            None
-        };
+        let params = self.pipeline_params(self.applied_crop);
+        let pipeline_template = self
+            .pipeline_cache_key
+            .clone()
+            .zip(self.pipeline_cache.clone());
         let data_dir = self.data_dir.clone();
         let configured_limit = if params.settings.preview_max_size == 0 {
             image.width.max(image.height)
@@ -1155,7 +1259,12 @@ impl App {
         self.status = format!("Rendering preview (maximum {preview_limit} px)…");
         let (tx, rx) = mpsc::channel();
         let ctx_for_worker = ctx.clone();
-        let task = self.scheduler.task(Priority::Interactive);
+        // Drag frames go ahead of everything, including the last refine.
+        let task = self.scheduler.task(if interactive {
+            Priority::Drag
+        } else {
+            Priority::Interactive
+        });
         let worker_task = task.clone();
         let handle = std::thread::Builder::new()
             .name("spektrafilm-render".into())
@@ -1166,6 +1275,9 @@ impl App {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _scope = worker_task.enter();
                     let cpu = worker_task.cpu().map_err(|e| e.to_string())?;
+                    params
+                        .validate()
+                        .map_err(|e| format!("processing settings: {e}"))?;
                     let t_total = Instant::now();
                     let t_scale = Instant::now();
                     // simulate_preview always bounds input size. Preview mode
@@ -1179,9 +1291,11 @@ impl App {
                     let scale_ms = t_scale.elapsed().as_secs_f32() * 1000.;
                     let input_preview = image.clone();
                     let t_build = Instant::now();
+                    let cache_key =
+                        preview_pipeline_cache_key(&data_dir, &film_name, &print_name, &params);
                     let pipeline = match pipeline_template {
-                        Some(pipeline) => pipeline.with_params(params),
-                        None => {
+                        Some((key, pipeline)) if key == cache_key => pipeline.with_params(params),
+                        _ => {
                             let film = profile::load_profile_by_name(&data_dir, &film_name)
                                 .map_err(|e| format!("film profile: {e}"))?;
                             let print = profile::load_profile_by_name(
@@ -1242,8 +1356,12 @@ impl App {
                     drop(cpu_render);
                     let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
                     let t_preview = Instant::now();
-                    let preview =
-                        make_preview_texture_data(&output, &pipeline.params.io, display_transform);
+                    let preview = prepare_preview_texture_data(
+                        &output,
+                        &pipeline.params.io,
+                        display_transform,
+                        backend.as_ref(),
+                    );
                     let source_preview = if prepare_source {
                         let source = if source_image.width.max(source_image.height) > 2048 {
                             Arc::new(spektrafilm_core::resize::preview(&source_image, 2048))
@@ -1255,7 +1373,12 @@ impl App {
                         source_io.output_cctf_encoding = source_key.1;
                         Some((
                             source_key,
-                            make_preview_texture_data(&source, &source_io, display_transform),
+                            prepare_preview_texture_data(
+                                &source,
+                                &source_io,
+                                display_transform,
+                                backend.as_ref(),
+                            ),
                         ))
                     } else {
                         None
@@ -1306,6 +1429,10 @@ impl App {
     /// cursor) and click-drag pan. Double-click resets to fit.
     /// `self.zoom = 1.0` means fit-to-panel; values >1 zoom in.
     fn draw_preview_with_zoom(&mut self, ui: &mut egui::Ui) {
+        if self.crop_tool.is_some() {
+            self.crop_canvas(ui);
+            return;
+        }
         // Holding "before" shows the unprocessed input in place of the render.
         let held_display = self.compare_hold.then(|| {
             let saved = self.display.clone();
@@ -1343,6 +1470,11 @@ impl App {
         }
 
         let response = ui.allocate_response(avail, egui::Sense::click_and_drag());
+        if let Some(path) = &self.image_path
+            && let Some(error) = file_menu::show(&response, path)
+        {
+            self.status = error;
+        }
         let rect = response.rect;
         let fit_centre = rect.min + area.center().to_vec2();
 
@@ -1389,9 +1521,9 @@ impl App {
             |p: egui::Pos2| (p.x - split_x).abs() < 8.0 && split_rect.y_range().contains(p.y);
         let split_id = response.id.with("split-drag");
         let mut dragging_split = self.display.compare_split
-            && response.dragged()
+            && response.dragged_by(egui::PointerButton::Primary)
             && ui.data(|d| d.get_temp::<bool>(split_id)).unwrap_or(false);
-        if self.display.compare_split && response.drag_started() {
+        if self.display.compare_split && response.drag_started_by(egui::PointerButton::Primary) {
             dragging_split = ui
                 .input(|i| i.pointer.press_origin())
                 .is_some_and(near_split);
@@ -1407,7 +1539,7 @@ impl App {
                 self.display.split_position =
                     ((p.x - split_rect.left()) / split_rect.width()).clamp(0.0, 1.0);
             }
-        } else if response.dragged() {
+        } else if response.dragged_by(egui::PointerButton::Primary) {
             self.pan += response.drag_delta();
         }
         if response.double_clicked() {
@@ -1630,7 +1762,8 @@ impl App {
                 self.last_preview_ms = r.preview_ms;
                 self.last_worker_total_ms = r.worker_total_ms;
                 if let Some(canvas) = &self.canvas {
-                    let first_frame = self.canvas_output.is_none();
+                    let first_frame =
+                        self.canvas_output.is_none() && std::mem::take(&mut self.develop_next);
                     self.canvas_previous = self
                         .canvas_output
                         .take()
@@ -1705,42 +1838,74 @@ impl App {
         }
     }
 
-    /// Open a save dialog and write the most recent rendered output to
-    /// disk. Suggested filename is the input stem + the chosen film
-    /// stock + the chosen extension; default extension is PNG (8-bit
-    /// sRGB-encoded, matching what's on screen).
-    fn save_dialog(&mut self) {
-        let Some(out) = self.output_image.clone() else {
-            self.status = "Nothing to save yet — load an image first.".into();
-            return;
-        };
-        let default_name = match &self.image_path {
+    fn image_save_name(&self) -> String {
+        let extension = self.export_format.extensions()[0];
+        match &self.image_path {
             Some(p) => {
                 let stem = p
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("spektrafilm");
-                format!("{stem}_{}_spektra.png", self.film_name)
+                format!("{stem}_{}_spektra.{extension}", self.film_name)
             }
-            None => "spektrafilm.png".into(),
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg", "tif", "tiff", "exr"])
-            .set_file_name(&default_name)
+            None => format!("spektrafilm.{extension}"),
+        }
+    }
+
+    fn image_save_dialog(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .add_filter(self.export_format.label(), self.export_format.extensions())
+            .add_filter("All images", &["jpg", "jpeg", "tif", "tiff", "png", "exr"])
+            .set_file_name(self.image_save_name())
             .save_file()
-        else {
+    }
+
+    fn export_metadata(
+        &self,
+        params: &RuntimeParams,
+        crop: Crop,
+    ) -> Result<spektrafilm_io::Metadata> {
+        let mut raw = self.export_raw_options().clone();
+        raw.lightroom_geometry = raw
+            .lightroom_geometry
+            .map(|geometry| geometry.orientation_only());
+        self.metadata
+            .with_edit_settings(&spektrafilm_io::EditSettings {
+                film: &self.film_name,
+                paper: &self.print_name,
+                params,
+                raw: &raw,
+                rotation: self.rotation,
+                crop,
+            })
+    }
+
+    /// Save the rendered preview using the selected file format.
+    fn save_dialog(&mut self) {
+        let Some(out) = self.output_image.clone() else {
+            self.status = "Nothing to save yet — load an image first.".into();
+            return;
+        };
+        let Some(path) = self.image_save_dialog() else {
             return;
         };
         let t = Instant::now();
-        match spektrafilm_io::save_converted(
-            &out,
-            &self.params.io.output_color_space,
-            self.params.io.output_cctf_encoding,
-            &path,
-            &self.current_save_options(),
-            &self.metadata,
-            &self.data_dir,
-        ) {
+        let mut params = self.params.clone();
+        params.settings.preview_max_size = self.rendered_preview_limit;
+        let result = self
+            .export_metadata(&params, self.applied_crop)
+            .and_then(|metadata| {
+                spektrafilm_io::save_converted(
+                    &out,
+                    &self.params.io.output_color_space,
+                    self.params.io.output_cctf_encoding,
+                    &path,
+                    &self.current_save_options(),
+                    &metadata,
+                    &self.data_dir,
+                )
+            });
+        match result {
             Ok(()) => {
                 self.status = format!(
                     "Saved {} in {:.0} ms",
@@ -1774,29 +1939,29 @@ impl App {
                 }
             }
         };
-        let stem = input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("spektrafilm");
-        let default_name = format!("{stem}_{}_spektra.png", self.film_name);
-        let Some(out_path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "tif", "tiff", "jpg", "jpeg", "exr"])
-            .set_file_name(&default_name)
-            .save_file()
-        else {
+        let Some(out_path) = self.image_save_dialog() else {
             return;
         };
 
         let film = self.film_name.clone();
         let paper = self.print_name.clone();
+        let crop = self.committed_crop();
         let mut params = self.params.clone();
         params.settings.preview_mode = false;
+        // The CLI scales grain for the crop itself.
+        let cli_params = params.clone();
+        params.camera.film_format_mm = self.pipeline_params(crop).camera.film_format_mm;
         let data_dir = self.data_dir.clone();
         let raw_options = self.export_raw_options().clone();
         let rotation = self.rotation;
         let save_options = self.current_save_options();
-        let metadata = self.metadata.clone();
-        let image = self.image.clone();
+        let metadata = self.export_metadata(&cli_params, crop);
+        // While cropping, `image` is the whole frame; export the committed crop.
+        let image = if crop == self.applied_crop {
+            self.image.clone().map(Ok)
+        } else {
+            self.uncropped.clone().map(Err)
+        };
         let backend = self.backend.clone();
         let label = if cli_path.is_some() {
             "f64 CPU"
@@ -1813,16 +1978,22 @@ impl App {
                     &out_path,
                     &film,
                     &paper,
-                    &params,
+                    &cli_params,
                     &data_dir,
                     cancel,
                     &raw_options,
                     &save_options,
                     rotation,
+                    crop,
                 );
             }
+            let metadata = metadata?;
+            let image = match image.context("source image is still loading")? {
+                Ok(image) => image,
+                Err(frame) => Arc::new(crop.apply(&frame)?),
+            };
             run_gpu_export(
-                image.context("source image is still loading")?.as_ref(),
+                image.as_ref(),
                 &out_path,
                 &film,
                 &paper,
@@ -1859,10 +2030,13 @@ impl App {
         let handle = std::thread::Builder::new()
             .name("spektrafilm-export".into())
             .spawn(move || {
-                let _scope = worker_task.enter();
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&worker_cancel)))
-                        .unwrap_or_else(|panic| Err(anyhow::anyhow!(panic_message(panic))));
+                let result = worker_task
+                    .run(|| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run(&worker_cancel)
+                        }))
+                    })
+                    .unwrap_or_else(|panic| Err(anyhow::anyhow!(panic_message(panic))));
                 let message = result
                     .map(|_| {
                         (
@@ -2064,6 +2238,54 @@ impl App {
                     tooltips::CONTROL_LENS_BLUR_UM,
                 )
                 .changed();
+                if changed {
+                    self.dirty = true;
+                }
+            });
+
+        Section::new("Tone", Tab::Input, tooltips::SECTION_TONE)
+            .used(stages.camera, not_camera)
+            .pointers(&["/camera/tone"])
+            .show(ui, |ui| {
+                let t = &mut self.params.camera.tone;
+                let defaults = &stock.camera.tone;
+                let mut changed = false;
+                for (label, value, default, help) in [
+                    (
+                        "Highlights",
+                        &mut t.highlights,
+                        defaults.highlights,
+                        tooltips::CONTROL_HIGHLIGHTS,
+                    ),
+                    (
+                        "Shadows",
+                        &mut t.shadows,
+                        defaults.shadows,
+                        tooltips::CONTROL_SHADOWS,
+                    ),
+                    (
+                        "Whites",
+                        &mut t.whites,
+                        defaults.whites,
+                        tooltips::CONTROL_WHITES,
+                    ),
+                    (
+                        "Blacks",
+                        &mut t.blacks,
+                        defaults.blacks,
+                        tooltips::CONTROL_BLACKS,
+                    ),
+                ] {
+                    changed |= tooltips::labeled(
+                        ui,
+                        tooltips::slider(value, -100. ..=100.)
+                            .stock(default)
+                            .step_by(1.),
+                        label,
+                        help,
+                    )
+                    .changed();
+                }
                 if changed {
                     self.dirty = true;
                 }
@@ -3184,6 +3406,7 @@ impl eframe::App for App {
         }
         let _ = frame;
 
+        self.poll_preload();
         self.poll_load_job();
         self.poll_calibration(ctx);
         // Refine an interactive 640 px frame after the slider is released.
@@ -3205,7 +3428,7 @@ impl eframe::App for App {
         if self.dirty
             && (self.auto_preview || self.render_requested)
             && self.image.is_some()
-            && self.load_job.is_none()
+            && !self.image_loading()
         {
             let now = Instant::now();
             let dirty_since = *self.dirty_since.get_or_insert(now);
@@ -3229,7 +3452,7 @@ impl eframe::App for App {
                 }
             }
         }
-        if self.render_job.is_some() || self.load_job.is_some() {
+        if self.render_job.is_some() || self.image_loading() {
             ctx.request_repaint_after(IN_FLIGHT_REPAINT);
         }
         self.poll_render_job(ctx);
@@ -3296,6 +3519,7 @@ impl eframe::App for App {
                             .show(ui, |ui| self.controls_panel(ui, ctx));
                     });
             });
+        let preload_radius = &mut self.preload_radius;
         let action = self.catalog.as_mut().and_then(|catalog| {
             egui::SidePanel::left("catalog")
                 .default_width(236.)
@@ -3310,18 +3534,24 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
-                    catalog.show(ui, ctx)
+                    catalog.show(ui, ctx, preload_radius)
                 })
                 .inner
         });
         match action {
             Some(catalog_ui::Action::Close) => {
+                let request = self.preload.waiting().cloned();
+                self.preload.stop();
                 self.leave_photo();
                 self.catalog = None;
                 self.last_catalog = None;
+                if let Some(request) = request {
+                    self.start_image_load(request);
+                }
             }
             Some(catalog_ui::Action::Select(photo)) => self.select_catalog_photo(photo),
             Some(catalog_ui::Action::Empty) => {
+                self.preload.stop();
                 self.leave_photo();
                 if let Some(job) = &mut self.load_job {
                     job.discard();
@@ -3335,6 +3565,7 @@ impl eframe::App for App {
             }
             None => {}
         }
+        self.update_preloading();
         let canvas = if self.display.gray_18_canvas {
             egui::Color32::from_gray(118)
         } else {
@@ -3369,6 +3600,7 @@ impl eframe::App for App {
             self.load_image_from_path(&path);
         }
         self.reload_raw_if_changed(&raw_before);
+        self.sync_crop();
     }
 
     /// Called once when the window is closing. If an export is still
@@ -3377,6 +3609,7 @@ impl eframe::App for App {
     /// this the f64 CLI orphans into its own process group and keeps
     /// hammering the CPU long after the window is gone.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.preload.stop();
         self.leave_photo();
         let Some(job) = self.export_job.take() else {
             return;
@@ -3585,8 +3818,13 @@ fn fps_label(ms: f32) -> &'static str {
     }
 }
 
-fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &RuntimeParams) -> String {
-    serde_json::json!({
+fn preview_pipeline_cache_key(
+    data_dir: &Path,
+    film_name: &str,
+    print_name: &str,
+    params: &RuntimeParams,
+) -> String {
+    let params_key = serde_json::json!({
         "film": film_name,
         "print": print_name,
         "workflow":params.route(),
@@ -3637,7 +3875,27 @@ fn preview_pipeline_cache_key(film_name: &str, print_name: &str, params: &Runtim
             0.0
         },
     })
-    .to_string()
+    .to_string();
+    let mut files: Vec<_> = [
+        film_name,
+        if params.scans_film() {
+            film_name
+        } else {
+            print_name
+        },
+    ]
+    .map(|stock| data_dir.join("profiles").join(format!("{stock}.json")))
+    .into();
+    files.push(data_dir.join("filters/neutral_print_filters.json"));
+    let spectral = data_dir.join("luts/spectral_upsampling");
+    if let Ok(entries) = std::fs::read_dir(&spectral) {
+        files.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+    }
+    files.push(spectral.join("arctic2026alpha02/reflectance_xy_tc.npy"));
+    files.sort();
+    files.dedup();
+    let sources: Vec<_> = files.iter().map(|path| (path, image_stamp(path))).collect();
+    format!("{params_key}:{:?}", (data_dir, sources))
 }
 
 fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
@@ -3649,6 +3907,33 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
             .map(|e| e.stock.clone())
             .unwrap_or_else(|| preferred.to_string())
     }
+}
+
+fn prepare_preview_texture_data(
+    out: &ImageBuf,
+    io: &spektrafilm_core::params::IoParams,
+    display_transform: bool,
+    backend: &dyn ComputeBackend,
+) -> PreviewTextureData {
+    // Small previews and already encoded sRGB are cheaper to pack on the CPU.
+    if out.pixel_count() >= 512 * 1024
+        && display_transform
+        && !(io.output_color_space == "sRGB" && io.output_cctf_encoding)
+    {
+        if let Some(preview) = backend.display_preview(
+            out,
+            &io.output_color_space,
+            io.output_cctf_encoding,
+            display_transform,
+            PREVIEW_TEXTURE_MAX_DIM,
+        ) {
+            return PreviewTextureData {
+                size: preview.size,
+                rgba: preview.rgba,
+            };
+        }
+    }
+    make_preview_texture_data(out, io, display_transform)
 }
 
 /// Convert the selected output color transport to an sRGB RGBA display preview.
@@ -3863,6 +4148,7 @@ fn run_f64_export(
     raw_options: &spektrafilm_io::RawOptions,
     save_options: &spektrafilm_io::SaveOptions,
     rotation: u8,
+    crop: Crop,
 ) -> Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3926,9 +4212,13 @@ fn run_f64_export(
     if let Some(path) = &raw_options.lens_database {
         cmd.arg("--lens-database").arg(path);
     }
+    // Lightroom's crop is already part of `crop`.
     if let Some(geometry) = &raw_options.lightroom_geometry {
         cmd.arg("--lightroom-geometry")
-            .arg(serde_json::to_string(geometry)?);
+            .arg(serde_json::to_string(&geometry.orientation_only())?);
+    }
+    if !crop.is_full() {
+        cmd.arg("--crop").arg(serde_json::to_string(&crop)?);
     }
     run_cli(&mut cmd, cancel)
 }
@@ -4136,6 +4426,7 @@ impl App {
             rotation: self.rotation,
             auto_preview: self.auto_preview,
             gpu_export: self.gpu_export,
+            export_format: self.export_format,
             lut: self.lut.clone(),
             display: self.display.clone(),
             scan_for_print_restore: self.scan_for_print_restore,
@@ -4146,6 +4437,7 @@ impl App {
             zoom: self.zoom,
             pan: [self.pan.x, self.pan.y],
             raw: self.export_raw_options().clone(),
+            crop: self.committed_crop_option(),
             output: self.current_save_options(),
         }
     }
@@ -4158,6 +4450,7 @@ impl App {
         profile::load_profile_by_name(&self.data_dir, &state.paper)?;
         self.auto_preview = state.auto_preview;
         self.gpu_export = state.gpu_export;
+        self.export_format = state.export_format;
         self.lut = state.lut;
         self.display = state.display;
         self.scan_for_print_restore = state.scan_for_print_restore;
@@ -4168,6 +4461,9 @@ impl App {
                 catalog.selected = None;
             }
             if let Some(image) = state.image {
+                // Project crops already use the saved rotation, even for this photo.
+                self.clear_image();
+                self.crop = state.crop;
                 self.load_image_with_state(
                     &image,
                     state.rotation,
@@ -4495,6 +4791,26 @@ impl App {
         Section::new("File export", Tab::Output, tooltips::SECTION_FILE_EXPORT)
             .closed()
             .show(ui, |ui| {
+                tooltips::combo(
+                    ui,
+                    egui::ComboBox::from_id_salt("export_format")
+                        .selected_text(self.export_format.label()),
+                    "File format",
+                    tooltips::MENU_EXPORT_FORMAT,
+                    |ui| {
+                        for format in [
+                            ExportFormat::Jpeg,
+                            ExportFormat::Tiff,
+                            ExportFormat::Png,
+                            ExportFormat::Exr,
+                        ] {
+                            ui.selectable_value(&mut self.export_format, format, format.label());
+                        }
+                    },
+                );
+                if self.export_format == ExportFormat::Exr && self.save_options.bit_depth == 8 {
+                    self.save_options.bit_depth = 16;
+                }
                 tooltips::checkbox(
                     ui,
                     &mut self.gpu_export,
@@ -4532,38 +4848,55 @@ impl App {
                     "Encode saving transfer function",
                     tooltips::CONTROL_ENCODE_SAVING_TRANSFER_FUNCTION,
                 );
-                tooltips::combo(
-                    ui,
-                    egui::ComboBox::from_id_salt("export_depth")
-                        .selected_text(format!("{} bit", self.save_options.bit_depth)),
-                    "TIFF bit depth",
-                    tooltips::MENU_EXPORT_DEPTH,
-                    |ui| {
-                        for depth in [8, 16, 32] {
-                            ui.selectable_value(
-                                &mut self.save_options.bit_depth,
-                                depth,
-                                format!("{depth} bit"),
-                            )
-                            .on_hover_text(if depth == 32 {
-                                tooltips::TIFF_FLOAT
+                if matches!(self.export_format, ExportFormat::Tiff | ExportFormat::Exr) {
+                    tooltips::combo(
+                        ui,
+                        egui::ComboBox::from_id_salt("export_depth")
+                            .selected_text(format!("{} bit", self.save_options.bit_depth)),
+                        if self.export_format == ExportFormat::Exr {
+                            "EXR bit depth"
+                        } else {
+                            "TIFF bit depth"
+                        },
+                        tooltips::MENU_EXPORT_DEPTH,
+                        |ui| {
+                            let depths: &[u8] = if self.export_format == ExportFormat::Exr {
+                                &[16, 32]
                             } else {
-                                tooltips::TIFF_INTEGER
-                            });
-                        }
-                    },
-                );
-                tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.save_options.jpeg_quality, 1..=100),
-                    "JPEG quality",
-                    tooltips::CONTROL_JPEG_QUALITY,
-                );
-                ui.label(
-                    egui::RichText::new("Float TIFF and EXR preserve values outside 0–1.")
-                        .small()
-                        .color(theme::TEXT_WEAK),
-                );
+                                &[8, 16, 32]
+                            };
+                            for &depth in depths {
+                                ui.selectable_value(
+                                    &mut self.save_options.bit_depth,
+                                    depth,
+                                    format!("{depth} bit"),
+                                )
+                                .on_hover_text(
+                                    if self.export_format == ExportFormat::Exr {
+                                        "Floating-point precision for linear EXR pixels."
+                                    } else if depth == 32 {
+                                        tooltips::TIFF_FLOAT
+                                    } else {
+                                        tooltips::TIFF_INTEGER
+                                    },
+                                );
+                            }
+                        },
+                    );
+                    ui.label(
+                        egui::RichText::new("Float TIFF and EXR preserve values outside 0–1.")
+                            .small()
+                            .color(theme::TEXT_WEAK),
+                    );
+                }
+                if self.export_format == ExportFormat::Jpeg {
+                    tooltips::labeled(
+                        ui,
+                        egui::Slider::new(&mut self.save_options.jpeg_quality, 1..=100),
+                        "JPEG quality",
+                        tooltips::CONTROL_JPEG_QUALITY,
+                    );
+                }
             });
     }
 
@@ -4725,7 +5058,20 @@ mod raw_reload_tests {
             .unwrap()
             .pixels
             .rotated_quarter_turns(1);
-        assert_eq!(app.image.as_ref().unwrap().data, expected.data);
+        // The editor applies Lightroom's crop itself, on the whole frame.
+        let image = app.image.as_ref().unwrap();
+        assert_eq!(
+            (image.width, image.height),
+            (expected.width, expected.height)
+        );
+        let error = image
+            .data
+            .iter()
+            .zip(&expected.data)
+            .map(|(a, b)| (*a as f64 - *b as f64).abs())
+            .fold(0., f64::max);
+        assert!(error < 1e-5, "{error}");
+        let kept = app.image.as_ref().unwrap().clone();
         assert_ne!(app.image.as_ref().unwrap().data, original.data);
         assert_eq!(app.rotation, 1);
         assert_eq!((app.zoom, app.pan), view);
@@ -4737,7 +5083,10 @@ mod raw_reload_tests {
         finish(&mut app);
         assert!(app.status.starts_with("Load error:"), "{}", app.status);
         assert_eq!(app.export_raw_options(), &applied);
-        assert_eq!(app.image.as_ref().unwrap().data, expected.data);
+        assert!(
+            Arc::ptr_eq(app.image.as_ref().unwrap(), &kept),
+            "a failed reload keeps the pixels"
+        );
         app.reload_raw_if_changed(&app.raw_options.clone());
         assert!(
             app.load_job.is_none(),
@@ -4845,6 +5194,54 @@ mod transition_tests {
 #[cfg(all(test, unix))]
 mod export_tests {
     use super::*;
+
+    #[test]
+    fn export_recipe_uses_loaded_raw_settings_and_keeps_editor_values_before_crop_scaling() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        app.params.camera.tone.shadows = 42.;
+        app.params.camera.film_format_mm = 35.;
+        app.rotation = 1;
+        app.raw_options.temperature = 9000.;
+        app.loaded_raw_options = Some(spektrafilm_io::RawOptions {
+            decoder: "rawler".into(),
+            white_balance: "custom".into(),
+            temperature: 4200.,
+            lightroom_geometry: Some(spektrafilm_io::lightroom::Geometry {
+                orientation: 6,
+                crop: [0.25, 0., 1., 0.5],
+                angle: 2.,
+            }),
+            ..Default::default()
+        });
+        let crop = Crop {
+            size: [0.5, 0.75],
+            angle: 2.,
+            ..Default::default()
+        };
+        let metadata = app.export_metadata(&app.params, crop).unwrap();
+        let settings = metadata.edit_settings.unwrap();
+        assert_eq!(settings["film"], app.film_name);
+        assert_eq!(settings["paper"], app.print_name);
+        assert_eq!(
+            settings["params"],
+            serde_json::to_value(&app.params).unwrap()
+        );
+        assert_eq!(settings["raw"]["temperature"], 4200.);
+        assert_eq!(settings["raw"]["lightroom_geometry"]["orientation"], 6);
+        assert_eq!(
+            settings["raw"]["lightroom_geometry"]["crop"],
+            serde_json::json!([0., 0., 1., 1.])
+        );
+        assert_eq!(settings["raw"]["lightroom_geometry"]["angle"], 0.);
+        assert_eq!(settings["rotation"], 1);
+        assert_eq!(settings["crop"], serde_json::to_value(crop).unwrap());
+    }
 
     #[test]
     fn cancelling_an_export_waiting_for_capacity_does_not_run_or_write_it() {
@@ -5064,6 +5461,297 @@ mod preview_texture_tests {
     use super::*;
 
     #[test]
+    fn accelerated_display_preserves_source_and_cpu_fallback() {
+        let image = ImageBuf::from_data(
+            1025,
+            683,
+            (0..1025 * 683 * 3)
+                .map(|i| spektrafilm_math::precision::from_f64((i * 73 % 1021) as f64 / 511. - 0.1))
+                .collect(),
+        );
+        let before = image.data.clone();
+        let io = spektrafilm_core::params::IoParams {
+            output_color_space: "ACES2065-1".into(),
+            output_cctf_encoding: false,
+            ..Default::default()
+        };
+        let expected = make_preview_texture_data(&image, &io, true);
+        let cpu = prepare_preview_texture_data(
+            &image,
+            &io,
+            true,
+            &spektrafilm_gpu::cpu_backend::CpuBackend,
+        );
+        assert_eq!(cpu.rgba, expected.rgba);
+        if let Some(backend) = spektrafilm_gpu::wgpu_backend::WgpuBackend::new() {
+            let actual = prepare_preview_texture_data(&image, &io, true, &backend);
+            assert_eq!(actual.size, expected.size);
+            assert!(
+                actual
+                    .rgba
+                    .iter()
+                    .zip(&expected.rgba)
+                    .all(|(a, b)| a.abs_diff(*b) <= 1)
+            );
+        }
+        assert_eq!(image.data, before);
+    }
+
+    #[test]
+    fn gpu_preview_preparation_matches_cpu() {
+        let Some(backend) = spektrafilm_gpu::wgpu_backend::WgpuBackend::new() else {
+            return;
+        };
+        if backend
+            .display_preview(
+                &ImageBuf::new(1, 1),
+                "sRGB",
+                true,
+                false,
+                PREVIEW_TEXTURE_MAX_DIM,
+            )
+            .is_none()
+        {
+            return;
+        }
+        for color in spektrafilm_math::transfer::names() {
+            let curve = spektrafilm_math::transfer::get(color).unwrap().transfer;
+            if !curve.supported() {
+                continue;
+            }
+            for encoded in [false, true] {
+                let image = ImageBuf::from_data(
+                    31,
+                    17,
+                    (0..31 * 17 * 3)
+                        .map(|i| {
+                            let v = (i * 73 % 1021) as f64 / 511.;
+                            spektrafilm_math::precision::from_f64(if encoded {
+                                curve.encode(v)
+                            } else {
+                                v
+                            })
+                        })
+                        .collect(),
+                );
+                let mut io = spektrafilm_core::params::IoParams::default();
+                io.output_color_space = color.into();
+                io.output_cctf_encoding = encoded;
+                for transform in [false, true] {
+                    let actual = backend
+                        .display_preview(&image, color, encoded, transform, PREVIEW_TEXTURE_MAX_DIM)
+                        .unwrap();
+                    let expected = make_preview_texture_data(&image, &io, transform);
+                    assert_eq!(actual.size, expected.size);
+                    let error = actual
+                        .rgba
+                        .iter()
+                        .zip(&expected.rgba)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        error <= 1,
+                        "{color}, encoded={encoded}, transform={transform}: {error} byte error"
+                    );
+                }
+            }
+        }
+        // Exercise the display texture cap and its transform-before-interpolation order.
+        let width = PREVIEW_TEXTURE_MAX_DIM as u32 + 17;
+        let image = ImageBuf::from_data(
+            width,
+            3,
+            (0..width * 3 * 3)
+                .map(|i| spektrafilm_math::precision::from_f64((i * 73 % 1021) as f64 / 511. - 0.1))
+                .collect(),
+        );
+        for transform in [false, true] {
+            let io = spektrafilm_core::params::IoParams {
+                output_color_space: "ProPhoto RGB".into(),
+                output_cctf_encoding: true,
+                ..Default::default()
+            };
+            let expected = make_preview_texture_data(&image, &io, transform);
+            let actual = backend
+                .display_preview(
+                    &image,
+                    "ProPhoto RGB",
+                    true,
+                    transform,
+                    PREVIEW_TEXTURE_MAX_DIM,
+                )
+                .unwrap();
+            assert_eq!(actual.size, expected.size);
+            let error = actual
+                .rgba
+                .iter()
+                .zip(&expected.rgba)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                error <= 1,
+                "capped preview, transform={transform}: {error} byte error"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode A/B benchmark; set SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG to a Lightroom catalog"]
+    fn preview_gpu_benchmark() {
+        use std::hint::black_box;
+        let catalog =
+            std::env::var_os("SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG").expect("catalog path");
+        let catalog = spektrafilm_io::lightroom::Catalog::open(Path::new(&catalog)).unwrap();
+        let backend = spektrafilm_gpu::wgpu_backend::WgpuBackend::new().expect("GPU");
+        let scheduler = Scheduler::default();
+        let task = scheduler.task(Priority::Interactive);
+        let _scope = task.enter();
+        for photo in catalog
+            .photos
+            .iter()
+            .filter(|p| p.available && spektrafilm_io::is_raw(&p.path))
+            .take(6)
+        {
+            let started = Instant::now();
+            let source = spektrafilm_io::load(
+                &photo.path,
+                &spektrafilm_io::RawOptions {
+                    decoder: "rawler".into(),
+                    lightroom_geometry: photo.geometry.clone().ok(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let decode_ms = started.elapsed().as_secs_f64() * 1000.;
+            let input = spektrafilm_core::resize::preview(&source.pixels, 2048);
+            let mut io = spektrafilm_core::params::IoParams::default();
+            io.output_color_space = source.color_space.clone();
+            io.output_cctf_encoding = source.encoded;
+            // Warm compilation before paired, alternating measurements.
+            let cold_start = Instant::now();
+            let first = backend
+                .display_preview(
+                    &input,
+                    &source.color_space,
+                    source.encoded,
+                    true,
+                    PREVIEW_TEXTURE_MAX_DIM,
+                )
+                .unwrap();
+            let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.;
+            let expected = make_preview_texture_data(&input, &io, true);
+            let error = first
+                .rgba
+                .iter()
+                .zip(&expected.rgba)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                error <= 1,
+                "real RAW source display differs by {error} byte levels"
+            );
+            println!(
+                "FIRST file={} gpu_display_ms={cold_ms:.3} max_byte_error={error}",
+                photo.path.file_name().unwrap().to_string_lossy()
+            );
+            for round in 0..7 {
+                let mut times = [0.; 5];
+                for i in if round % 2 == 0 {
+                    [0, 1, 2, 3, 4]
+                } else {
+                    [4, 3, 2, 1, 0]
+                } {
+                    let start = Instant::now();
+                    match i {
+                        0 => {
+                            black_box(spektrafilm_core::resize::preview(&source.pixels, 2048));
+                        }
+                        1 => {
+                            black_box(make_preview_texture_data(&input, &io, true));
+                        }
+                        2 => {
+                            black_box(
+                                backend
+                                    .display_preview(
+                                        &input,
+                                        &source.color_space,
+                                        source.encoded,
+                                        true,
+                                        PREVIEW_TEXTURE_MAX_DIM,
+                                    )
+                                    .unwrap(),
+                            );
+                        }
+                        3 => {
+                            let input = spektrafilm_core::resize::preview(&source.pixels, 2048);
+                            black_box(make_preview_texture_data(&input, &io, true));
+                        }
+                        _ => {
+                            let input = spektrafilm_core::resize::preview(&source.pixels, 2048);
+                            black_box(prepare_preview_texture_data(&input, &io, true, &backend));
+                        }
+                    }
+                    times[i] = start.elapsed().as_secs_f64() * 1000.;
+                }
+                println!(
+                    "PREP file={} round={round} decode_ms={decode_ms:.3} cpu_resize_ms={:.3} cpu_display_ms={:.3} gpu_display_ms={:.3} cpu_prepare_ms={:.3} gpu_prepare_ms={:.3}",
+                    photo.path.file_name().unwrap().to_string_lossy(),
+                    times[0],
+                    times[1],
+                    times[2],
+                    times[3],
+                    times[4]
+                );
+            }
+        }
+        for width in [256, 512, 1024, 2048] {
+            let height = width * 2 / 3;
+            let image = ImageBuf::from_data(
+                width,
+                height,
+                (0..width * height * 3)
+                    .map(|i| spektrafilm_math::precision::from_f64((i * 73 % 1021) as f64 / 1021.))
+                    .collect(),
+            );
+            for encoded in [false, true] {
+                let io = spektrafilm_core::params::IoParams {
+                    output_cctf_encoding: encoded,
+                    ..Default::default()
+                };
+                for round in 0..5 {
+                    let mut times = [0.; 2];
+                    for i in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        let start = Instant::now();
+                        if i == 0 {
+                            black_box(make_preview_texture_data(&image, &io, true));
+                        } else {
+                            black_box(
+                                backend
+                                    .display_preview(
+                                        &image,
+                                        "sRGB",
+                                        encoded,
+                                        true,
+                                        PREVIEW_TEXTURE_MAX_DIM,
+                                    )
+                                    .unwrap(),
+                            );
+                        }
+                        times[i] = start.elapsed().as_secs_f64() * 1000.;
+                    }
+                    println!(
+                        "DISPLAY width={width} encoded={encoded} cpu_ms={:.3} gpu_ms={:.3}",
+                        times[0], times[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parallel_display_conversion_matches_scalar_reference() {
         let image = ImageBuf::from_data(
             31,
@@ -5275,12 +5963,15 @@ mod catalog_loading_tests {
         );
         assert_eq!(app.params.camera.exposure_compensation_ev, 1.25);
         assert_eq!(workflow_controls(&app.params), expected_controls);
+        let latest_frame = app.uncropped.as_ref().unwrap().clone();
         let latest_pixels = app.image.as_ref().unwrap().clone();
         app.select_catalog_photo(first);
         finish(&mut app);
         app.select_catalog_photo(latest.clone());
         finish(&mut app);
-        assert!(Arc::ptr_eq(app.image.as_ref().unwrap(), &latest_pixels));
+        // The decoded frame is reused; the crop is applied to it again.
+        assert!(Arc::ptr_eq(app.uncropped.as_ref().unwrap(), &latest_frame));
+        assert_eq!(app.image.as_ref().unwrap().data, latest_pixels.data);
         let path = dir.path().join("project.json");
         app.project_state().save(&path).unwrap();
         let mut reopened = App::new(
@@ -5365,6 +6056,84 @@ mod preview_cache_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn file_stamp_invalidates_replacements_with_the_same_size_and_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let before = image_stamp(&path).unwrap();
+        let old = std::fs::File::open(&path).unwrap();
+        let modified = old.metadata().unwrap().modified().unwrap();
+        std::fs::write(&replacement, b"bbbb").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_ne!(image_stamp(&path).unwrap(), before);
+    }
+    #[test]
+    fn pipeline_cache_tracks_selected_profile_files_and_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("profiles")).unwrap();
+        let film = dir.path().join("profiles/film.json");
+        let paper = dir.path().join("profiles/paper.json");
+        std::fs::write(&film, b"film v1").unwrap();
+        std::fs::write(&paper, b"paper v1").unwrap();
+        let mut params = RuntimeParams::default();
+        let key = |p: &RuntimeParams| preview_pipeline_cache_key(dir.path(), "film", "paper", p);
+        let first = key(&params);
+        std::fs::write(dir.path().join("profiles/unused.json"), b"unrelated").unwrap();
+        assert_eq!(first, key(&params));
+        std::fs::write(&film, b"film version two").unwrap();
+        let second = key(&params);
+        assert_ne!(first, second);
+        std::fs::write(&paper, b"paper version two").unwrap();
+        assert_ne!(second, key(&params));
+        assert_ne!(
+            key(&params),
+            preview_pipeline_cache_key(&dir.path().join("other"), "film", "paper", &params)
+        );
+
+        let spectral = dir.path().join("luts/spectral_upsampling");
+        std::fs::create_dir_all(&spectral).unwrap();
+        std::fs::write(spectral.join("method.toml"), b"descriptor").unwrap();
+        std::fs::write(spectral.join("method.npy"), b"spectra").unwrap();
+        let before = key(&params);
+        std::fs::write(spectral.join("method.npy"), b"new spectra").unwrap();
+        assert_ne!(before, key(&params));
+        let before = key(&params);
+        std::fs::write(spectral.join("method.toml"), b"new descriptor").unwrap();
+        assert_ne!(before, key(&params));
+        std::fs::create_dir(dir.path().join("filters")).unwrap();
+        let before = key(&params);
+        std::fs::write(
+            dir.path().join("filters/neutral_print_filters.json"),
+            b"filters",
+        )
+        .unwrap();
+        assert_ne!(before, key(&params));
+
+        params.workflow.route = "input > film > scan".into();
+        let scan_key = key(&params);
+        std::fs::remove_file(&paper).unwrap();
+        assert_eq!(
+            scan_key,
+            key(&params),
+            "an unused paper file must not invalidate a film scan"
+        );
+        std::fs::remove_file(&film).unwrap();
+        assert_ne!(scan_key, key(&params));
+    }
+
+    #[test]
     fn cached_previews_match_rebuilt_pipelines_after_control_changes() {
         use serde_json::json;
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
@@ -5379,6 +6148,10 @@ mod preview_cache_tests {
             .unwrap()
         };
         let changes = [
+            ("/camera/tone/highlights", json!(-80.0)),
+            ("/camera/tone/shadows", json!(65.0)),
+            ("/camera/tone/whites", json!(40.0)),
+            ("/camera/tone/blacks", json!(-35.0)),
             ("/camera/exposure_compensation_ev", json!(1.0)),
             ("/camera/auto_exposure", json!(false)),
             ("/camera/auto_exposure_method", json!("matrix")),
@@ -5451,17 +6224,25 @@ mod preview_cache_tests {
             params.debug.deactivate_stochastic_effects = true;
             params.camera.auto_exposure = true;
             let template = build(film, paper, params.clone());
-            let original_key = preview_pipeline_cache_key(film, paper, &params);
+            let original_key = preview_pipeline_cache_key(&data, film, paper, &params);
             for (path, value) in &changes {
                 let mut edited = serde_json::to_value(&params).unwrap();
                 *edited.pointer_mut(path).unwrap() = value.clone();
                 let changed: RuntimeParams = serde_json::from_value(edited).unwrap();
+                if path.starts_with("/camera/tone/") {
+                    assert_eq!(
+                        preview_pipeline_cache_key(&data, film, paper, &changed),
+                        original_key,
+                        "tone changes must reuse spectral calibration"
+                    );
+                }
                 let expected = build(film, paper, changed.clone());
-                let actual = if preview_pipeline_cache_key(film, paper, &changed) == original_key {
-                    template.clone().with_params(changed)
-                } else {
-                    build(film, paper, changed)
-                };
+                let actual =
+                    if preview_pipeline_cache_key(&data, film, paper, &changed) == original_key {
+                        template.clone().with_params(changed)
+                    } else {
+                        build(film, paper, changed)
+                    };
                 let expected =
                     expected.process(image.clone(), &spektrafilm_gpu::cpu_backend::CpuBackend);
                 let actual =
@@ -5564,6 +6345,16 @@ mod gpu_export_tests {
             std::env::temp_dir().join(format!("spektrafilm-gpu-export-{}.png", std::process::id()));
         for (scale, dimensions) in [(1., (64, 32)), (0.5, (32, 16))] {
             params.io.upscale_factor = scale;
+            let metadata = spektrafilm_io::Metadata::default()
+                .with_edit_settings(&spektrafilm_io::EditSettings {
+                    film: "kodak_gold_200",
+                    paper: "kodak_portra_endura",
+                    params: &params,
+                    raw: &Default::default(),
+                    rotation: 0,
+                    crop: Crop::FULL,
+                })
+                .unwrap();
             run_gpu_export(
                 &image,
                 &path,
@@ -5574,13 +6365,23 @@ mod gpu_export_tests {
                 backend.as_ref(),
                 &AtomicBool::new(false),
                 &options,
-                &Default::default(),
+                &metadata,
             )
             .unwrap();
             let loaded = spektrafilm_io::load(&path, &Default::default()).unwrap();
             assert_eq!((loaded.pixels.width, loaded.pixels.height), dimensions);
             assert_eq!(loaded.color_space, "Display P3");
             assert!(loaded.encoded);
+            let tags = loaded.metadata.native.as_ref().unwrap();
+            let comment = tags
+                .get_tag_by_hex(0x9286, None)
+                .next()
+                .unwrap()
+                .value_as_u8_vec(&tags.get_endian());
+            let recipe: serde_json::Value =
+                serde_json::from_slice(comment.strip_prefix(b"ASCII\0\0\0").unwrap()).unwrap();
+            assert_eq!(recipe["settings"]["params"]["io"]["upscale_factor"], scale);
+            assert_eq!(recipe["output"]["color_space"], "Display P3");
         }
         std::fs::remove_file(path).unwrap();
     }
