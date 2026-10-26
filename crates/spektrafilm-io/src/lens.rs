@@ -10,6 +10,15 @@ use std::{
 };
 type Ptr = *mut c_void;
 
+/// What actually happened during this photo's Lensfun lookup and correction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LensCorrection {
+    pub detected_lens: Option<String>,
+    pub matched_lens: Option<String>,
+    pub applied: bool,
+    pub detail: &'static str,
+}
+
 #[derive(Debug)]
 pub struct CorrectionFailure;
 impl std::fmt::Display for CorrectionFailure {
@@ -18,12 +27,26 @@ impl std::fmt::Display for CorrectionFailure {
     }
 }
 impl std::error::Error for CorrectionFailure {}
-/// Returns false when no camera/lens is in the database, matching Python.
-pub fn correct(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> Result<bool> {
+/// Missing matches leave pixels unchanged and report why correction was skipped.
+pub fn correct(
+    image: &mut ImageBuf,
+    path: &Path,
+    database: Option<&Path>,
+) -> Result<LensCorrection> {
     correct_inner(image, path, database).context(CorrectionFailure)
 }
-fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> Result<bool> {
+fn correct_inner(
+    image: &mut ImageBuf,
+    path: &Path,
+    database: Option<&Path>,
+) -> Result<LensCorrection> {
     use little_exif::{exif_tag::ExifTag, metadata::Metadata};
+    let mut report = LensCorrection {
+        detected_lens: None,
+        matched_lens: None,
+        applied: false,
+        detail: "Not applied: lens metadata is missing.",
+    };
     let metadata = Metadata::new_from_path(path).or_else(|_| {
         Metadata::new_from_vec(
             &std::fs::read(path)?,
@@ -31,7 +54,7 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
         )
     });
     let Ok(metadata) = metadata else {
-        return Ok(false);
+        return Ok(report);
     };
     let (mut make, mut model, mut lens_make, mut lens_model) =
         (String::new(), String::new(), String::new(), String::new());
@@ -55,8 +78,15 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
             _ => {}
         }
     }
-    if lens_model.is_empty() || focal <= 0. {
-        return Ok(false);
+    if !lens_model.is_empty() {
+        report.detected_lens = Some(lens_model.clone());
+    }
+    if lens_model.is_empty() {
+        return Ok(report);
+    }
+    if !focal.is_finite() || focal <= 0. {
+        report.detail = "Not applied: focal length is missing or invalid.";
+        return Ok(report);
     }
     let api = super::lens_api::Api::new()?;
     // SAFETY: Api owns the selected implementation for the lifetime of all guards.
@@ -122,15 +152,17 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
             CString::new(lens_make)?,
             CString::new(lens_model)?,
         );
+        report.detail = "Not applied: camera was not found in the database.";
         let cams = cameras(db, make.as_ptr(), model.as_ptr(), 1);
         if cams.is_null() {
-            return Ok(false);
+            return Ok(report);
         }
         let _cams = Guard(cams.cast(), free);
         let camera = *cams;
         if camera.is_null() {
-            return Ok(false);
+            return Ok(report);
         }
+        report.detail = "Not applied: no matching lens profile in the database.";
         let found = lenses(
             db,
             camera,
@@ -143,13 +175,23 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
             1,
         );
         if found.is_null() {
-            return Ok(false);
+            return Ok(report);
         }
         let _found = Guard(found.cast(), free);
         let lens = *found;
         if lens.is_null() {
-            return Ok(false);
+            return Ok(report);
         }
+        // lfLens starts with Maker and Model; lfMLstr's first string is its default name.
+        let profile_name = &*lens.cast::<super::lens_api::LensName>();
+        if !profile_name.model.is_null() {
+            report.matched_lens = Some(
+                std::ffi::CStr::from_ptr(profile_name.model)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        report.detail = "Matched profile, but no calibration is available for these settings.";
         let modifier = modifier_new(
             lens,
             (*camera).crop,
@@ -162,7 +204,7 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
         let _modifier = Guard(modifier, modifier_destroy);
         let enabled = initialize(modifier, lens, 3, focal, aperture, 1000., 1., 1, -1, 0);
         if enabled == 0 {
-            return Ok(false);
+            return Ok(report);
         }
         tracing::info!(camera=%model.to_string_lossy(),lens=%lens_model.to_string_lossy(),flags=enabled,"Applying Lensfun correction");
         let mut pixels: Vec<f32> = image.data.iter().map(|v| *v as f32).collect();
@@ -192,7 +234,9 @@ fn correct_inner(image: &mut ImageBuf, path: &Path, database: Option<&Path>) -> 
                 *a = from_f64(b as f64);
             }
         }
-        Ok(true)
+        report.applied = true;
+        report.detail = "Lens correction applied.";
+        Ok(report)
     }
 }
 
@@ -310,11 +354,15 @@ mod tests {
         }]));
         tags.write_to_file(&path).unwrap();
         let mut image = ImageBuf::from_data(32, 32, vec![from_f64(0.18); 32 * 32 * 3]);
-        assert!(correct(&mut image, &path, Some(Path::new(&db))).unwrap());
+        assert!(
+            correct(&mut image, &path, Some(Path::new(&db)))
+                .unwrap()
+                .applied
+        );
         assert!(image.data.iter().all(|v| v.is_finite()));
         assert!(image.data.iter().any(|v| (*v as f64 - 0.18).abs() > 1e-5));
         let mut automatic = ImageBuf::from_data(32, 32, vec![from_f64(0.18); 32 * 32 * 3]);
-        assert!(correct(&mut automatic, &path, None).unwrap());
+        assert!(correct(&mut automatic, &path, None).unwrap().applied);
         assert_eq!(
             automatic.data, image.data,
             "automatic discovery must use the same corrections"
@@ -364,7 +412,10 @@ mod builtin_tests {
         .unwrap();
         tags().write_to_file(&image_path).unwrap();
         let mut pixels = ImageBuf::from_data(37, 29, vec![from_f64(0.18); 37 * 29 * 3]);
-        assert!(correct(&mut pixels, &image_path, Some(root.path())).unwrap());
+        let report = correct(&mut pixels, &image_path, Some(root.path())).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.detected_lens.as_deref(), Some("Fixture Lens"));
+        assert_eq!(report.matched_lens.as_deref(), Some("Fixture Lens"));
         assert!(pixels.data.iter().all(|v| v.is_finite()));
         assert!(pixels.data.iter().any(|v| (*v as f64 - 0.18).abs() > 1e-4));
         for pixel in pixels.data.chunks_exact(3) {
@@ -372,6 +423,103 @@ mod builtin_tests {
             assert!((pixel[1] as f64 - pixel[2] as f64).abs() < 1e-3);
         }
     }
+    #[test]
+    fn reports_missing_metadata_unmatched_lenses_and_profiles_without_calibration() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture.xml"), XML).unwrap();
+        let path = root.path().join("fixture.jpg");
+        image::save_buffer(
+            &path,
+            &vec![128u8; 16 * 16 * 3],
+            16,
+            16,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+        let original = ImageBuf::from_data(16, 16, vec![from_f64(0.18); 16 * 16 * 3]);
+        let mut image = original.clone();
+        let missing = correct(&mut image, &path, Some(root.path())).unwrap();
+        assert!(
+            !missing.applied && missing.detected_lens.is_none() && missing.matched_lens.is_none()
+        );
+        let mut exif = tags();
+        exif.set_tag(ExifTag::LensModel("UnregisteredPrime".into()));
+        exif.write_to_file(&path).unwrap();
+        let unmatched = correct(&mut image, &path, Some(root.path())).unwrap();
+        assert_eq!(
+            unmatched.detected_lens.as_deref(),
+            Some("UnregisteredPrime")
+        );
+        assert!(unmatched.matched_lens.is_none() && !unmatched.applied);
+        assert!(unmatched.detail.contains("no matching lens"));
+        exif.set_tag(ExifTag::Model("UnavailableCamera".into()));
+        exif.write_to_file(&path).unwrap();
+        let camera = correct(&mut image, &path, Some(root.path())).unwrap();
+        assert!(camera.detail.contains("camera was not found"));
+        tags().write_to_file(&path).unwrap();
+        let start = XML.find("<calibration>").unwrap();
+        let end = XML.find("</calibration>").unwrap() + "</calibration>".len();
+        std::fs::write(
+            root.path().join("fixture.xml"),
+            format!("{}{}", &XML[..start], &XML[end..]),
+        )
+        .unwrap();
+        let uncalibrated = correct(&mut image, &path, Some(root.path())).unwrap();
+        assert_eq!(uncalibrated.matched_lens.as_deref(), Some("Fixture Lens"));
+        assert!(!uncalibrated.applied);
+        assert!(uncalibrated.detail.contains("no calibration"));
+        assert_eq!(image.data, original.data);
+    }
+
+    #[test]
+    fn raw_load_reports_the_matched_profile_and_preserves_explicit_disable() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("fixture.xml"), XML).unwrap();
+        let input = root.path().join("fixture.dng");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic.dng");
+        let mut buffer = std::fs::read(source).unwrap();
+        let mut metadata =
+            Metadata::new_from_vec(&buffer, little_exif::filetype::FileExtension::TIFF).unwrap();
+        for tag in &tags() {
+            metadata.set_tag(tag.clone());
+        }
+        metadata
+            .write_to_vec(&mut buffer, little_exif::filetype::FileExtension::TIFF)
+            .unwrap();
+        std::fs::write(&input, buffer).unwrap();
+        assert!(crate::RawOptions::default().lens_correction);
+        let disabled: crate::RawOptions =
+            serde_json::from_str(r#"{"lens_correction":false}"#).unwrap();
+        assert!(!disabled.lens_correction);
+        let old: crate::RawOptions = serde_json::from_str("{}").unwrap();
+        assert!(old.lens_correction);
+        for decoder in ["rawler", "libraw"] {
+            if decoder == "libraw" && std::env::var_os("SPEKTRAFILM_LIBRAW_LIBRARY").is_none() {
+                continue;
+            }
+            let options = crate::RawOptions {
+                decoder: decoder.into(),
+                lens_database: Some(root.path().into()),
+                ..Default::default()
+            };
+            let loaded = crate::load(&input, &options).unwrap();
+            let report = loaded.metadata.lens_correction.as_ref().unwrap();
+            assert!(report.applied, "{decoder}: {report:?}");
+            assert_eq!(report.matched_lens.as_deref(), Some("Fixture Lens"));
+            assert_eq!(loaded.metadata.detected_lens(), Some("Fixture Lens"));
+            let disabled = crate::load(
+                &input,
+                &crate::RawOptions {
+                    lens_correction: false,
+                    ..options
+                },
+            )
+            .unwrap();
+            assert!(disabled.metadata.lens_correction.is_none());
+            assert_eq!(disabled.metadata.detected_lens(), Some("Fixture Lens"));
+        }
+    }
+
     #[test]
     fn lens_setup_failure_is_not_retried_or_mislabeled_as_a_raw_decoder_failure() {
         let root = tempfile::tempdir().unwrap();
@@ -396,6 +544,7 @@ mod builtin_tests {
             &input,
             &crate::RawOptions {
                 decoder: "rawler".into(),
+                lens_correction: false,
                 ..Default::default()
             },
         )

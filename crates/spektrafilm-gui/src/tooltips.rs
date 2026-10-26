@@ -66,10 +66,10 @@ fn caption(ui: &mut Ui, text: &str, width: f32, sense: Sense) -> Caption {
 }
 
 /// The caption's context menu offers "Reset to stock default"; true when chosen.
-fn reset_requested(label: &Response) -> bool {
+fn reset_requested(label: &Response, reset_label: &str) -> bool {
     let mut chosen = false;
     label.context_menu(|ui| {
-        if ui.button("Reset to stock default").clicked() {
+        if ui.button(reset_label).clicked() {
             chosen = true;
             ui.close_menu();
         }
@@ -102,6 +102,18 @@ pub fn labeled(
     text: impl Into<WidgetText>,
     help: &str,
 ) -> Response {
+    labeled_with_reset(ui, widget, text, help, "Reset to stock default")
+}
+
+/// The same row with a named reset target (e.g. the photo's As Shot balance).
+/// Plain egui widgets leave the reset request available via `take_row_reset`.
+pub fn labeled_with_reset(
+    ui: &mut Ui,
+    widget: impl Widget,
+    text: impl Into<WidgetText>,
+    help: &str,
+    reset_label: &str,
+) -> Response {
     let text = text.into();
     let id = inspector::row_id(text.text());
     let learned_modified = inspector::row_modified(id);
@@ -111,7 +123,8 @@ pub fn labeled(
         ui.style_mut().explanation_tooltips = false;
         let width = caption_width(ui);
         let label = caption(ui, text.text(), width, Sense::click());
-        let reset = label.response.double_clicked() || reset_requested(&label.response);
+        let reset =
+            label.response.double_clicked() || reset_requested(&label.response, reset_label);
         inspector::begin_row(reset);
         if reset && inspector::row_stock_modified().is_none() {
             inspector::request_row_reset(id);
@@ -165,7 +178,7 @@ pub fn checkbox(
             ui.ctx().request_repaint();
         }
         let response = response.labelled_by(label.id).union(label.clone());
-        if reset_requested(&label) {
+        if reset_requested(&label, "Reset to stock default") {
             inspector::request_row_reset(id);
         }
         attach_help(label, help, modified, false);
@@ -217,7 +230,9 @@ pub fn channels<T: egui::emath::Numeric, const N: usize>(
         let width = caption_width(ui);
         let label = caption(ui, text.text(), width, Sense::click());
         label.paint_marker(ui, modified);
-        if modified && label.response.double_clicked() || reset_requested(&label.response) {
+        if modified && label.response.double_clicked()
+            || reset_requested(&label.response, "Reset to stock default")
+        {
             inspector::request_row_reset(id);
         }
         let label = label.response;
@@ -554,6 +569,7 @@ pub const CONTROL_AUTO_EXPOSURE: &str =
     "Estimate film exposure from image brightness before applying EV compensation.";
 pub const CONTROL_EV_COMPENSATION: &str =
     "Adjust film exposure in stops, with +1 EV doubling the exposure.";
+pub const CONTROL_PRINT_AUTO_COMPENSATION: &str = "Automatically adjust print exposure to counteract manual EV compensation, keeping middle gray near the same brightness while film contrast and color can change. Turn off to let manual EV brighten or darken the print. Does not compensate for Auto exposure. Only used when the workflow includes printing.";
 pub const SECTION_TONE: &str =
     "Balance the photograph's tonal ranges after exposure and before film simulation.";
 pub const CONTROL_HIGHLIGHTS: &str = "Darken or brighten highlight detail before film exposure. Negative values restrain bright detail; the brightest tail is controlled by Whites.";
@@ -695,9 +711,9 @@ pub const CONTROL_SIMPLIFIED_PREVIEW_MODE: &str =
     "Skip grain, lens blur and sharpening while retaining halation and optical diffusion.";
 pub const CONTROL_PREVIEW_LONG_EDGE_PX: &str =
     "Limit the interactive preview’s long edge in pixels; export starts from the original image.";
-pub const CONTROL_TEMPERATURE_K: &str =
-    "Set the illuminant temperature used for custom RAW white balance.";
-pub const CONTROL_TINT: &str = "Adjust green–magenta balance for custom RAW white balance.";
+pub const SECTION_WHITE_BALANCE: &str = "Adjust RAW temperature and tint from the current white balance. Reset restores the camera’s exact As Shot balance.";
+pub const CONTROL_TEMPERATURE_K: &str = "Lower values make the photo cooler; higher values make it warmer. Kelvin values are estimated from camera white balance data. Double-click the label or choose Reset to As Shot to restore the original camera balance.";
+pub const CONTROL_TINT: &str = "Move left for greener color or right for more magenta. Double-click the label or choose Reset to As Shot to restore the original camera balance.";
 pub const CONTROL_LENS_CORRECTION_LENSFUN: &str =
     "Correct supported lens distortion, color fringing and vignetting using Lensfun profiles.";
 pub const CONTROL_USE_AUTOMATIC_LENSFUN_DATABASE: &str =
@@ -784,8 +800,6 @@ pub const MENU_ENLARGER_ILLUMINANT: &str =
     "Choose the spectral light source used to expose the print paper.";
 pub const MENU_RAW_DECODER: &str =
     "Choose the engine that decodes camera RAW data before film processing.";
-pub const MENU_RAW_WHITE_BALANCE: &str =
-    "Choose the white-balance method used when decoding the RAW file.";
 pub const MENU_CANVAS_INTERPOLATION: &str =
     "Choose how image pixels are resampled for preview zooming without changing export.";
 pub const MENU_SAVING_COLOR_SPACE: &str =

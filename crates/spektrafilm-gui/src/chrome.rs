@@ -38,7 +38,6 @@ const FIT_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F)
 const BEFORE_KEY: Key = Key::Backslash;
 /// Space reserved under the image for the floating canvas toolbar.
 const TOOLBAR_CLEARANCE: f32 = 52.0;
-const CANVAS_MARGIN: f32 = 28.0;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "tif", "tiff", "exr", // standard
@@ -110,7 +109,7 @@ impl App {
     }
 
     fn export_enabled(&self) -> bool {
-        self.image_path.is_some() && !self.image_loading() && self.export_job.is_none()
+        self.image_path.is_some() && !self.image_loading() && !self.export_busy()
     }
 
     fn save_project_dialog(&mut self) {
@@ -165,6 +164,7 @@ impl App {
         }
         self.auto_preview = true;
         self.params.settings.preview_max_size = 2048;
+        self.preview_max_size = 2048;
         self.gpu_export = true;
         self.lut = Default::default();
         self.display = Default::default();
@@ -218,7 +218,10 @@ impl App {
     // ── Undo / inspector frame state ────────────────────────────────────
 
     pub(crate) fn snapshot(&self) -> history::Snapshot {
+        let mut raw = self.raw_options.clone();
+        raw.lightroom_geometry = None;
         history::Snapshot {
+            raw,
             params: self.params_json.clone(),
             film: self.film_name.clone(),
             print: self.print_name.clone(),
@@ -241,6 +244,10 @@ impl App {
                 return;
             }
         };
+        let previous_raw = self.raw_options.clone();
+        let geometry = self.raw_options.lightroom_geometry.take();
+        self.raw_options = snapshot.raw;
+        self.raw_options.lightroom_geometry = geometry;
         self.params = params;
         self.params_json = snapshot.params;
         if self.film_name != snapshot.film {
@@ -259,6 +266,7 @@ impl App {
         }
         self.dirty = true;
         self.pending_dirty = self.render_job.is_some();
+        self.reload_raw_if_changed(&previous_raw);
     }
 
     pub(crate) fn undo(&mut self) {
@@ -511,7 +519,7 @@ impl App {
                         ui.close_menu();
                         self.save_dialog();
                     }
-                    if self.export_job.is_some() {
+                    if self.export_busy() {
                         if ui
                             .button("Cancel export")
                             .on_hover_text(tooltips::CANCEL_EXPORT)
@@ -556,6 +564,11 @@ impl App {
                     {
                         ui.close_menu();
                         self.factory_defaults();
+                    }
+                    ui.separator();
+                    if ui.button("Close window").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -713,6 +726,10 @@ impl App {
                         ui.close_menu();
                         toggle_full_screen(ctx);
                     }
+                    if ui.button("Minimize window").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
                     ui.separator();
                     ui.add(egui::Checkbox::new(
                         &mut self.display.compare_split,
@@ -757,6 +774,7 @@ impl App {
                     ui.checkbox(&mut self.display.animate, "Paper development animation")
                         .on_hover_text(tooltips::CONTROL_PAPER_DEVELOPMENT_CROSSFADE);
                 });
+                window_drag_area(ui);
             });
         });
     }
@@ -894,11 +912,10 @@ impl App {
 
     // ── Canvas ──────────────────────────────────────────────────────────
 
-    /// The canvas rect left for the image once margins and the toolbar are
-    /// reserved, so a fitted print never sits under the toolbar.
+    /// Fit to the canvas edges while keeping the floating toolbar clear.
     pub(crate) fn image_area(rect: egui::Rect) -> egui::Rect {
-        let mut area = rect.shrink(CANVAS_MARGIN);
-        area.max.y = (area.max.y - TOOLBAR_CLEARANCE + CANVAS_MARGIN).max(area.min.y + 1.0);
+        let mut area = rect;
+        area.max.y = (area.max.y - TOOLBAR_CLEARANCE).max(area.min.y + 1.0);
         area
     }
 
@@ -1144,7 +1161,7 @@ impl App {
         ui.set_min_width(300.0);
         if tooltips::labeled(
             ui,
-            egui::Slider::new(&mut self.params.settings.preview_max_size, 128..=8192).step_by(128.),
+            egui::Slider::new(&mut self.preview_max_size, 128..=8192).step_by(128.),
             "Preview long edge (px)",
             tooltips::CONTROL_PREVIEW_LONG_EDGE_PX,
         )
@@ -1286,6 +1303,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(10, 4)),
             )
             .show(ctx, |ui| {
+                self.batch_progress_ui(ui);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let weak = |s: String| RichText::new(s).small().color(theme::TEXT_WEAK);
@@ -1653,6 +1671,25 @@ fn fn_key_held() -> bool {
     false
 }
 
+fn window_drag_area(ui: &mut egui::Ui) {
+    let response = ui
+        .allocate_response(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_text("Drag to move the window. Double-click to maximize or restore.");
+    if ui.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+        return;
+    }
+    if response.double_clicked() {
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    } else if response.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
 fn toggle_full_screen(ctx: &egui::Context) {
     let full_screen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full_screen));
@@ -1704,6 +1741,140 @@ fn status_is_error(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_space_drags_and_double_clicks_maximize_without_affecting_fullscreen() {
+        use eframe::egui;
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: egui::pos2(40., 16.),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let frame = |ctx: &egui::Context, time, events, fullscreen| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300., 100.),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .fullscreen = Some(fullscreen);
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, super::window_drag_area);
+            })
+        };
+        for fullscreen in [false, true] {
+            let ctx = egui::Context::default();
+            frame(&ctx, 0., vec![], fullscreen);
+            frame(
+                &ctx,
+                0.1,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(40., 16.)),
+                    pointer(true),
+                ],
+                fullscreen,
+            );
+            let output = frame(
+                &ctx,
+                0.2,
+                vec![egui::Event::PointerMoved(egui::pos2(100., 16.))],
+                fullscreen,
+            );
+            assert_eq!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, egui::ViewportCommand::StartDrag)),
+                !fullscreen
+            );
+        }
+        let ctx = egui::Context::default();
+        frame(&ctx, 0., vec![], false);
+        let mut maximized = false;
+        for (index, pressed) in [true, false, true, false].into_iter().enumerate() {
+            let output = frame(
+                &ctx,
+                0.1 + index as f64 * 0.05,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(40., 16.)),
+                    pointer(pressed),
+                ],
+                false,
+            );
+            maximized |= output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Maximized(true)));
+        }
+        assert!(maximized);
+    }
+
+    #[test]
+    fn fit_uses_canvas_edges_and_ignores_hidden_white_border() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &cc,
+            Arc::new(spektrafilm_gpu::cpu_backend::CpuBackend),
+            None,
+        );
+        let texture = ctx.load_texture(
+            "fit fixture",
+            egui::ColorImage::new([1200, 800], egui::Color32::GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        app.input_tex = Some(texture.clone());
+        app.output_tex = Some(texture.clone());
+        app.zoom_fit();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 652.));
+        let render = |app: &mut App| {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(canvas),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| app.draw_preview_with_zoom(ui));
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture.id() => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .expect("rendered photo")
+        };
+        app.display.show_border = false;
+        for padding in [0., 0.03, 0.2] {
+            app.display.white_padding = padding;
+            let photo = render(&mut app);
+            assert!(photo.min.distance(egui::Pos2::ZERO) < 0.01, "{photo:?}");
+            assert!(
+                photo.max.distance(egui::pos2(900., 600.)) < 0.01,
+                "{photo:?}"
+            );
+        }
+        app.display.show_border = true;
+        app.display.white_padding = 0.03;
+        let bordered = render(&mut app);
+        assert!(bordered.width() < 900. && bordered.height() < 600.);
+        assert!(App::image_area(canvas).contains_rect(bordered));
+    }
+
     #[test]
     fn fn_key_query_runs() {
         // Exercises the AppKit call on macOS. The answer is the live keyboard

@@ -27,5 +27,6 @@ fn main() -> anyhow::Result<()> {
         loaded.color_space,
         start.elapsed().as_secs_f64()
     );
+    println!("{:?}", loaded.metadata.lens_correction);
     Ok(())
 }

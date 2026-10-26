@@ -3,7 +3,7 @@
 use eframe::egui::{FontFamily, FontId, RichText};
 pub use egui_phosphor::regular::*;
 
-/// The font family holding only the icon font (see `theme`).
+/// The font family prioritizing icons, with text fallbacks (see `theme`).
 pub const FAMILY: &str = "icons";
 
 pub fn font(size: f32) -> FontId {

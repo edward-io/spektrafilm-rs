@@ -56,7 +56,9 @@ fn fonts() -> FontDefinitions {
     );
     fonts.families.insert(
         FontFamily::Name(crate::icons::FAMILY.into()),
-        vec!["phosphor".into()],
+        std::iter::once("phosphor".to_string())
+            .chain(fonts.families[&FontFamily::Proportional].iter().cloned())
+            .collect(),
     );
     let mono = fonts.families.entry(FontFamily::Monospace).or_default();
     mono.insert(0, "JetBrainsMono".into());
@@ -139,4 +141,30 @@ fn style(style: &mut egui::Style) {
     w.noninteractive.corner_radius = radius;
     w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_gray(80));
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_family_has_a_replacement_glyph_and_icons_keep_priority() {
+        let definitions = fonts();
+        let icon_family = FontFamily::Name(crate::icons::FAMILY.into());
+        assert_eq!(definitions.families[&icon_family][0], "phosphor");
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.fonts(|fonts| {
+                for family in definitions.families.keys() {
+                    let id = FontId::new(15., family.clone());
+                    assert!(
+                        fonts.has_glyph(&id, '◻') || fonts.has_glyph(&id, '?'),
+                        "{family:?}"
+                    );
+                }
+                assert!(fonts.has_glyphs(&crate::icons::font(15.), crate::icons::GEAR));
+            });
+        });
+    }
 }

@@ -19,6 +19,8 @@ pub struct Snapshot {
     pub scan_for_print_restore: Option<[bool; 3]>,
     /// `None` before a catalog photo's Lightroom crop has been read.
     pub crop: Option<spektrafilm_io::crop::Crop>,
+    /// RAW settings without catalog geometry, so white balance is undoable.
+    pub raw: spektrafilm_io::RawOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +159,7 @@ mod tests {
             print: "p".into(),
             scan_for_print_restore: None,
             crop: None,
+            raw: Default::default(),
         }
     }
     fn observe(h: &mut History, v: i32) -> bool {

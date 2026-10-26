@@ -17,6 +17,7 @@ precision-f64 = [
 ]
 
 [dependencies]
+tempfile = "3"
 spektrafilm-io.workspace = true
 serde.workspace = true
 spektrafilm-core.workspace = true
@@ -48,4 +49,3 @@ foreign-types = "0.5"
 
 [dev-dependencies]
 pollster = "0.4"
-tempfile = "3"

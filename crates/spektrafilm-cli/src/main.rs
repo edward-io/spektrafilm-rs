@@ -47,6 +47,9 @@ enum Commands {
         /// Geometry imported from Lightroom (JSON); no color adjustments are applied.
         #[arg(long)]
         lightroom_geometry: Option<String>,
+        /// Use the editor's crop conversion after orientation and manual rotation.
+        #[arg(long)]
+        editor_framing: bool,
         /// Crop and straighten after rotation (JSON, as saved by the GUI). Grain
         /// and other spatial effects keep the size they have in the whole frame.
         #[arg(long)]
@@ -86,7 +89,7 @@ enum Commands {
         bit_depth: u8,
         #[arg(long,default_value="auto",value_parser=["auto","libraw","rawler"])]
         raw_decoder: String,
-        #[arg(long)]
+        #[arg(long, default_value="true", num_args=0..=1, default_missing_value="true", action=clap::ArgAction::Set)]
         lens_correction: bool,
         #[arg(long)]
         lens_database: Option<PathBuf>,
@@ -103,6 +106,9 @@ enum Commands {
         temperature: f64,
         #[arg(long, default_value = "1", allow_hyphen_values = true)]
         tint: f64,
+        /// Relative RAW white balance [mired, tint] as JSON.
+        #[arg(long)]
+        white_balance_shift: Option<String>,
     },
     /// List available film and paper profiles.
     ListProfiles {
@@ -157,7 +163,21 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::from(if error.is::<spektrafilm_io::OutputIoError>() {
+                spektrafilm_io::OUTPUT_IO_EXIT_CODE
+            } else {
+                1
+            })
+        }
+    }
+}
+
+fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -191,6 +211,7 @@ fn main() -> Result<()> {
             input,
             rotate_quarter_turns,
             lightroom_geometry,
+            editor_framing,
             crop,
             output,
             film,
@@ -208,6 +229,7 @@ fn main() -> Result<()> {
             white_balance,
             temperature,
             tint,
+            white_balance_shift,
             raw_decoder,
             lens_correction,
             lens_database,
@@ -230,12 +252,14 @@ fn main() -> Result<()> {
                 &white_balance,
                 temperature,
                 tint,
+                white_balance_shift.as_deref(),
                 &raw_decoder,
                 lens_correction,
                 lens_database.as_deref(),
                 rotate_quarter_turns,
                 lightroom_geometry.as_deref(),
                 crop.as_deref(),
+                editor_framing,
             )?;
         }
         Commands::ListProfiles { data_dir } => {
@@ -298,12 +322,14 @@ fn cmd_process(
     white_balance: &str,
     temperature: f64,
     tint: f64,
+    white_balance_shift: Option<&str>,
     raw_decoder: &str,
     lens_correction: bool,
     lens_database: Option<&Path>,
     rotate_quarter_turns: u8,
     lightroom_geometry: Option<&str>,
     crop: Option<&str>,
+    editor_framing: bool,
 ) -> Result<()> {
     let total_start = Instant::now();
 
@@ -339,12 +365,14 @@ fn cmd_process(
     let film = profile::load_profile_by_name(data_dir, film_name)
         .with_context(|| format!("loading film profile: {film_name}"))?;
 
-    let print_stock = if scan_film || params.route() == "input" {
+    let print_stock = if scan_film {
         film_name.to_string()
     } else if let Some(p) = paper_name {
         p.to_string()
     } else if let Some(ref target) = film.info.target_print {
         target.clone()
+    } else if params.route() == "input" {
+        film_name.to_string()
     } else {
         bail!("no paper specified and film has no target_print — use --paper or --scan-film");
     };
@@ -354,11 +382,16 @@ fn cmd_process(
     eprintln!("Profiles loaded: {} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
-    let raw_options = spektrafilm_io::RawOptions {
+    let mut raw_options = spektrafilm_io::RawOptions {
         decoder: raw_decoder.into(),
         white_balance: white_balance.into(),
         temperature,
         tint,
+        white_balance_shift: white_balance_shift
+            .map(serde_json::from_str)
+            .transpose()
+            .context("parsing white balance shift")?
+            .unwrap_or([0.; 2]),
         lens_correction,
         lens_database: lens_database.map(Path::to_path_buf),
         lightroom_geometry: lightroom_geometry
@@ -366,6 +399,10 @@ fn cmd_process(
             .transpose()
             .context("parsing Lightroom geometry")?,
     };
+    let catalog_geometry = raw_options.lightroom_geometry.clone();
+    if editor_framing {
+        raw_options.lightroom_geometry = catalog_geometry.as_ref().map(|g| g.orientation_only());
+    }
     let loaded = spektrafilm_io::load(input, &raw_options)?;
     if !input_overrides[0] {
         params.io.input_color_space = loaded.color_space;
@@ -385,6 +422,21 @@ fn cmd_process(
         .map(serde_json::from_str)
         .transpose()
         .context("parsing crop")?;
+    let image = if rotate_quarter_turns == 0 {
+        loaded.pixels
+    } else {
+        loaded.pixels.rotated_quarter_turns(rotate_quarter_turns)
+    };
+    let crop = crop.or_else(|| {
+        editor_framing.then(|| {
+            spektrafilm_io::crop::Crop::from_catalog(
+                catalog_geometry.as_ref(),
+                image.width,
+                image.height,
+                rotate_quarter_turns,
+            )
+        })
+    });
     let metadata = loaded
         .metadata
         .with_edit_settings(&spektrafilm_io::EditSettings {
@@ -395,18 +447,13 @@ fn cmd_process(
             rotation: rotate_quarter_turns % 4,
             crop: crop.unwrap_or_default(),
         })?;
-    let image = if rotate_quarter_turns == 0 {
-        loaded.pixels
-    } else {
-        loaded.pixels.rotated_quarter_turns(rotate_quarter_turns)
-    };
     let image = match crop {
-        Some(crop) => {
+        Some(crop) if !crop.is_full() => {
             params.camera.film_format_mm *=
                 crop.long_side_fraction(image.width as f64, image.height as f64) as f32;
             crop.apply(&image)?
         }
-        None => image,
+        _ => image,
     };
     eprintln!(
         "Image loaded: {}x{} in {} ms",

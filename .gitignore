@@ -17,3 +17,6 @@ AGENTS.md
 
 # Generated application packages.
 /dist/
+
+# Local icon studies; the selected app icon is tracked under assets/.
+/output/icon-concepts-*/

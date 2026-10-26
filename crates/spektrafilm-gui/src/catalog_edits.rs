@@ -28,7 +28,7 @@ impl App {
 
     /// Open the edit store on first use. A store that can't be opened is
     /// reported once; the app keeps working without saving edits.
-    fn edit_store(&mut self) -> Option<&EditStore> {
+    pub(super) fn edit_store(&mut self) -> Option<&EditStore> {
         if self.edit_store.is_none() && !self.edit_store_failed {
             match EditStore::open(&EditStore::default_path()) {
                 Ok(store) => self.edit_store = Some(store),
@@ -131,12 +131,22 @@ impl App {
             }
             None => None,
         };
+        let complete_raw_history = saved
+            .as_ref()
+            .is_some_and(|(steps, _)| steps.iter().all(|s| s.state.get("raw").is_some()));
         let steps: Option<Vec<Step>> = saved.as_ref().and_then(|(steps, _)| {
             steps
                 .iter()
                 .map(|s| {
+                    let mut state = s.state.clone();
+                    // Older history never recorded RAW options; keep the photo's saved balance.
+                    if state.get("raw").is_none() {
+                        let mut raw = self.raw_options.clone();
+                        raw.lightroom_geometry = None;
+                        state["raw"] = serde_json::to_value(raw).ok()?;
+                    }
                     Some(Step {
-                        snapshot: state_snapshot(&s.state)?,
+                        snapshot: state_snapshot(&state)?,
                         label: s.label.clone(),
                         at: s.at,
                     })
@@ -146,7 +156,8 @@ impl App {
         match (steps, saved) {
             (Some(steps), Some((_, position))) => {
                 self.history.restore(steps, position);
-                self.history_persisted = true;
+                // Rewrite the upgraded base on the next edit so RAW deltas keep their full baseline.
+                self.history_persisted = complete_raw_history;
                 // The photo's own look (saved alongside) is what's current.
                 self.amend_history();
             }
@@ -199,6 +210,23 @@ impl App {
             && old != new
         {
             return crop_ui::describe(&old, &new);
+        }
+        if previous.raw != current.raw {
+            let raw = &current.raw;
+            if raw.white_balance != previous.raw.white_balance
+                || raw.temperature != previous.raw.temperature
+                || raw.tint != previous.raw.tint
+                || raw.white_balance_shift != previous.raw.white_balance_shift
+            {
+                return if matches!(raw.white_balance.as_str(), "as_shot" | "camera")
+                    && raw.white_balance_shift == [0.; 2]
+                {
+                    "White balance: As Shot".into()
+                } else {
+                    "White balance".into()
+                };
+            }
+            return "RAW development".into();
         }
         let pointers = inspector::diff_pointers(&previous.params, &current.params);
         let mut names: Vec<String> = Vec::new();
@@ -387,25 +415,18 @@ fn snapshot_state(snapshot: &Snapshot) -> serde_json::Value {
         "params": *snapshot.params,
         "scan_for_print_restore": snapshot.scan_for_print_restore,
         "crop": snapshot.crop,
+        "raw": snapshot.raw,
     })
 }
 
 fn state_snapshot(state: &serde_json::Value) -> Option<Snapshot> {
     let mut params = state.get("params")?.clone();
-    // Old steps need the same neutral fields as RuntimeParams deserialization,
-    // or Undo followed by recording would create a phantom edit and lose Redo.
-    if let Some(camera) = params
-        .get_mut("camera")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        let mut tone =
-            serde_json::to_value(spektrafilm_core::params::ToneParams::default()).ok()?;
-        if let Some(saved) = camera.remove("tone") {
-            edits::merge(&mut tone, saved);
-        }
-        camera.insert("tone".into(), tone);
-    }
+    // Match runtime defaults and f32 precision after a JSON round trip, so Undo
+    // doesn't create a phantom edit. Keep unknown fields from newer versions.
+    let typed: RuntimeParams = serde_json::from_value(params.clone()).ok()?;
+    edits::merge(&mut params, serde_json::to_value(typed).ok()?);
     Some(Snapshot {
+        raw: serde_json::from_value(state.get("raw").cloned().unwrap_or_else(|| serde_json::json!({}))).ok()?,
         film: state.get("film")?.as_str()?.to_owned(),
         print: state.get("paper")?.as_str()?.to_owned(),
         params: Arc::new(params),
@@ -647,6 +668,69 @@ mod tests {
     }
 
     #[test]
+    fn white_balance_upgrades_old_history_and_survives_photo_switching_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("edits.sqlite");
+        let catalog = write_catalog(dir.path());
+        let (a, b) = (photo(dir.path(), 1), photo(dir.path(), 2));
+        let mut app = new_app(&store);
+        open(&mut app, &catalog, &a);
+        let previous = app.raw_options.clone();
+        app.raw_options.white_balance = "custom".into();
+        app.raw_options.temperature = 4300.;
+        app.raw_options.tint = 1.2;
+        app.reload_raw_if_changed(&previous);
+        finish(&mut app);
+        app.rebase_history();
+        let mut old = snapshot_state(&app.snapshot());
+        old.as_object_mut().unwrap().remove("raw");
+        app.edit_store
+            .as_ref()
+            .unwrap()
+            .replace_history(
+                &catalog,
+                1,
+                &[StoredStep {
+                    label: "Start".into(),
+                    at: 1,
+                    state: old,
+                }],
+            )
+            .unwrap();
+        app.save_photo_edit();
+        app.load_photo_history(&catalog, 1);
+        assert!(
+            !app.record_step(),
+            "upgrading does not create a history step"
+        );
+        let previous = app.raw_options.clone();
+        app.raw_options.white_balance_shift = [-20., 12.];
+        app.record_step();
+        app.reload_raw_if_changed(&previous);
+        finish(&mut app);
+        select(&mut app, &b);
+        assert_eq!(app.raw_options.white_balance_shift, [0.; 2]);
+        select(&mut app, &a);
+        assert_eq!(app.raw_options.white_balance_shift, [-20., 12.]);
+        app.leave_photo();
+        drop(app);
+        let mut app = new_app(&store);
+        open(&mut app, &catalog, &a);
+        assert_eq!(app.raw_options.temperature, 4300.);
+        assert_eq!(app.raw_options.white_balance_shift, [-20., 12.]);
+        app.undo();
+        finish(&mut app);
+        assert_eq!(app.raw_options.white_balance, "custom");
+        assert_eq!(app.raw_options.temperature, 4300.);
+        assert_eq!(app.raw_options.tint, 1.2);
+        assert_eq!(app.raw_options.white_balance_shift, [0.; 2]);
+        assert!(!app.record_step());
+        app.redo();
+        finish(&mut app);
+        assert_eq!(app.raw_options.white_balance_shift, [-20., 12.]);
+    }
+
+    #[test]
     fn copied_settings_paste_onto_another_photo_as_one_saved_step() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("edits.sqlite");
@@ -800,6 +884,7 @@ mod tests {
             print: "kodak_portra_endura".into(),
             scan_for_print_restore: None,
             crop: None,
+            raw: Default::default(),
         };
         let mut app = app;
         assert_eq!(

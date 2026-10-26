@@ -26,6 +26,47 @@ impl Default for Crop {
 }
 
 impl Crop {
+    /// Resolve Lightroom framing in the oriented frame after manual quarter turns.
+    pub fn from_catalog(
+        geometry: Option<&Geometry>,
+        width: u32,
+        height: u32,
+        rotation: u8,
+    ) -> Self {
+        let Some(geometry) = geometry else {
+            return Self::FULL;
+        };
+        let (w, h) = if rotation % 2 == 1 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let crop = Self::from_lightroom(geometry, w as f64, h as f64)
+            .rotated_quarter_turns(rotation)
+            .shrink_to_fit(width as f64, height as f64);
+        if crop.validate().is_ok() {
+            crop
+        } else {
+            Self::FULL
+        }
+    }
+
+    pub fn shrink_to_fit(self, width: f64, height: f64) -> Self {
+        let [x, y] = [self.center[0] * width, self.center[1] * height];
+        let [w, h] = self.pixels(width, height);
+        let (sin, cos) = self.angle.to_radians().sin_cos();
+        let (sin, cos) = (sin.abs(), cos.abs());
+        let (ex, ey) = ((w * cos + h * sin) / 2., (w * sin + h * cos) / 2.);
+        let scale = (x.min(width - x) / ex)
+            .min(y.min(height - y) / ey)
+            .clamp(0., 1.);
+        Self {
+            center: [x / width, y / height],
+            size: [w * scale / width, h * scale / height],
+            ..self
+        }
+    }
+
     pub const FULL: Self = Self {
         center: [0.5, 0.5],
         size: [1., 1.],

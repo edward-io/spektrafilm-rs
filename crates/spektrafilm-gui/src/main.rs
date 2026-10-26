@@ -5,6 +5,7 @@
 // a control changes. The output texture is uploaded to egui once per
 // render; the panel scales it to fit.
 
+mod batch_export;
 mod calibration_ui;
 mod catalog_edits;
 mod catalog_ui;
@@ -18,12 +19,15 @@ mod inspector;
 mod lut_ui;
 mod names;
 mod paper_back;
+mod photo_export;
 mod preload;
 mod project;
 mod settings;
 mod theme;
+mod thumbnails;
 mod tooltips;
 mod view;
+mod white_balance_ui;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +69,13 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../assets/spektrafilm-icon.png"
+                ))
+                .expect("bundled Spektrafilm icon must be a valid PNG"),
+            )
+            .with_decorations(false)
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([900.0, 560.0]),
         renderer: gui_renderer(),
@@ -250,6 +261,7 @@ struct App {
     lut: lut_ui::Settings,
     render_requested: bool,
     display: project::DisplayParams,
+    preview_max_size: u32,
     scan_for_print_restore: Option<[bool; 3]>,
     backend: Arc<dyn ComputeBackend>,
     data_dir: PathBuf,
@@ -277,6 +289,7 @@ struct App {
     /// The whole frame, after orientation and quarter turns.
     uncropped: Option<Arc<ImageBuf>>,
     source_stamp: Option<(u64, std::time::SystemTime)>,
+    native_input_color: Option<(String, bool)>,
     /// The photo's crop; `None` until a catalog photo's Lightroom crop is read.
     crop: Option<Crop>,
     /// The crop `image` was made with (the whole frame while cropping).
@@ -343,6 +356,8 @@ struct App {
     /// surfaces success/failure in `status` when the worker thread
     /// completes. Joined eagerly to release the thread.
     export_job: Option<ExportJob>,
+    batch_export: Option<batch_export::Job>,
+    thumbnails: thumbnails::Manager,
     /// Inspector stage tab shown in the sidebar.
     tab: inspector::Tab,
     history: history::History,
@@ -383,6 +398,7 @@ struct LoadJob {
     started: Instant,
     color_override: Option<(String, bool)>,
     rotation: u8,
+    crop: Option<Crop>,
     raw_options: spektrafilm_io::RawOptions,
     view_override: Option<(f32, egui::Vec2)>,
     rx: mpsc::Receiver<Result<LoadedPreview, String>>,
@@ -495,6 +511,7 @@ struct RenderResult {
     preview_limit: u32,
     path: String,
     preview: PreviewTextureData,
+    thumbnail: Option<thumbnails::Rendered>,
     source_preview: Option<((String, bool, bool), PreviewTextureData)>,
     paper: Arc<PreviewTextureData>,
     input_clone_ms: f32,
@@ -590,6 +607,7 @@ impl App {
             lut: Default::default(),
             render_requested: false,
             display: Default::default(),
+            preview_max_size: 2048,
             scan_for_print_restore: None,
             backend,
             data_dir,
@@ -609,6 +627,7 @@ impl App {
             image: None,
             uncropped: None,
             source_stamp: None,
+            native_input_color: None,
             crop: None,
             applied_crop: Crop::FULL,
             crop_tool: None,
@@ -645,6 +664,8 @@ impl App {
             #[cfg(target_os = "macos")]
             metal_colorspace_tagged: false,
             export_job: None,
+            batch_export: None,
+            thumbnails: thumbnails::Manager::default(),
             tab: inspector::Tab::default(),
             history: Default::default(),
             params_json: Default::default(),
@@ -690,7 +711,7 @@ impl App {
         self.raw_options.lightroom_geometry = None;
         self.crop = None;
         if let Some(catalog) = &mut self.catalog {
-            catalog.selected = None;
+            catalog.clear_selection();
         }
         self.load_image_with_state(path, 0, None, None);
     }
@@ -700,6 +721,7 @@ impl App {
         self.image = None;
         self.uncropped = None;
         self.source_stamp = None;
+        self.native_input_color = None;
         self.applied_crop = Crop::FULL;
         self.crop_tool = None;
         self.image_path = None;
@@ -946,6 +968,7 @@ impl App {
                     started: Instant::now(),
                     color_override,
                     rotation,
+                    crop,
                     raw_options: loaded_options,
                     view_override,
                     rx,
@@ -1002,10 +1025,13 @@ impl App {
                     source.clone(),
                 );
                 let new_image = self.image_path.as_ref() != Some(&job.path);
+                let keep_render =
+                    !new_image && self.rotation == job.rotation && self.applied_crop == crop;
                 // Rotating, cropping or redeveloping the same photo swaps in place.
                 self.develop_next = new_image;
                 self.loaded_raw_options = Some(job.raw_options);
                 self.metadata = source.metadata;
+                self.native_input_color = Some((source.color_space.clone(), source.encoded));
                 let (color, encoded) = job
                     .color_override
                     .unwrap_or((source.color_space, source.encoded));
@@ -1036,10 +1062,12 @@ impl App {
                 self.image = Some(img);
                 self.image_path = Some(job.path);
                 self.output_image = None;
-                self.output_tex = None;
+                if !keep_render {
+                    self.output_tex = None;
+                    self.canvas_output = None;
+                }
                 self.input_tex = None;
                 self.canvas_input = None;
-                self.canvas_output = None;
                 self.canvas_previous = None;
                 self.animation = None;
                 self.preview_input.clear();
@@ -1119,6 +1147,10 @@ impl App {
         let ctx = self.ctx.clone();
         let (tx, rx) = mpsc::channel();
         let worker_color = color.clone();
+        let native_color = self
+            .native_input_color
+            .clone()
+            .unwrap_or((color.clone(), encoded));
         let source_stamp = self.source_stamp;
         let task = self.scheduler.task(Priority::Interactive);
         let worker_task = task.clone();
@@ -1156,8 +1188,8 @@ impl App {
                         source: SourceImage {
                             pixels,
                             metadata,
-                            color_space: worker_color,
-                            encoded,
+                            color_space: native_color.0,
+                            encoded: native_color.1,
                             stamp: source_stamp,
                         },
                         image,
@@ -1181,6 +1213,7 @@ impl App {
                     started: Instant::now(),
                     color_override: Some((color, encoded)),
                     rotation,
+                    crop: Some(crop),
                     raw_options: self.export_raw_options().clone(),
                     view_override: None,
                     rx,
@@ -1219,6 +1252,8 @@ impl App {
         let film_name = self.film_name.clone();
         let print_name = self.print_name.clone();
         let params = self.pipeline_params(self.applied_crop);
+        let thumbnail_spec = self.current_thumbnail_spec();
+        let thumbnail_frame = self.thumbnail_frame();
         let pipeline_template = self
             .pipeline_cache_key
             .clone()
@@ -1293,6 +1328,10 @@ impl App {
                     let t_build = Instant::now();
                     let cache_key =
                         preview_pipeline_cache_key(&data_dir, &film_name, &print_name, &params);
+                    let thumbnail_key = thumbnail_spec
+                        .as_ref()
+                        .zip(thumbnail_frame.as_ref())
+                        .map(|(spec, frame)| spec.fingerprint(frame));
                     let pipeline = match pipeline_template {
                         Some((key, pipeline)) if key == cache_key => pipeline.with_params(params),
                         _ => {
@@ -1320,38 +1359,7 @@ impl App {
                         Some(worker_task.cpu().map_err(|e| e.to_string())?)
                     };
                     let t = Instant::now();
-                    let mut path = if backend.is_gpu() {
-                        "GPU stages"
-                    } else {
-                        "CPU"
-                    }
-                    .to_string();
-                    if backend.is_gpu()
-                        && pipeline.params.film_render.grain.active
-                        && !pipeline.params.converts_film()
-                        && pipeline.params.film_render.grain.sublayers_active
-                        && !backend.supports_layered_grain()
-                    {
-                        path.push_str(" + CPU sublayer grain");
-                    }
-                    let output = match () {
-                        () if pipeline.params.io.crop
-                            || (pipeline.params.io.upscale_factor - 1.).abs() > 1e-6
-                            || (pipeline.params.scans_film() && pipeline.film.is_positive()) =>
-                        {
-                            pipeline.process((*image).clone(), backend.as_ref())
-                        }
-                        () => {
-                            if let Some(output) =
-                                pipeline.process_resident_borrowed(image.as_ref(), backend.as_ref())
-                            {
-                                path = "GPU resident".into();
-                                output
-                            } else {
-                                pipeline.process((*image).clone(), backend.as_ref())
-                            }
-                        }
-                    };
+                    let (output, path) = render_preview_image(&pipeline, &image, backend.as_ref());
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     drop(cpu_render);
                     let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
@@ -1362,6 +1370,30 @@ impl App {
                         display_transform,
                         backend.as_ref(),
                     );
+                    let thumbnail = match (&thumbnail_spec, &thumbnail_frame, thumbnail_key) {
+                        (Some(spec), Some(info), Some(key))
+                            if spec.fingerprint(info) == key
+                                && image_stamp(&spec.path) == info.stamp =>
+                        {
+                            Some(thumbnails::Rendered {
+                                spec: spec.clone(),
+                                frame: info.clone(),
+                                fingerprint: key,
+                                quality: preview_limit,
+                                image: if display_transform {
+                                    thumbnails::shrink(&preview)
+                                } else {
+                                    thumbnails::shrink(&prepare_preview_texture_data(
+                                        &output,
+                                        &pipeline.params.io,
+                                        true,
+                                        backend.as_ref(),
+                                    ))
+                                },
+                            })
+                        }
+                        _ => None,
+                    };
                     let source_preview = if prepare_source {
                         let source = if source_image.width.max(source_image.height) > 2048 {
                             Arc::new(spektrafilm_core::resize::preview(&source_image, 2048))
@@ -1399,6 +1431,7 @@ impl App {
                         preview_limit,
                         path,
                         preview,
+                        thumbnail,
                         source_preview,
                         paper,
                         input_clone_ms,
@@ -1454,9 +1487,13 @@ impl App {
             .map(|i| egui::vec2(i.size[0] as f32, i.size[1] as f32))
             .or_else(|| self.output_tex.as_ref().map(|t| t.size_vec2()));
         let img_size = source_size.or(output_size).unwrap_or(egui::Vec2::splat(1.));
-        let border = img_size.x.max(img_size.y) * self.display.white_padding;
+        let border = if self.display.show_border {
+            img_size.x.max(img_size.y) * self.display.white_padding
+        } else {
+            0.
+        };
         let paper_size = img_size + egui::Vec2::splat(2. * border);
-        // Fit inside the margins and above the floating toolbar.
+        // Fit the visible image and border above the floating toolbar.
         let area = Self::image_area(egui::Rect::from_min_size(egui::Pos2::ZERO, avail));
         let fit_scale = (area.width() / paper_size.x)
             .min(area.height() / paper_size.y)
@@ -1754,6 +1791,9 @@ impl App {
                     ctx.request_repaint();
                     return;
                 }
+                if let Some(thumbnail) = r.thumbnail {
+                    self.accept_rendered_thumbnail(thumbnail, !interactive, ctx);
+                }
                 self.render_path = r.path;
                 self.last_input_clone_ms = r.input_clone_ms;
                 self.last_scale_ms = r.scale_ms;
@@ -1943,25 +1983,23 @@ impl App {
             return;
         };
 
-        let film = self.film_name.clone();
-        let paper = self.print_name.clone();
-        let crop = self.committed_crop();
-        let mut params = self.params.clone();
-        params.settings.preview_mode = false;
-        // The CLI scales grain for the crop itself.
-        let cli_params = params.clone();
-        params.camera.film_format_mm = self.pipeline_params(crop).camera.film_format_mm;
-        let data_dir = self.data_dir.clone();
-        let raw_options = self.export_raw_options().clone();
-        let rotation = self.rotation;
-        let save_options = self.current_save_options();
-        let metadata = self.export_metadata(&cli_params, crop);
-        // While cropping, `image` is the whole frame; export the committed crop.
-        let image = if crop == self.applied_crop {
-            self.image.clone().map(Ok)
-        } else {
-            self.uncropped.clone().map(Err)
+        let mut edit = self.current_edit();
+        edit.raw = self.export_raw_options().clone();
+        edit.crop = Some(self.committed_crop());
+        let request = photo_export::Request {
+            path: input_path,
+            edit,
+            detect_input_color: false,
         };
+        let source = self.uncropped.as_ref().map(|pixels| SourceImage {
+            pixels: pixels.clone(),
+            metadata: self.metadata.clone(),
+            color_space: self.params.io.input_color_space.clone(),
+            encoded: self.params.io.input_cctf_decoding,
+            stamp: self.source_stamp,
+        });
+        let data_dir = self.data_dir.clone();
+        let options = self.current_save_options();
         let backend = self.backend.clone();
         let label = if cli_path.is_some() {
             "f64 CPU"
@@ -1970,39 +2008,16 @@ impl App {
         } else {
             "CPU"
         };
-        self.start_export_job(ctx, label, out_path.clone(), move |cancel| {
-            if let Some(cli_path) = cli_path {
-                return run_f64_export(
-                    &cli_path,
-                    &input_path,
-                    &out_path,
-                    &film,
-                    &paper,
-                    &cli_params,
-                    &data_dir,
-                    cancel,
-                    &raw_options,
-                    &save_options,
-                    rotation,
-                    crop,
-                );
-            }
-            let metadata = metadata?;
-            let image = match image.context("source image is still loading")? {
-                Ok(image) => image,
-                Err(frame) => Arc::new(crop.apply(&frame)?),
-            };
-            run_gpu_export(
-                image.as_ref(),
+        self.start_export_job(ctx, label, out_path.clone(), move |cancel, task| {
+            request.run(
                 &out_path,
-                &film,
-                &paper,
-                &params,
+                &options,
                 &data_dir,
                 backend.as_ref(),
+                cli_path.as_deref(),
                 cancel,
-                &save_options,
-                &metadata,
+                task,
+                source,
             )
         });
     }
@@ -2015,9 +2030,9 @@ impl App {
 
     fn start_export_job<F>(&mut self, ctx: &egui::Context, label: &str, output: PathBuf, run: F)
     where
-        F: FnOnce(&AtomicBool) -> Result<()> + Send + 'static,
+        F: FnOnce(&AtomicBool, &Task) -> Result<()> + Send + 'static,
     {
-        if self.export_job.is_some() {
+        if self.export_busy() {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -2033,7 +2048,7 @@ impl App {
                 let result = worker_task
                     .run(|| {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run(&worker_cancel)
+                            run(&worker_cancel, &worker_task)
                         }))
                     })
                     .unwrap_or_else(|panic| Err(anyhow::anyhow!(panic_message(panic))));
@@ -2069,6 +2084,12 @@ impl App {
     /// child; `poll_export_job` then drains the resulting error message
     /// on the next `update()` tick.
     fn cancel_export(&mut self) {
+        if let Some(batch) = &self.batch_export
+            && batch.running()
+        {
+            batch.cancel();
+            return;
+        }
         let Some(job) = self.export_job.as_ref() else {
             return;
         };
@@ -2167,6 +2188,8 @@ impl App {
         const NOT_PRINT: &str = "Not used: this workflow does not print.";
         const NOT_SCAN: &str = "Not used: this workflow bypasses the scanner.";
 
+        self.white_balance_controls(ui);
+
         // ── Exposure ────────────────────────────────────────────────────
         Section::new("Exposure", Tab::Input, tooltips::SECTION_EXPOSURE)
             .used(stages.camera, not_camera)
@@ -2174,6 +2197,7 @@ impl App {
                 "/camera/auto_exposure",
                 "/camera/auto_exposure_method",
                 "/camera/exposure_compensation_ev",
+                "/enlarger/print_exposure_compensation",
                 "/camera/film_format_mm",
                 "/camera/lens_blur_um",
             ])
@@ -2221,6 +2245,17 @@ impl App {
                     tooltips::CONTROL_EV_COMPENSATION,
                 )
                 .changed();
+                changed |= ui
+                    .add_enabled_ui(stages.print, |ui| {
+                        tooltips::checkbox(
+                            ui,
+                            &mut self.params.enlarger.print_exposure_compensation,
+                            "Print auto compensation",
+                            tooltips::CONTROL_PRINT_AUTO_COMPENSATION,
+                        )
+                    })
+                    .inner
+                    .changed();
                 changed |= tooltips::labeled(
                     ui,
                     tooltips::slider(&mut self.params.camera.film_format_mm, 4.0..=120.0)
@@ -3410,13 +3445,13 @@ impl eframe::App for App {
         self.poll_load_job();
         self.poll_calibration(ctx);
         // Refine an interactive 640 px frame after the slider is released.
-        let configured_limit = if self.params.settings.preview_max_size == 0 {
+        let configured_limit = if self.preview_max_size == 0 {
             self.image
                 .as_ref()
                 .map(|i| i.width.max(i.height))
                 .unwrap_or(0)
         } else {
-            self.params.settings.preview_max_size
+            self.preview_max_size
         };
         if !ctx.is_using_pointer()
             && self.render_job.is_none()
@@ -3519,7 +3554,7 @@ impl eframe::App for App {
                             .show(ui, |ui| self.controls_panel(ui, ctx));
                     });
             });
-        let preload_radius = &mut self.preload_radius;
+        let export_ready = self.selection_export_ready();
         let action = self.catalog.as_mut().and_then(|catalog| {
             egui::SidePanel::left("catalog")
                 .default_width(236.)
@@ -3534,22 +3569,13 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
-                    catalog.show(ui, ctx, preload_radius)
+                    catalog.show(ui, ctx, export_ready)
                 })
                 .inner
         });
         match action {
-            Some(catalog_ui::Action::Close) => {
-                let request = self.preload.waiting().cloned();
-                self.preload.stop();
-                self.leave_photo();
-                self.catalog = None;
-                self.last_catalog = None;
-                if let Some(request) = request {
-                    self.start_image_load(request);
-                }
-            }
             Some(catalog_ui::Action::Select(photo)) => self.select_catalog_photo(photo),
+            Some(catalog_ui::Action::Export(photos)) => self.export_selection_dialog(ctx, photos),
             Some(catalog_ui::Action::Empty) => {
                 self.preload.stop();
                 self.leave_photo();
@@ -3601,6 +3627,7 @@ impl eframe::App for App {
         }
         self.reload_raw_if_changed(&raw_before);
         self.sync_crop();
+        self.update_edited_thumbnails(ctx);
     }
 
     /// Called once when the window is closing. If an export is still
@@ -3611,6 +3638,8 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.preload.stop();
         self.leave_photo();
+        self.batch_export.take();
+        self.thumbnails.shutdown();
         let Some(job) = self.export_job.take() else {
             return;
         };
@@ -3909,6 +3938,44 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
     }
 }
 
+fn render_preview_image(
+    pipeline: &Pipeline,
+    image: &ImageBuf,
+    backend: &dyn ComputeBackend,
+) -> (ImageBuf, String) {
+    let mut path = if backend.is_gpu() {
+        "GPU stages"
+    } else {
+        "CPU"
+    }
+    .to_string();
+    if backend.is_gpu()
+        && pipeline.params.film_render.grain.active
+        && !pipeline.params.converts_film()
+        && pipeline.params.film_render.grain.sublayers_active
+        && !backend.supports_layered_grain()
+    {
+        path.push_str(" + CPU sublayer grain");
+    }
+    let output = match () {
+        () if pipeline.params.io.crop
+            || (pipeline.params.io.upscale_factor - 1.).abs() > 1e-6
+            || (pipeline.params.scans_film() && pipeline.film.is_positive()) =>
+        {
+            pipeline.process(image.clone(), backend)
+        }
+        () => {
+            if let Some(output) = pipeline.process_resident_borrowed(image, backend) {
+                path = "GPU resident".into();
+                output
+            } else {
+                pipeline.process(image.clone(), backend)
+            }
+        }
+    };
+    (output, path)
+}
+
 fn prepare_preview_texture_data(
     out: &ImageBuf,
     io: &spektrafilm_core::params::IoParams,
@@ -4148,7 +4215,8 @@ fn run_f64_export(
     raw_options: &spektrafilm_io::RawOptions,
     save_options: &spektrafilm_io::SaveOptions,
     rotation: u8,
-    crop: Crop,
+    crop: Option<Crop>,
+    detect_input_color: bool,
 ) -> Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4161,7 +4229,17 @@ fn run_f64_export(
     {
         let f = std::fs::File::create(&temp.0)
             .with_context(|| format!("creating params tempfile {}", temp.0.display()))?;
-        serde_json::to_writer(std::io::BufWriter::new(f), params)
+        let mut settings = serde_json::to_value(params)?;
+        if detect_input_color {
+            if let Some(io) = settings
+                .get_mut("io")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                io.remove("input_color_space");
+                io.remove("input_cctf_decoding");
+            }
+        }
+        serde_json::to_writer(std::io::BufWriter::new(f), &settings)
             .context("serializing params to JSON")?;
     }
 
@@ -4171,6 +4249,7 @@ fn run_f64_export(
     // to GPU would silently demote the export back to f32 math.
     cmd.env("SPEKTRAFILM_BACKEND", "cpu")
         .arg("process")
+        .arg("--editor-framing")
         .arg("--rotate-quarter-turns")
         .arg(rotation.to_string())
         .arg("--bit-depth")
@@ -4189,6 +4268,8 @@ fn run_f64_export(
         .arg(raw_options.temperature.to_string())
         .arg("--tint")
         .arg(raw_options.tint.to_string())
+        .arg("--white-balance-shift")
+        .arg(serde_json::to_string(&raw_options.white_balance_shift)?)
         .arg(input)
         .arg("-o")
         .arg(output)
@@ -4206,18 +4287,16 @@ fn run_f64_export(
         cmd.arg("--scan-film");
     }
 
-    if raw_options.lens_correction {
-        cmd.arg("--lens-correction");
-    }
+    cmd.arg("--lens-correction")
+        .arg(raw_options.lens_correction.to_string());
     if let Some(path) = &raw_options.lens_database {
         cmd.arg("--lens-database").arg(path);
     }
-    // Lightroom's crop is already part of `crop`.
     if let Some(geometry) = &raw_options.lightroom_geometry {
         cmd.arg("--lightroom-geometry")
-            .arg(serde_json::to_string(&geometry.orientation_only())?);
+            .arg(serde_json::to_string(geometry)?);
     }
-    if !crop.is_full() {
+    if let Some(crop) = crop {
         cmd.arg("--crop").arg(serde_json::to_string(&crop)?);
     }
     run_cli(&mut cmd, cancel)
@@ -4311,6 +4390,9 @@ fn run_cli(cmd: &mut std::process::Command, cancel: &AtomicBool) -> Result<()> {
     };
     let stderr = reader.join().unwrap_or_default();
     let status = result?;
+    if status.code() == Some(spektrafilm_io::OUTPUT_IO_EXIT_CODE as i32) {
+        return Err(spektrafilm_io::OutputIoError(anyhow::anyhow!("{}", stderr.trim())).into());
+    }
     if !status.success() {
         anyhow::bail!("export CLI exited {status}: {}", stderr.trim());
     }
@@ -4452,13 +4534,17 @@ impl App {
         self.gpu_export = state.gpu_export;
         self.export_format = state.export_format;
         self.lut = state.lut;
-        self.display = state.display;
+        if !load_image {
+            // Import legacy startup preferences once; projects don't change the view.
+            self.display = state.display;
+            self.preview_max_size = state.params.settings.preview_max_size;
+        }
         self.scan_for_print_restore = state.scan_for_print_restore;
         self.raw_options = state.raw;
         self.save_options = state.output;
         if load_image {
             if let Some(catalog) = &mut self.catalog {
-                catalog.selected = None;
+                catalog.clear_selection();
             }
             if let Some(image) = state.image {
                 // Project crops already use the saved rotation, even for this photo.
@@ -4900,6 +4986,39 @@ impl App {
             });
     }
 
+    fn lens_match_status(&self, ui: &mut egui::Ui) {
+        if !self
+            .image_path
+            .as_deref()
+            .is_some_and(spektrafilm_io::is_raw)
+        {
+            ui.weak("Lens correction is available for RAW photos.");
+            return;
+        }
+        let report = self.metadata.lens_correction.as_ref();
+        let detected = self.metadata.detected_lens();
+        ui.weak(format!(
+            "Detected lens: {}",
+            detected.unwrap_or("not recorded in the photo")
+        ));
+        if self.image_loading() {
+            ui.weak("Updating lens correction…");
+        } else if !self.raw_options.lens_correction {
+            ui.weak("Lens correction is off; database matching is not checked.");
+        } else if self
+            .loaded_raw_options
+            .as_ref()
+            .is_none_or(|o| !o.lens_correction || o.lens_database != self.raw_options.lens_database)
+        {
+            ui.weak("Lens correction could not be updated. See the load error for details.");
+        } else if let Some(report) = report {
+            if let Some(name) = &report.matched_lens {
+                ui.weak(format!("Matched Lensfun profile: {name}"));
+            }
+            ui.weak(report.detail);
+        }
+    }
+
     fn raw_controls(&mut self, ui: &mut egui::Ui) {
         use inspector::{Section, Tab};
         Section::new(
@@ -4926,43 +5045,13 @@ impl App {
                     }
                 },
             );
-            tooltips::combo(
-                ui,
-                egui::ComboBox::from_id_salt("raw_white_balance")
-                    .selected_text(names::label(&self.raw_options.white_balance)),
-                "White balance",
-                tooltips::MENU_RAW_WHITE_BALANCE,
-                |ui| {
-                    for name in ["as_shot", "daylight", "tungsten", "custom"] {
-                        ui.selectable_value(
-                            &mut self.raw_options.white_balance,
-                            name.into(),
-                            names::label(name),
-                        )
-                        .on_hover_text(tooltips::option(name));
-                    }
-                },
-            );
-            if self.raw_options.white_balance == "custom" {
-                tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.raw_options.temperature, 2000.0..=15000.0),
-                    "Temperature (K)",
-                    tooltips::CONTROL_TEMPERATURE_K,
-                );
-                tooltips::labeled(
-                    ui,
-                    egui::Slider::new(&mut self.raw_options.tint, 0.1..=3.0),
-                    "Tint",
-                    tooltips::CONTROL_TINT,
-                );
-            }
             tooltips::checkbox(
                 ui,
                 &mut self.raw_options.lens_correction,
                 "Lens correction (Lensfun)",
                 tooltips::CONTROL_LENS_CORRECTION_LENSFUN,
             );
+            self.lens_match_status(ui);
             if self.raw_options.lens_correction {
                 if let Some(path) = &self.raw_options.lens_database {
                     ui.label(
@@ -5030,6 +5119,47 @@ mod raw_reload_tests {
             }
             app.poll_load_job();
         }
+    }
+
+    #[test]
+    fn lens_status_reports_the_loaded_match_and_hides_stale_results() {
+        let mut app = new_app();
+        app.load_image_from_path(&input());
+        finish(&mut app);
+        app.metadata.lens_correction = Some(spektrafilm_io::LensCorrection {
+            detected_lens: Some("Camera lens name".into()),
+            matched_lens: Some("Matched database lens".into()),
+            applied: true,
+            detail: "Lens correction applied.",
+        });
+        let ctx = app.ctx.clone();
+        let text = |app: &App| {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.lens_match_status(ui));
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let matched = text(&app);
+        assert!(matched.contains("Detected lens: Camera lens name"));
+        assert!(matched.contains("Matched Lensfun profile: Matched database lens"));
+        assert!(matched.contains("Lens correction applied."));
+        app.raw_options.lens_correction = false;
+        let disabled = text(&app);
+        assert!(disabled.contains("correction is off"));
+        assert!(!disabled.contains("Matched Lensfun profile"));
+        app.raw_options.lens_correction = true;
+        app.raw_options.lens_database = Some("new-database".into());
+        let changed_database = text(&app);
+        assert!(changed_database.contains("could not be updated"));
+        assert!(!changed_database.contains("Matched Lensfun profile"));
     }
 
     #[test]
@@ -5258,7 +5388,7 @@ mod export_tests {
         let visited = ran.clone();
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("cancelled.png");
-        app.start_export_job(&ctx, "test", output.clone(), move |_| {
+        app.start_export_job(&ctx, "test", output.clone(), move |_, _| {
             let _cpu = scheduler::cpu_permit()?;
             visited.store(true, Ordering::Relaxed);
             Ok(())
@@ -5417,7 +5547,7 @@ mod preview_failure_tests {
             None,
         );
         app.params = RuntimeParams::default();
-        app.params.settings.preview_max_size = 2048;
+        app.preview_max_size = 2048;
         app.auto_preview = true;
         app.image = Some(Arc::new(ImageBuf::new(64, 32)));
         app.output_image = Some(ImageBuf::new(64, 32));
@@ -6020,7 +6150,7 @@ mod preview_cache_tests {
         }
         assert!(app.image.is_some(), "{}", app.status);
         for limit in [640, 2048] {
-            app.params.settings.preview_max_size = limit;
+            app.preview_max_size = limit;
             for setting in ["exposure", "print_exposure", "halation"] {
                 for step in 0..5 {
                     match setting {

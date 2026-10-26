@@ -14,6 +14,12 @@ pub struct Camera {
     pub crop: f32,
     pub score: i32,
 }
+/// The first two fields of the pinned lfLens C struct; copy strings before freeing the DB.
+#[repr(C)]
+pub struct LensName {
+    pub maker: *const c_char,
+    pub model: *const c_char,
+}
 type New = unsafe extern "C" fn() -> Ptr;
 type Destroy = unsafe extern "C" fn(Ptr);
 type Load = unsafe extern "C" fn(Ptr) -> i32;

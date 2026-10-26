@@ -1,6 +1,6 @@
 # spektrafilm-rs
 
-![banner](docs/card.jpg)
+<img src="assets/spektrafilm-icon.png" alt="Spektrafilm app icon" width="192">
 
 A spectral simulator for analogue film and the print-and-scan chain, with a
 native Rust GUI and CLI. This repository,
@@ -49,6 +49,49 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 ## Changelog
 
 ### Unreleased
+
+#### 2026-10-26
+
+- **Exposure controls:** added Print auto compensation beside EV compensation,
+  with hover help explaining how it counteracts manual EV changes while leaving
+  Auto exposure's adjustment intact.
+- **White balance:** Temperature and Tint are always visible, with rounded
+  blue-to-amber and green-to-magenta tracks. Double-clicking either label or
+  using its context menu restores the exact As Shot balance. Adjustments start
+  smoothly from the existing balance, support Undo/Redo and saved edits, and
+  keep the rendered preview visible while the RAW reloads. Older saved modes
+  retain their appearance; history normalization avoids phantom edits after
+  reopening a photo.
+- **Lens correction:** enabled by default for new photos, preserving saved off
+  settings. The RAW panel reports the detected lens, matched Lensfun profile,
+  and whether correction was applied, including missing metadata, unmatched
+  lenses, and profiles without usable calibration. CLI and f64 exports honor
+  explicit off settings.
+- **Catalog batch export:** Shift-click selects a range in the current filter;
+  the context menu exports that selection using each photo's own edits. The
+  queue supports GPU and f64 output, progress, cancellation, and individual
+  failure reports. Existing files are never overwritten, unfinished temporary
+  outputs are removed, and destination I/O failures stop the queue. Shared
+  export preparation preserves editor crop, rotation, RAW settings, and color
+  handling across single-photo, batch, and f64 exports.
+- **Edited reel thumbnails:** exposure, color, crop, rotation, and film edits
+  update thumbnails from the finished editor preview. A bounded, persistent
+  LRU cache restores them after restart; visible missing previews regenerate
+  in the background using matching decoded originals already in memory.
+  Stale results cannot replace newer edits, loading photos use their incoming
+  rotation and crop, and evicted textures reload without the polling delay.
+- **Preview preferences:** preview resolution and display settings stay with
+  the app across photo changes, Undo/Redo, pasted settings, and opened projects.
+- **Window and appearance:** removed the native title bar; empty menu-bar space
+  supports dragging and double-click maximize/restore, with minimize and close
+  actions in the menus. Added icon-font fallbacks to prevent missing replacement
+  glyph warnings, and replaced the default app icon with the light-written S
+  in both the running app and macOS packaging.
+- **Fit preview:** removed the 28-point canvas margin and stopped reserving
+  white-border padding when the border is hidden. Toolbar clearance and the
+  photo's aspect ratio are preserved.
+
+#### Earlier unreleased changes
 
 Changes from the original Rust fork's v0.1.2 baseline,
 [turbasvin/spektrafilm-rs at `9dd59b0`](https://github.com/turbasvin/spektrafilm-rs/commit/9dd59b0380194b93686aaa230a8bb9680aa270a4):
@@ -99,14 +142,51 @@ use **Previous / Next**, or press the left/right arrow keys to browse.
 Unavailable originals are skipped. Connect the photo drive and press
 **Refresh** to update availability, flags and geometry.
 
+Reel thumbnails reflect Spektrafilm's exposure, color, crop, rotation and film
+settings. The active photo reuses its finished editor preview; no second RAW
+decode is needed for that update. Committing a crop updates the thumbnail too.
+Opening the crop tool or using a before/after comparison doesn't replace the
+thumbnail with the temporary canvas view.
+
+Finished thumbnails persist in a disposable `previews.sqlite` alongside
+`edits.sqlite`. The cache uses lossless PNGs, a 256 MiB disk limit and LRU
+eviction; the in-memory texture cache holds up to 256 photos. It checks the
+photo's saved settings, original, profiles and app build before reuse. After
+a restart, valid thumbnails load from disk before camera previews are read.
+Missing or stale thumbnails regenerate one at a time for visible photos, with
+edited/cropped photos first and editor work taking priority. An older thumbnail
+stays visible during the update; hover its small hollow indicator for status.
+**Refresh** retries failures. Deleting `previews.sqlite` only discards cached
+images; Lightroom catalogs, originals and saved edits aren't changed.
+
 Right-click the main preview or a catalog thumbnail to **Copy path** to the
 original photo or **Show in Finder**.
+
+To export a group, click its first photo, then **Shift-click** the last. The
+highlighted range follows the current All/Picks filter, including off-screen
+photos. Right-click a highlighted photo, choose **Export N images…**, and pick
+the destination folder. Right-clicking an unselected photo selects only that
+photo. The outlined active photo remains the one edited by the inspector.
+
+Each queued photo uses its own saved edits (or normal defaults); the active
+photo uses its latest applied edits. Finish an open crop or RAW reload before
+starting. Output format, color space, quality, and GPU/f64 mode come from the
+current File export settings. Settings are captured when the queue starts,
+so browsing or editing afterwards does not change the queued results.
+
+The queue processes one original at a time. Existing files and virtual-copy
+name collisions receive numbered suffixes, without overwriting. The progress
+row provides Cancel and an expandable list of issues. Missing originals are
+skipped; other image failures are reported while the remaining photos continue.
+Destination I/O errors stop the queue. Cancellation keeps completed exports
+and removes the unfinished temporary output.
 
 Catalogs are opened read-only. Original files are developed by Spektrafilm,
 with Lightroom's crop, straighten angle, rotation and flips applied. Lightroom
 color, exposure, white balance and other tonal adjustments are not imported.
 Imported geometry is retained in saved Spektrafilm projects and full-resolution
-GPU/CPU exports. Camera previews are used only as browser thumbnails.
+GPU/CPU exports. Camera previews serve as temporary thumbnails while edited
+previews load.
 
 Adobe lens and perspective corrections are not reproduced; affected photos
 show a warning because their framing can differ. The importer has been tested
@@ -152,6 +232,10 @@ SPEKTRAFILM_BENCH_LIGHTROOM_CATALOG="/path/to/catalog.lrcat" \
 
 ## GUI and RAW development
 
+The window has no native title bar. Drag the empty menu-bar space to move it,
+or double-click that space to maximize or restore. Use **View → Minimize window**
+and **File → Close window** for the other window controls.
+
 Open or drop JPEG, PNG, TIFF, EXR or camera RAW files. RAW support includes the
 Sony ILCE-7M5 through rawler 0.8. Auto tries rawler first, then falls back to an
 installed LibRaw if decoding fails. LibRaw is optional; configuration and camera
@@ -192,7 +276,21 @@ remain on the CPU; small previews and already encoded sRGB use the CPU as well.
 This changes display preparation only, leaving saved image pixels untouched.
 Auto preview can be disabled for manual rendering. Changing the RAW decoder,
 white balance or lens settings automatically reloads the RAW in the background.
-Lens correction reports whether the database is downloaded, installed locally or not
+**Input → White balance** always shows Temperature and Tint. Adjustments start
+from the current balance without switching presets. The Temperature rail has a
+subtle blue-to-amber tint for cooler-to-warmer adjustments, and the Tint rail runs
+from green to magenta. Double-clicking either
+slider label restores both controls to the camera's exact original balance;
+the labels' right-click menus offer the same reset.
+Kelvin and tint are estimated coordinates and can differ from Lightroom or
+between decoders. Existing saved presets keep their appearance. White balance
+edits support Undo/Redo, and the last rendered preview stays visible until its
+replacement is ready, without flashing the source image or paper backing.
+Lens correction defaults to on for new photos; saved off settings are preserved.
+The RAW development panel shows the lens recorded in the photo, the matched
+Lensfun profile, and whether correction was applied. Missing matches, missing
+metadata, and profiles without usable calibration are reported explicitly.
+The database status shows whether it is downloaded, installed locally or not
 downloaded yet. Hover over an available database's status to see its location.
 The first download requires internet access; subsequent loads use the cache offline.
 Projects retain the RAW settings that produced the loaded image; pending RAW
@@ -244,7 +342,10 @@ SPEKTRAFILM_BACKEND=cpu ./target/release/spektrafilm-f64 process input.ARW \
 
 RAW controls: `--raw-decoder auto|libraw|rawler`, `--white-balance
 as_shot|daylight|tungsten|custom`, `--temperature`, `--tint`, `--lens-correction`,
-and `--lens-database`. `--saving-color-space` and `--saving-cctf-encoding`
+and `--lens-database`. Lens correction is on by default; use
+`--lens-correction false` to disable it. `--white-balance-shift '[-20,10]'` applies the GUI's relative
+temperature (mired) and tint adjustments on top of the selected balance; zeroes
+preserve the decoder's original output. `--saving-color-space` and `--saving-cctf-encoding`
 control the saved color transport independently of processing. JPEG quality
 and TIFF/EXR bit depth are configurable.
 

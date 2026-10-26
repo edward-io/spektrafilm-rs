@@ -26,6 +26,116 @@ fn success(result: std::process::Output) {
 }
 
 #[test]
+fn editor_framing_uses_the_same_crop_and_grain_scale_for_unopened_catalog_photos() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = root().join("crates/spektrafilm-io/tests/fixtures/synthetic.dng");
+    let settings = dir.path().join("settings.json");
+    let output = dir.path().join("batch.tif");
+    let explicit = dir.path().join("individual.tif");
+    let mut params = RuntimeParams::default();
+    params.debug.deactivate_spatial_effects = true;
+    params.debug.deactivate_stochastic_effects = true;
+    params.camera.auto_exposure = false;
+    params.camera.film_format_mm = 40.;
+    params.camera.tone.highlights = -25.;
+    let mut value = serde_json::to_value(&params).unwrap();
+    for key in ["input_color_space", "input_cctf_decoding"] {
+        value["io"].as_object_mut().unwrap().remove(key);
+    }
+    fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
+    let geometry = spektrafilm_io::lightroom::Geometry {
+        orientation: 6,
+        crop: [0.2, 0.1, 0.8, 0.7],
+        angle: 3.,
+    };
+    let source = load(
+        &input,
+        &RawOptions {
+            decoder: "rawler".into(),
+            lightroom_geometry: Some(geometry.orientation_only()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let image = source.pixels.rotated_quarter_turns(1);
+    let crop =
+        spektrafilm_io::crop::Crop::from_catalog(Some(&geometry), image.width, image.height, 1);
+    let geometry = serde_json::to_string(&geometry).unwrap();
+    let base = [
+        "process",
+        input.to_str().unwrap(),
+        "--film",
+        "kodak_gold_200",
+        "--paper",
+        "kodak_portra_endura",
+        "--raw-decoder",
+        "rawler",
+        "--params",
+        settings.to_str().unwrap(),
+        "--editor-framing",
+        "--lightroom-geometry",
+        &geometry,
+        "--rotate-quarter-turns",
+        "1",
+        "--bit-depth",
+        "32",
+    ];
+    let mut arguments = base.to_vec();
+    arguments.extend(["-o", output.to_str().unwrap()]);
+    success(cli(&arguments));
+    let crop_json = serde_json::to_string(&crop).unwrap();
+    let mut arguments = base.to_vec();
+    arguments.extend(["--crop", &crop_json, "-o", explicit.to_str().unwrap()]);
+    success(cli(&arguments));
+    let batch = load(&output, &Default::default()).unwrap();
+    let individual = load(&explicit, &Default::default()).unwrap();
+    assert_eq!(batch.pixels.data, individual.pixels.data);
+    let tags = batch.metadata.native.as_ref().unwrap();
+    let bytes = tags
+        .get_tag_by_hex(0x9286, None)
+        .next()
+        .unwrap()
+        .value_as_u8_vec(&tags.get_endian());
+    let recipe: serde_json::Value = serde_json::from_slice(&bytes[8..]).unwrap();
+    assert_eq!(
+        recipe["settings"]["crop"],
+        serde_json::to_value(crop).unwrap()
+    );
+    assert_eq!(
+        recipe["settings"]["params"]["camera"]["film_format_mm"],
+        40.
+    );
+    assert_eq!(
+        recipe["settings"]["raw"]["lightroom_geometry"]["crop"],
+        serde_json::json!([0., 0., 1., 1.])
+    );
+}
+
+#[test]
+fn output_io_failure_has_a_distinct_exit_code_for_the_export_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.png");
+    image::RgbImage::new(2, 2).save(&input).unwrap();
+    let output = dir.path().join("missing").join("output.png");
+    let result = cli(&[
+        "process",
+        input.to_str().unwrap(),
+        "--film",
+        "kodak_gold_200",
+        "--paper",
+        "kodak_portra_endura",
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        result.status.code(),
+        Some(spektrafilm_io::OUTPUT_IO_EXIT_CODE as i32),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn invalid_crop_is_reported_without_overwriting_the_output() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("frame.png");
@@ -72,6 +182,8 @@ fn process_exports_imported_lightroom_crop_and_rotation() {
         "kodak_portra_endura",
         "--raw-decoder",
         "rawler",
+        "--lens-correction",
+        "false",
         "--lightroom-geometry",
         r#"{"orientation":6,"crop":[0.25,0,1,0.5],"angle":0}"#,
         "--rotate-quarter-turns",
@@ -101,6 +213,7 @@ fn process_exports_imported_lightroom_crop_and_rotation() {
         serde_json::to_value(&params.camera.tone).unwrap()
     );
     assert_eq!(recipe["settings"]["raw"]["decoder"], "rawler");
+    assert_eq!(recipe["settings"]["raw"]["lens_correction"], false);
     assert_eq!(recipe["settings"]["rotation"], 1);
     assert_eq!(
         recipe["settings"]["crop"],
@@ -126,6 +239,7 @@ fn raw_processing_honors_explicit_input_fields_and_detects_unspecified_fields() 
         &input,
         &RawOptions {
             decoder: "rawler".into(),
+            white_balance_shift: [-20., 12.],
             ..Default::default()
         },
     )
@@ -173,6 +287,8 @@ fn raw_processing_honors_explicit_input_fields_and_detects_unspecified_fields() 
             "kodak_portra_endura",
             "--raw-decoder",
             "rawler",
+            "--white-balance-shift",
+            "[-20,12]",
             "--params",
             config.to_str().unwrap(),
             "--raw-out",

@@ -3,8 +3,17 @@ use egui::Response;
 use std::{path::Path, process::Command};
 
 pub(crate) fn show(response: &Response, path: &Path) -> Option<String> {
+    show_with(response, path, |_| {})
+}
+
+pub(crate) fn show_with(
+    response: &Response,
+    path: &Path,
+    extra: impl FnOnce(&mut egui::Ui),
+) -> Option<String> {
     let mut error = None;
     response.context_menu(|ui| {
+        extra(ui);
         if ui.button("Copy path").clicked() {
             ui.ctx().copy_text(path.to_string_lossy().into_owned());
             ui.close_menu();

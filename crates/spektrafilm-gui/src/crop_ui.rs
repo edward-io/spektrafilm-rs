@@ -116,13 +116,7 @@ impl Frame {
     }
     /// The crop shrunk about its centre until it fits.
     fn shrink_to_fit(&self, crop: Crop) -> Crop {
-        let [x, y] = self.centre(&crop);
-        let [ex, ey] = self.extents(&crop);
-        let scale = (x.min(self.w - x) / ex)
-            .min(y.min(self.h - y) / ey)
-            .clamp(0., 1.);
-        let [w, h] = self.size(&crop);
-        self.crop([x, y], [w * scale, h * scale], crop.angle)
+        crop.shrink_to_fit(self.w, self.h)
     }
     /// Frame vector for an offset along the crop's own axes.
     fn along(&self, crop: &Crop, [u, v]: [f64; 2]) -> [f64; 2] {
@@ -171,22 +165,12 @@ pub fn lightroom_crop(
     frame: &ImageBuf,
     rotation: u8,
 ) -> Crop {
-    let Some(geometry) = &options.lightroom_geometry else {
-        return Crop::FULL;
-    };
-    let (w, h) = if rotation % 2 == 1 {
-        (frame.height, frame.width)
-    } else {
-        (frame.width, frame.height)
-    };
-    let crop = Crop::from_lightroom(geometry, w as f64, h as f64).rotated_quarter_turns(rotation);
-    // Rounding can put a corner a hair outside the frame.
-    let crop = Frame::of(frame).shrink_to_fit(crop);
-    if crop.validate().is_ok() {
-        crop
-    } else {
-        Crop::FULL
-    }
+    Crop::from_catalog(
+        options.lightroom_geometry.as_ref(),
+        frame.width,
+        frame.height,
+        rotation,
+    )
 }
 
 /// `frame` with `crop` applied, sharing the pixels when nothing is cropped.
@@ -237,6 +221,8 @@ impl App {
     /// shrinks with it, so grain keeps the size it has in the whole frame.
     pub(crate) fn pipeline_params(&self, crop: Crop) -> RuntimeParams {
         let mut params = self.params.clone();
+        // Preview quality belongs to the app, including for legacy photo edits.
+        params.settings.preview_max_size = self.preview_max_size;
         if let Some(frame) = &self.uncropped {
             params.camera.film_format_mm *=
                 crop.long_side_fraction(frame.width as f64, frame.height as f64) as f32;

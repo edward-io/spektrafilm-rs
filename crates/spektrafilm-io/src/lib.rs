@@ -7,17 +7,39 @@ mod lens_api;
 pub mod lens_database;
 pub mod lightroom;
 mod raw_libraw;
+mod white_balance;
 mod xmp;
 use anyhow::{Context, Result, bail};
 use image::{ImageDecoder, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use spektrafilm_math::{image::ImageBuf, precision::from_f64};
 use std::{fs::File, io::BufWriter, path::Path};
+pub use white_balance::WhiteBalance;
 
 pub use export_metadata::EditSettings;
+pub use lens::LensCorrection;
+
+/// Distinguishes destination I/O failures from an individual image/metadata error.
+#[derive(Debug)]
+pub struct OutputIoError(pub anyhow::Error);
+impl std::fmt::Display for OutputIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for OutputIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+/// The f64 helper uses EX_IOERR to report destination failures to the GUI.
+pub const OUTPUT_IO_EXIT_CODE: u8 = 74;
 
 #[derive(Clone, Default)]
 pub struct Metadata {
+    pub lens_correction: Option<LensCorrection>,
+    /// Decoder baseline for the white balance sliders, before relative adjustments.
+    pub white_balance: Option<WhiteBalance>,
     pub source_orientation: u16,
     pub native: Option<little_exif::metadata::Metadata>,
     pub jpeg_segments: Vec<Vec<u8>>,
@@ -27,6 +49,22 @@ pub struct Metadata {
     /// An export snapshot; opening a rendered image does not apply its recipe.
     pub edit_settings: Option<serde_json::Value>,
 }
+impl Metadata {
+    pub fn detected_lens(&self) -> Option<&str> {
+        self.lens_correction
+            .as_ref()
+            .and_then(|report| report.detected_lens.as_deref())
+            .or_else(|| {
+                self.native.as_ref()?.into_iter().find_map(|tag| match tag {
+                    little_exif::exif_tag::ExifTag::LensModel(name) if !name.is_empty() => {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+            })
+    }
+}
+
 pub struct LoadedImage {
     pub pixels: ImageBuf,
     pub metadata: Metadata,
@@ -41,6 +79,8 @@ pub struct RawOptions {
     pub white_balance: String,
     pub temperature: f64,
     pub tint: f64,
+    /// Relative temperature (mired) and tint, preserving existing decoder modes.
+    pub white_balance_shift: [f64; 2],
     pub lens_correction: bool,
     pub lens_database: Option<std::path::PathBuf>,
     pub lightroom_geometry: Option<lightroom::Geometry>,
@@ -52,7 +92,8 @@ impl Default for RawOptions {
             white_balance: "as_shot".into(),
             temperature: 5500.,
             tint: 1.,
-            lens_correction: false,
+            white_balance_shift: [0.; 2],
+            lens_correction: true,
             lens_database: None,
             lightroom_geometry: None,
         }
@@ -121,6 +162,9 @@ pub fn is_raw(path: &Path) -> bool {
 pub fn load(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
     let started = std::time::Instant::now();
     let mut loaded = load_source(path, raw)?;
+    if is_raw(path) {
+        white_balance::apply(&mut loaded, raw.white_balance_shift)?;
+    }
     let developed = started.elapsed();
     if let Some(geometry) = &raw.lightroom_geometry {
         loaded.pixels = geometry.apply(loaded.pixels, loaded.metadata.source_orientation)?;
@@ -203,6 +247,8 @@ fn load_source(path: &Path, raw: &RawOptions) -> Result<LoadedImage> {
     };
     let orientation = decoder.orientation()?;
     let metadata = Metadata {
+        lens_correction: None,
+        white_balance: None,
         source_orientation: orientation.to_exif() as u16,
         native: little_exif::metadata::Metadata::new_from_path(path).ok(),
         jpeg_segments: jpeg_metadata_segments(path),
@@ -344,6 +390,19 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
     {
         bail!("unknown RAW white balance mode: {}", options.white_balance);
     }
+    let as_shot = raw.develop_params().ok().and_then(|p| {
+        let matrix = rawler::imgop::matrix::pseudo_inverse(p.color_matrices.first()?.matrix);
+        let xyz = std::array::from_fn(|i| {
+            (0..4)
+                .filter_map(|c| {
+                    let gain = raw.wb_coeffs[c] as f64;
+                    (gain.is_finite() && gain > 0.).then(|| matrix[i][c] as f64 / gain)
+                })
+                .sum()
+        });
+        WhiteBalance::from_xyz(xyz)
+    });
+    let white_balance = WhiteBalance::for_options(as_shot, options);
     if options.white_balance != "camera" && options.white_balance != "as_shot" {
         let temperature = match options.white_balance.as_str() {
             "daylight" => 6504.,
@@ -383,9 +442,15 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
             p[1] *= from_f64(options.tint);
         }
     }
-    if options.lens_correction {
-        lens::correct(&mut pixels, path, options.lens_database.as_deref())?;
-    }
+    let lens_correction = if options.lens_correction {
+        Some(lens::correct(
+            &mut pixels,
+            path,
+            options.lens_database.as_deref(),
+        )?)
+    } else {
+        None
+    };
     // RawDevelop crops and demosaics in sensor coordinates but does not apply
     // the orientation tag. Transform after lens correction, before the GUI
     // sees the pixels or saving normalizes the exported orientation to 1.
@@ -394,6 +459,8 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         pixels,
         metadata: Metadata {
             source_orientation: raw.orientation.to_u16(),
+            lens_correction,
+            white_balance,
             native: little_exif::metadata::Metadata::new_from_path(path)
                 .or_else(|_| {
                     little_exif::metadata::Metadata::new_from_vec(
@@ -412,21 +479,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
 /// Set `raw`'s white balance so a Planckian illuminant at `temperature` K
 /// develops to neutral.
 fn planckian_white_balance(raw: &mut rawler::RawImage, temperature: f64) -> Result<()> {
-    // A camera-space neutral from the selected Planckian white point.
-    let t = temperature.clamp(1667., 25000.);
-    let x = if t <= 4000. {
-        -0.2661239e9 / t.powi(3) - 0.2343589e6 / t.powi(2) + 0.8776956e3 / t + 0.179910
-    } else {
-        -3.0258469e9 / t.powi(3) + 2.1070379e6 / t.powi(2) + 0.2226347e3 / t + 0.240390
-    };
-    let y = if t <= 2222. {
-        -1.1063814 * x.powi(3) - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
-    } else if t <= 4000. {
-        -0.9549476 * x.powi(3) - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
-    } else {
-        3.0817580 * x.powi(3) - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
-    };
-    let xyz = [x / y, 1., (1. - x - y) / y];
+    let xyz = white_balance::planckian_xyz(temperature);
     // The matrix RawDevelop itself uses. Rawler leaves the deprecated
     // `xyz_to_cam` zeroed for most cameras, which would disable WB.
     let xyz_to_cam = raw
@@ -719,6 +772,33 @@ pub fn save_converted(
 /// Save pixels, then merge source descriptive tags into the output's own IFDs.
 /// Structural TIFF/thumbnail offsets are never transplanted from the source.
 pub fn save(
+    image: &ImageBuf,
+    path: &Path,
+    options: &SaveOptions,
+    metadata: &Metadata,
+    data_dir: &Path,
+) -> Result<()> {
+    save_inner(image, path, options, metadata, data_dir).map_err(|error| {
+        if error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|cause| {
+                !matches!(
+                    cause.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::Unsupported
+                )
+            })
+        {
+            OutputIoError(error).into()
+        } else {
+            error
+        }
+    })
+}
+
+fn save_inner(
     image: &ImageBuf,
     path: &Path,
     options: &SaveOptions,

@@ -120,6 +120,29 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
                 user_mul(raw, c, if v > 0. { v } else { cam_mul(raw, 1) });
             }
         }
+        let as_shot = (|| -> Result<Option<super::WhiteBalance>> {
+            let pre_mul =
+                lib.get::<unsafe extern "C" fn(Ptr, i32) -> f32>(b"libraw_get_pre_mul\0")?;
+            let rgb_cam =
+                lib.get::<unsafe extern "C" fn(Ptr, i32, i32) -> f32>(b"libraw_get_rgb_cam\0")?;
+            let rgb: [f64; 3] = std::array::from_fn(|i| {
+                (0..4)
+                    .filter_map(|c| {
+                        let gain = cam_mul(raw, c) as f64;
+                        (gain.is_finite() && gain > 0.).then(|| {
+                            rgb_cam(raw, i as i32, c) as f64 * pre_mul(raw, c) as f64 / gain
+                        })
+                    })
+                    .sum()
+            });
+            let matrix = transfer::get("sRGB").unwrap().to_xyz;
+            Ok(super::WhiteBalance::from_xyz(std::array::from_fn(|i| {
+                (0..3).map(|c| matrix[i][c] * rgb[c]).sum()
+            })))
+        })()
+        .ok()
+        .flatten();
+        let white_balance = super::WhiteBalance::for_options(as_shot, options);
         check(process(raw), "process")?;
         let processed = started.elapsed();
         let mut error = 0;
@@ -146,9 +169,15 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
         let bytes = std::slice::from_raw_parts(header.data.as_ptr(), header.data_size as usize);
         let mut pixels = ImageBuf::new(header.width as u32, header.height as u32);
         copy_bitmap(&mut pixels, bytes, header.colors as usize);
-        if options.lens_correction {
-            super::lens::correct(&mut pixels, path, options.lens_database.as_deref())?;
-        }
+        let lens_correction = if options.lens_correction {
+            Some(super::lens::correct(
+                &mut pixels,
+                path,
+                options.lens_database.as_deref(),
+            )?)
+        } else {
+            None
+        };
         if matches!(options.white_balance.as_str(), "custom" | "tungsten") {
             let temperature = if options.white_balance == "tungsten" {
                 2850.
@@ -207,6 +236,8 @@ pub fn load(path: &Path, options: &RawOptions, lib: libloading::Library) -> Resu
             pixels,
             metadata: Metadata {
                 source_orientation,
+                lens_correction,
+                white_balance,
                 native,
                 ..Default::default()
             },

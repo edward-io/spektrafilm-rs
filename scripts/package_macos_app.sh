@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ICON_SOURCE="${ICON_SOURCE:-assets/spektrafilm-icon.jpg}"
+ICON_SOURCE="${ICON_SOURCE:-assets/spektrafilm-icon.png}"
 BUILD_TARGET_DIR="${BUILD_TARGET_DIR:-target/macos-app}"
 DIST_DIR="${DIST_DIR:-dist/spektrafilm-macos}"
 APP_NAME="${APP_NAME:-Spektrafilm}"

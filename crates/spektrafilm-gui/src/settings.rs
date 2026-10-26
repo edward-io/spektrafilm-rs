@@ -11,6 +11,7 @@ const KEY: &str = "spektrafilm-settings";
 #[serde(default)]
 pub struct AppSettings {
     pub display: project::DisplayParams,
+    pub preview_max_size: u32,
     pub tab: inspector::Tab,
     pub auto_preview: bool,
     pub gpu_export: bool,
@@ -25,6 +26,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             display: Default::default(),
+            preview_max_size: 2048,
             tab: Default::default(),
             auto_preview: true,
             gpu_export: true,
@@ -47,6 +49,7 @@ impl App {
     pub(crate) fn settings(&self) -> AppSettings {
         AppSettings {
             display: self.display.clone(),
+            preview_max_size: self.preview_max_size,
             tab: self.tab,
             auto_preview: self.auto_preview,
             gpu_export: self.gpu_export,
@@ -60,6 +63,7 @@ impl App {
 
     pub(crate) fn apply_settings(&mut self, settings: AppSettings) {
         self.display = settings.display;
+        self.preview_max_size = settings.preview_max_size;
         self.tab = settings.tab;
         self.auto_preview = settings.auto_preview;
         self.gpu_export = settings.gpu_export;
@@ -138,11 +142,59 @@ mod tests {
         let mut legacy = serde_json::to_value(app.settings()).unwrap();
         legacy.as_object_mut().unwrap().remove("export_format");
         legacy.as_object_mut().unwrap().remove("preload_radius");
+        legacy.as_object_mut().unwrap().remove("preview_max_size");
         legacy["save_options"]["jpeg_quality"] = 77.into();
         app.apply_settings(serde_json::from_value(legacy).unwrap());
         assert_eq!(app.export_format, project::ExportFormat::Jpeg);
         assert_eq!(app.save_options.jpeg_quality, 77);
         assert_eq!(app.preload_radius, preload::DEFAULT_RADIUS);
+        assert_eq!(app.preview_max_size, 2048);
+    }
+
+    #[test]
+    fn preview_preferences_survive_photo_changes_history_and_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.edit_store = Some(edits::EditStore::open(&dir.path().join("edits.sqlite")).unwrap());
+        app.display.show_border = false;
+        app.display.output_opacity = 0.65;
+        app.display.output_interpolation = "nearest".into();
+        let display = serde_json::to_value(&app.display).unwrap();
+        app.rebase_history();
+        app.preview_max_size = 3584;
+        assert!(!app.record_step(), "preview quality isn't a photo edit");
+
+        let mut legacy = app.current_edit();
+        legacy.params.settings.preview_max_size = 128;
+        legacy.params.camera.exposure_compensation_ev = 1.0;
+        let catalog = dir.path().join("test.lrcat");
+        app.edit_store
+            .as_ref()
+            .unwrap()
+            .save(&catalog, 1, &legacy, 0)
+            .unwrap();
+        app.open_photo_edit(&catalog, 1);
+        assert_eq!(
+            app.pipeline_params(Crop::FULL).settings.preview_max_size,
+            3584
+        );
+        app.open_photo_edit(&catalog, 2);
+        app.copied_edit = Some(legacy);
+        app.paste_photo_edit();
+        app.undo();
+        app.redo();
+        app.reset_photo_edit();
+        assert_eq!(app.preview_max_size, 3584);
+        assert_eq!(serde_json::to_value(&app.display).unwrap(), display);
+
+        let project = dir.path().join("legacy-project.json");
+        project::Project::default().save(&project).unwrap();
+        app.restore_project(&project, true).unwrap();
+        assert_eq!(
+            app.pipeline_params(Crop::FULL).settings.preview_max_size,
+            3584
+        );
+        assert_eq!(serde_json::to_value(&app.display).unwrap(), display);
     }
 
     #[test]
@@ -155,6 +207,7 @@ mod tests {
         let mut first = app();
         first.display.show_border = false;
         first.display.gray_18_canvas = false;
+        first.preview_max_size = 3584;
         first.tab = inspector::Tab::Print;
         first.auto_preview = false;
         first.save_options.jpeg_quality = 77;
@@ -167,6 +220,7 @@ mod tests {
         second.restore_settings(&storage, false);
         assert!(!second.display.show_border);
         assert!(!second.display.gray_18_canvas);
+        assert_eq!(second.preview_max_size, 3584);
         assert_eq!(second.tab, inspector::Tab::Print);
         assert!(!second.auto_preview);
         assert_eq!(second.save_options.jpeg_quality, 77);

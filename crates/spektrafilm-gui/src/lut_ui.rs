@@ -132,7 +132,7 @@ impl App {
                         tooltips::CONTROL_INCLUDE_DIAGNOSTIC_REPORT,
                     );
                 }
-                let available = self.export_job.is_none();
+                let available = !self.export_busy();
                 if ui
                     .add_enabled(available, egui::Button::new("Export LUT…"))
                     .on_hover_text(tooltips::CONTROL_EXPORT_LUT)
@@ -189,7 +189,7 @@ impl App {
         let paper = self.print_name.clone();
         let params = self.params.clone();
         let data = self.data_dir.clone();
-        self.start_export_job(ctx, "f64 LUT", output.clone(), move |cancel| {
+        self.start_export_job(ctx, "f64 LUT", output.clone(), move |cancel, _| {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
@@ -254,7 +254,7 @@ impl App {
             }
         };
         let data: PathBuf = self.data_dir.clone();
-        self.start_export_job(ctx, "f64 LUT bundle", output.clone(), move |cancel| {
+        self.start_export_job(ctx, "f64 LUT bundle", output.clone(), move |cancel, _| {
             run_cli(
                 Command::new(cli)
                     .env("SPEKTRAFILM_BACKEND", "cpu")

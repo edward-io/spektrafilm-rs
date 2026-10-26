@@ -14,8 +14,45 @@ const THUMBNAIL_CACHE_LIMIT: usize = 256;
 
 pub enum Action {
     Select(Photo),
+    Export(Vec<Photo>),
     Empty,
-    Close,
+}
+
+#[derive(Default)]
+struct Selection {
+    ids: HashSet<i64>,
+    anchor: Option<i64>,
+}
+
+impl Selection {
+    fn single(&mut self, id: i64) {
+        self.ids.clear();
+        self.ids.insert(id);
+        self.anchor = Some(id);
+    }
+
+    fn range(&mut self, id: i64, order: &[i64]) {
+        let Some(end) = order.iter().position(|&item| item == id) else {
+            return;
+        };
+        let start = self
+            .anchor
+            .and_then(|anchor| order.iter().position(|&item| item == anchor))
+            .or_else(|| order.iter().position(|item| self.ids.contains(item)))
+            .unwrap_or(end);
+        self.anchor = Some(order[start]);
+        self.ids = order[start.min(end)..=start.max(end)]
+            .iter()
+            .copied()
+            .collect();
+    }
+
+    fn retain(&mut self, visible: &HashSet<i64>) {
+        self.ids.retain(|id| visible.contains(id));
+        if self.anchor.is_some_and(|id| !visible.contains(&id)) {
+            self.anchor = None;
+        }
+    }
 }
 
 pub struct Browser {
@@ -30,8 +67,14 @@ pub struct Browser {
     show_notices: bool,
     visible: Vec<usize>,
     pub selected: Option<usize>,
+    selection: Selection,
     scroll_to_selected: bool,
     thumbnails: HashMap<i64, Option<egui::TextureHandle>>,
+    rendered: HashMap<i64, (String, u32)>,
+    preview_status: HashMap<i64, String>,
+    viewport: Vec<usize>,
+    /// Only read a camera preview after the edited disk cache has missed.
+    fallback_allowed: HashSet<i64>,
     thumbnail_order: VecDeque<i64>,
     thumbnail_generation: u64,
     pending_thumbnails: HashSet<i64>,
@@ -48,6 +91,77 @@ impl Drop for Browser {
 }
 
 impl Browser {
+    pub(super) fn preview_context(&self) -> (PathBuf, u64) {
+        (self.path.clone(), self.thumbnail_generation)
+    }
+
+    pub(super) fn viewport_photos(&self) -> Vec<Photo> {
+        self.catalog
+            .as_ref()
+            .map(|catalog| {
+                self.viewport
+                    .iter()
+                    .filter_map(|&i| catalog.photos.get(i).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn active_photo(&self) -> Option<Photo> {
+        self.catalog.as_ref()?.photos.get(self.selected?).cloned()
+    }
+
+    pub(super) fn rendered_key(&self, id: i64) -> Option<&str> {
+        self.rendered.get(&id).map(|(key, _)| key.as_str())
+    }
+
+    pub(super) fn allow_source_fallback(&mut self, id: i64) {
+        self.fallback_allowed.insert(id);
+    }
+
+    pub(super) fn preview_status(&mut self, id: i64, status: Option<String>) {
+        if let Some(status) = status {
+            self.preview_status.insert(id, status);
+        } else {
+            self.preview_status.remove(&id);
+        }
+    }
+
+    pub(super) fn rendered_thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        id: i64,
+        key: String,
+        quality: u32,
+        image: &image::RgbaImage,
+    ) {
+        if self
+            .rendered
+            .get(&id)
+            .is_some_and(|(old, size)| old == &key && *size > quality)
+        {
+            return;
+        }
+        let pixels = egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        );
+        let texture = if let Some(Some(texture)) = self.thumbnails.get_mut(&id) {
+            texture.set(pixels, egui::TextureOptions::LINEAR);
+            texture.clone()
+        } else {
+            ctx.load_texture(
+                format!("catalog-{id}"),
+                pixels,
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        self.store_thumbnail(id, Some(texture));
+        self.rendered.insert(id, (key, quality));
+        self.preview_status.remove(&id);
+        ctx.request_repaint();
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -69,6 +183,13 @@ impl Browser {
         });
         browser.filter();
         browser.selected = Some(selected);
+        if let Some(photo) = browser
+            .catalog
+            .as_ref()
+            .and_then(|c| c.photos.get(selected))
+        {
+            browser.selection.single(photo.id);
+        }
         browser
     }
 
@@ -115,6 +236,15 @@ impl Browser {
     }
 
     fn cache_thumbnail(&mut self, id: i64, texture: Option<egui::TextureHandle>) {
+        // Late camera previews must never replace an edited preview, even while stale.
+        if self.rendered.contains_key(&id) {
+            return;
+        }
+        self.store_thumbnail(id, texture);
+    }
+
+    fn store_thumbnail(&mut self, id: i64, texture: Option<egui::TextureHandle>) {
+        self.fallback_allowed.remove(&id);
         if texture.is_none() && self.thumbnails.get(&id).is_some_and(Option::is_some) {
             return;
         }
@@ -124,6 +254,8 @@ impl Browser {
         if self.thumbnail_order.len() > THUMBNAIL_CACHE_LIMIT {
             let oldest = self.thumbnail_order.pop_front().unwrap();
             self.thumbnails.remove(&oldest);
+            self.rendered.remove(&oldest);
+            self.preview_status.remove(&oldest);
         }
     }
 
@@ -161,8 +293,13 @@ impl Browser {
             show_notices: false,
             visible: Vec::new(),
             selected: None,
+            selection: Selection::default(),
             scroll_to_selected: false,
             thumbnails: HashMap::new(),
+            rendered: HashMap::new(),
+            preview_status: HashMap::new(),
+            viewport: Vec::new(),
+            fallback_allowed: HashSet::new(),
             thumbnail_order: VecDeque::new(),
             thumbnail_generation: 0,
             pending_thumbnails: HashSet::new(),
@@ -209,13 +346,31 @@ impl Browser {
                     .collect()
             })
             .unwrap_or_default();
+        let visible = self
+            .catalog
+            .as_ref()
+            .map(|catalog| self.visible.iter().map(|&i| catalog.photos[i].id).collect())
+            .unwrap_or_default();
+        self.selection.retain(&visible);
     }
 
     fn select(&mut self, position: usize) -> Option<Action> {
         let index = *self.visible.get(position)?;
+        self.selection
+            .single(self.catalog.as_ref()?.photos[index].id);
+        self.activate(position)
+    }
+
+    fn activate(&mut self, position: usize) -> Option<Action> {
+        let index = *self.visible.get(position)?;
         self.selected = Some(index);
         self.scroll_to_selected = true;
         Some(Action::Select(self.catalog.as_ref()?.photos[index].clone()))
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selection = Selection::default();
     }
 
     pub(super) fn preload_photos(&self, radius: u8) -> Vec<Photo> {
@@ -256,9 +411,10 @@ impl Browser {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        preload_radius: &mut u8,
+        export_ready: bool,
     ) -> Option<Action> {
         let mut action = None;
+        self.viewport.clear();
         if let Some(rx) = &self.loading {
             match rx.try_recv() {
                 Ok(result) => {
@@ -267,9 +423,19 @@ impl Browser {
                         Ok(catalog) => {
                             // A refresh can change paths/orientation and must retry failed reads.
                             self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
-                            self.thumbnails.clear();
-                            self.thumbnail_order.clear();
+                            let ids: HashSet<_> = catalog.photos.iter().map(|p| p.id).collect();
+                            self.rendered.retain(|id, _| ids.contains(id));
+                            self.thumbnails
+                                .retain(|id, _| self.rendered.contains_key(id));
+                            self.thumbnail_order
+                                .retain(|id| self.thumbnails.contains_key(id));
+                            self.preview_status.clear();
+                            for &id in self.rendered.keys() {
+                                self.preview_status
+                                    .insert(id, "Checking edited preview…".into());
+                            }
                             self.pending_thumbnails.clear();
+                            self.fallback_allowed.clear();
                             let selected_id = self
                                 .selected
                                 .and_then(|i| self.catalog.as_ref()?.photos.get(i))
@@ -282,7 +448,12 @@ impl Browser {
                                 .selected
                                 .and_then(|index| self.visible.iter().position(|i| *i == index))
                                 .unwrap_or(0);
-                            action = self.select(position).or(Some(Action::Empty));
+                            action = if self.selection.ids.is_empty() {
+                                self.select(position)
+                            } else {
+                                self.activate(position)
+                            }
+                            .or(Some(Action::Empty));
                         }
                         Err(error) => self.error = Some(error),
                     }
@@ -313,7 +484,7 @@ impl Browser {
                 }),
             );
         }
-        // ── Header: catalog name, refresh, close ────────────────────────
+        // ── Header: catalog name and refresh ───────────────────────────
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
@@ -323,29 +494,15 @@ impl Browser {
             .on_hover_text(self.path.display().to_string());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("×")
-                    .on_hover_text("Close the catalog")
-                    .clicked()
-                {
-                    action = Some(Action::Close);
-                }
-                if ui
                     .add_enabled(self.loading.is_none(), egui::Button::new("⟳").small())
                     .on_hover_text("Re-read the catalog, e.g. after reconnecting a drive")
                     .clicked()
                 {
                     self.refresh(ctx);
                 }
-                ui.menu_button(RichText::new(icons::GEAR_SIX).font(icons::font(13.0)), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Preload each side").on_hover_text("Decode this many RAWs ahead and behind in the current filter. Zero disables preloading. Neighbours use up to 2 GiB of memory.");
-                        ui.add(egui::DragValue::new(preload_radius).range(0..=8).speed(0.1));
-                    });
-                })
-                .response
-                .on_hover_text("Catalog settings");
             });
         });
+        let export_ready = export_ready && self.loading.is_none();
         let catalog_stats = self.catalog.as_ref().map(|catalog| {
             let picks = catalog
                 .photos
@@ -356,16 +513,6 @@ impl Browser {
             let unavailable = catalog.photos.len() - available;
             (available, picks, unavailable)
         });
-        ui.label(
-            RichText::new(match catalog_stats {
-                Some((available, _, _)) => {
-                    format!("Lightroom Classic · {available} photos · read-only")
-                }
-                None => "Lightroom Classic · read-only".into(),
-            })
-            .small()
-            .color(theme::TEXT_WEAK),
-        );
         ui.add_space(4.0);
 
         // ── Filter ──────────────────────────────────────────────────────
@@ -393,7 +540,21 @@ impl Browser {
                 self.filter();
                 if !self.selected.is_some_and(|i| self.visible.contains(&i)) {
                     self.selected = None;
-                    action = self.select(0).or(Some(Action::Empty));
+                    let position = self
+                        .catalog
+                        .as_ref()
+                        .and_then(|c| {
+                            self.visible
+                                .iter()
+                                .position(|&i| self.selection.ids.contains(&c.photos[i].id))
+                        })
+                        .unwrap_or(0);
+                    action = if self.selection.ids.is_empty() {
+                        self.select(position)
+                    } else {
+                        self.activate(position)
+                    }
+                    .or(Some(Action::Empty));
                 }
             }
         }
@@ -514,12 +675,16 @@ impl Browser {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     let weak = |s: String| RichText::new(s).small().color(theme::TEXT_WEAK);
-                    ui.label(weak(match position {
-                        Some(p) => format!("{} of {}", p + 1, self.visible.len()),
-                        None => format!("{} photos", self.visible.len()),
+                    ui.label(weak(if self.selection.ids.len() > 1 {
+                        format!("{} selected", self.selection.ids.len())
+                    } else {
+                        match position {
+                            Some(p) => format!("{} of {}", p + 1, self.visible.len()),
+                            None => format!("{} photos", self.visible.len()),
+                        }
                     }));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(weak("↑ ↓ to browse".into()));
+                        ui.label(weak("Shift-click to select".into()));
                     });
                 });
             });
@@ -561,6 +726,10 @@ impl Browser {
         }
         ui.spacing_mut().item_spacing.y = gap;
         scroll.show_rows(ui, row_height, self.visible.len(), |ui, range| {
+            self.viewport = range
+                .clone()
+                .map(|position| self.visible[position])
+                .collect();
             for position in range {
                 let index = self.visible[position];
                 let photo = &catalog.photos[index];
@@ -568,7 +737,9 @@ impl Browser {
                     // Keep on-screen images ahead of older cached thumbnails.
                     self.thumbnail_order.retain(|cached| *cached != photo.id);
                     self.thumbnail_order.push_back(photo.id);
-                } else if !self.pending_thumbnails.contains(&photo.id) {
+                } else if !self.pending_thumbnails.contains(&photo.id)
+                    && self.fallback_allowed.contains(&photo.id)
+                {
                     let orientation = photo.geometry.as_ref().map(|g| g.orientation).unwrap_or(1);
                     if self
                         .thumbnail_tx
@@ -591,14 +762,51 @@ impl Browser {
                     frame,
                     caption_height,
                     self.selected == Some(index),
+                    self.selection.ids.contains(&photo.id),
                     self.edited.contains(&photo.id),
+                    self.preview_status.get(&photo.id).map(String::as_str),
                 );
-                if let Some(error) = file_menu::show(&response, &photo.path) {
+                if response.secondary_clicked() && !self.selection.ids.contains(&photo.id) {
+                    self.selection.single(photo.id);
+                    next_position = Some(position);
+                }
+                if let Some(error) = file_menu::show_with(&response, &photo.path, |ui| {
+                    let count = self.selection.ids.len();
+                    let label = if count == 1 {
+                        "Export image…".to_owned()
+                    } else {
+                        format!("Export {count} images…")
+                    };
+                    if ui
+                        .add_enabled(export_ready && count > 0, egui::Button::new(label))
+                        .on_disabled_hover_text(
+                            "Finish the crop or image reload, and wait for the current export.",
+                        )
+                        .clicked()
+                    {
+                        let photos = self
+                            .visible
+                            .iter()
+                            .map(|&i| &catalog.photos[i])
+                            .filter(|p| self.selection.ids.contains(&p.id))
+                            .cloned()
+                            .collect();
+                        action = Some(Action::Export(photos));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }) {
                     self.error = Some(error);
                 }
                 if response.clicked() {
                     response.surrender_focus();
-                    next_position = Some(position);
+                    if ctx.input(|i| i.modifiers.shift) {
+                        let order: Vec<_> =
+                            self.visible.iter().map(|&i| catalog.photos[i].id).collect();
+                        self.selection.range(photo.id, &order);
+                    } else {
+                        next_position = Some(position);
+                    }
                 }
             }
         });
@@ -626,8 +834,10 @@ fn thumbnail_cell(
     texture: Option<&egui::TextureHandle>,
     frame_size: egui::Vec2,
     caption_height: f32,
+    active: bool,
     selected: bool,
     edited: bool,
+    preview_status: Option<&str>,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         frame_size + egui::vec2(0.0, caption_height),
@@ -641,13 +851,18 @@ fn thumbnail_cell(
     if edited {
         hover += "\nEdited in Spektrafilm";
     }
+    if let Some(status) = preview_status {
+        hover += &format!("\n{status}");
+    }
     let response = response.on_hover_text(hover);
     if !ui.is_rect_visible(rect) {
         return response;
     }
     let painter = ui.painter();
     let frame = egui::Rect::from_min_size(rect.min, frame_size);
-    let fill = if response.hovered() {
+    let fill = if selected {
+        theme::ACCENT.gamma_multiply(0.35)
+    } else if response.hovered() {
         egui::Color32::from_gray(44)
     } else {
         theme::WELL
@@ -680,10 +895,20 @@ fn thumbnail_cell(
         }
     }
     if selected {
+        painter.rect_filled(inner, 2.0, theme::ACCENT.gamma_multiply(0.12));
+    }
+    if active || selected {
         painter.rect_stroke(
             frame,
             4.0,
-            egui::Stroke::new(2.0, theme::ACCENT),
+            egui::Stroke::new(
+                if active { 3.0 } else { 1.0 },
+                if active {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_WEAK
+                },
+            ),
             egui::StrokeKind::Inside,
         );
     }
@@ -709,6 +934,13 @@ fn thumbnail_cell(
             4.5,
             theme::ACCENT,
             egui::Stroke::new(1.5, egui::Color32::from_black_alpha(160)),
+        );
+    }
+    if preview_status.is_some() {
+        painter.circle_stroke(
+            frame.left_bottom() + egui::vec2(10., -10.),
+            4.,
+            egui::Stroke::new(1.5, theme::ACCENT),
         );
     }
     if !photo.copy_name.is_empty() {
@@ -742,6 +974,172 @@ fn thumbnail_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_keep_the_anchor_and_follow_filtered_order() {
+        let mut selection = Selection::default();
+        let order = [90, 7, 23, 4, 51];
+        selection.single(7);
+        selection.range(51, &order);
+        assert_eq!(selection.ids, HashSet::from([7, 23, 4, 51]));
+        selection.range(23, &order);
+        assert_eq!(selection.ids, HashSet::from([7, 23]));
+        selection.range(90, &order);
+        assert_eq!(selection.ids, HashSet::from([90, 7]));
+        selection.retain(&HashSet::from([90, 23, 51]));
+        assert_eq!(selection.ids, HashSet::from([90]));
+        selection.range(51, &[90, 23, 51]);
+        assert_eq!(selection.ids, HashSet::from([90, 23, 51]));
+        selection.retain(&HashSet::new());
+        selection.range(23, &order);
+        assert_eq!(selection.ids, HashSet::from([23]));
+    }
+
+    #[test]
+    fn shift_click_and_context_menu_export_a_range_without_opening_its_raws() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut browser = Browser::test_catalog(
+            "/test.lrcat".into(),
+            photos(6),
+            0,
+            &ctx,
+            &Scheduler::default(),
+        );
+        let frame = |browser: &mut Browser, events, modifiers| {
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(270., 1800.),
+                    )),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = browser.show(ui, ctx, true);
+                    });
+                },
+            );
+            (output, action)
+        };
+        let click = |position, button, modifiers| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button,
+                    pressed: false,
+                    modifiers,
+                },
+            ]
+        };
+        let (output, _) = frame(&mut browser, vec![], egui::Modifiers::NONE);
+        let caption = |output: &egui::FullOutput, name: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == name => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let third = caption(&output, "DSC_0003.ARW");
+        let (_, action) = frame(
+            &mut browser,
+            click(third, egui::PointerButton::Primary, egui::Modifiers::SHIFT),
+            egui::Modifiers::SHIFT,
+        );
+        assert!(action.is_none(), "range selection must not open a RAW");
+        assert_eq!(browser.selected, Some(0));
+        assert_eq!(browser.selection.ids, HashSet::from([0, 1, 2, 3]));
+        frame(
+            &mut browser,
+            click(third, egui::PointerButton::Secondary, egui::Modifiers::NONE),
+            egui::Modifiers::NONE,
+        );
+        let (menu, _) = frame(&mut browser, vec![], egui::Modifiers::NONE);
+        assert_eq!(
+            browser.selection.ids.len(),
+            4,
+            "right-click discarded the range"
+        );
+        let export = caption(&menu, "Export 4 images…");
+        let (_, action) = frame(
+            &mut browser,
+            click(export, egui::PointerButton::Primary, egui::Modifiers::NONE),
+            egui::Modifiers::NONE,
+        );
+        let Some(Action::Export(photos)) = action else {
+            panic!("missing export action")
+        };
+        assert_eq!(
+            photos.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(browser.selected, Some(0));
+        let (output, _) = frame(&mut browser, vec![], egui::Modifiers::NONE);
+        let fifth = caption(&output, "DSC_0005.ARW");
+        let (_, action) = frame(
+            &mut browser,
+            click(fifth, egui::PointerButton::Secondary, egui::Modifiers::NONE),
+            egui::Modifiers::NONE,
+        );
+        assert!(matches!(action, Some(Action::Select(photo)) if photo.id == 5));
+        assert_eq!(browser.selection.ids, HashSet::from([5]));
+    }
+
+    #[test]
+    fn edited_previews_keep_their_texture_and_cannot_be_replaced_by_camera_results() {
+        let ctx = egui::Context::default();
+        let mut browser = Browser::test_catalog(
+            "/test.lrcat".into(),
+            photos(THUMBNAIL_CACHE_LIMIT + 1),
+            0,
+            &ctx,
+            &Scheduler::default(),
+        );
+        let original = image::RgbaImage::new(16, 10);
+        browser.rendered_thumbnail(&ctx, 0, "original".into(), 2048, &original);
+        let texture = browser.thumbnails[&0].as_ref().unwrap().id();
+        browser.preview_status(0, Some("Updating edited preview…".into()));
+        browser.cache_thumbnail(0, None);
+        browser.cache_thumbnail(
+            0,
+            Some(ctx.load_texture(
+                "late camera result",
+                egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            )),
+        );
+        assert_eq!(browser.thumbnails[&0].as_ref().unwrap().id(), texture);
+        assert!(browser.preview_status.contains_key(&0));
+        let cropped = image::RgbaImage::new(8, 10);
+        browser.rendered_thumbnail(&ctx, 0, "cropped".into(), 2048, &cropped);
+        browser.rendered_thumbnail(&ctx, 0, "cropped".into(), 640, &original);
+        let current = browser.thumbnails[&0].as_ref().unwrap();
+        assert_eq!(current.id(), texture);
+        assert_eq!(current.size(), [8, 10]);
+        assert!(!browser.preview_status.contains_key(&0));
+        for id in 1..=THUMBNAIL_CACHE_LIMIT as i64 {
+            browser.rendered_thumbnail(&ctx, id, "current".into(), 2048, &original);
+        }
+        assert_eq!(browser.rendered.len(), THUMBNAIL_CACHE_LIMIT);
+        assert_eq!(browser.thumbnails.len(), THUMBNAIL_CACHE_LIMIT);
+        assert!(!browser.rendered.contains_key(&0));
+    }
 
     fn photos(count: usize) -> Vec<Photo> {
         (0..count)
@@ -822,7 +1220,7 @@ mod tests {
                 |ctx| {
                     egui::SidePanel::left("catalog")
                         .exact_width(width)
-                        .show(ctx, |ui| browser.show(ui, ctx, &mut 0));
+                        .show(ctx, |ui| browser.show(ui, ctx, true));
                 },
             );
             assert_eq!(
@@ -866,6 +1264,7 @@ mod tests {
             )),
         );
         browser.cache_thumbnail(1, None);
+        browser.selection.range(1, &[0, 1]);
         browser.pending_thumbnails.insert(0);
         let generation = browser.thumbnail_generation;
         let (tx, rx) = mpsc::channel();
@@ -873,6 +1272,7 @@ mod tests {
         let mut updated = photos(2);
         updated[0].geometry.as_mut().unwrap().orientation = 6;
         updated[0].path = "/moved/photo.ARW".into();
+        updated.swap(0, 1);
         tx.send(Ok(Catalog {
             path: browser.path.clone(),
             photos: updated,
@@ -884,11 +1284,21 @@ mod tests {
             .unwrap();
         results_tx.send((generation, 1, None)).unwrap();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| browser.show(ui, ctx, &mut 0));
+            egui::CentralPanel::default().show(ctx, |ui| browser.show(ui, ctx, true));
         });
         assert_eq!(browser.thumbnail_generation, generation + 1);
+        assert_eq!(browser.selected, Some(1));
+        assert_eq!(browser.selection.ids, HashSet::from([0, 1]));
+        assert_eq!(browser.selection.anchor, Some(0));
         assert!(browser.thumbnails.is_empty());
         assert!(browser.thumbnail_order.is_empty());
+        // The edited disk cache gets the first chance after a refresh.
+        assert!(requests_rx.try_recv().is_err());
+        browser.allow_source_fallback(0);
+        browser.allow_source_fallback(1);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| browser.show(ui, ctx, true));
+        });
         let requests: Vec<_> = requests_rx.try_iter().collect();
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|(g, _, _, _)| *g == generation + 1));
@@ -988,7 +1398,7 @@ mod tests {
                     |ctx| {
                         panel_width = egui::SidePanel::left("catalog")
                             .exact_width(width)
-                            .show(ctx, |ui| browser.show(ui, ctx, &mut 2))
+                            .show(ctx, |ui| browser.show(ui, ctx, true))
                             .response
                             .rect
                             .width();
