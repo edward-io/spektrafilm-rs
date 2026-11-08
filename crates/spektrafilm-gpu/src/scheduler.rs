@@ -2,16 +2,14 @@
 //! decoding can overlap rendering. GPU stages keep their buffers while yielding.
 //!
 //! Foreground work (drag frames, then refine renders and photo decodes) has its
-//! own CPU slots, so it never waits behind background work. Background work also
-//! runs its parallel loops in a smaller, lower-priority thread pool (see
-//! [`Task::run`]) so it doesn't take cores from the foreground once admitted.
+//! own CPU slots, so its admission never waits behind background work.
 use std::{
     cell::RefCell,
     collections::BTreeSet,
     marker::PhantomData,
     rc::Rc,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -108,57 +106,13 @@ impl Task {
         }
     }
 
-    /// Run `f` inside the task. Background work runs on the low-priority
-    /// thread pool, so its parallel loops use those threads instead of the
-    /// global pool the foreground uses.
-    pub fn run<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
-        let run = || {
-            let _scope = self.enter();
-            f()
-        };
-        if self.priority.is_foreground() {
-            run()
-        } else {
-            background_pool().install(run)
-        }
+    /// Run on the caller's thread. A Rayon worker waiting for a parallel loop
+    /// can steal another job, so blocking for admission there can deadlock the loop.
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _scope = self.enter();
+        f()
     }
 }
-
-/// Fewer threads than cores, at a lower OS priority where available (on macOS
-/// the utility QoS class, which also keeps it off the performance cores the
-/// UI and foreground renders want).
-fn background_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let threads = if cfg!(target_os = "macos") {
-            cores
-        } else {
-            (cores / 2).max(1)
-        };
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("spektrafilm-background-{i}"))
-            .start_handler(|_| lower_thread_priority())
-            .build()
-            .expect("background thread pool")
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn lower_thread_priority() {
-    const QOS_CLASS_UTILITY: u32 = 0x11;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
-    }
-    // SAFETY: only changes the scheduling class of the calling thread.
-    unsafe {
-        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn lower_thread_priority() {}
 
 thread_local! {
     static CURRENT: RefCell<Option<Task>> = const { RefCell::new(None) };
@@ -563,20 +517,51 @@ mod tests {
     }
 
     #[test]
-    fn background_tasks_run_on_the_background_pool() {
+    fn queued_export_does_not_block_background_compute() {
         let scheduler = Scheduler::default();
-        let task = scheduler.task(Priority::Export);
-        let name = task.run(|| {
-            assert!(cpu_permit().unwrap().is_some(), "task is entered");
-            std::thread::current().name().map(str::to_owned)
+        let background = scheduler.task(Priority::Background);
+        let export = scheduler.task(Priority::Export);
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            background.run(move || {
+                let _cpu = cpu_permit().unwrap().expect("task context is set");
+                holding_tx.send(()).unwrap();
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    finish_rx.recv_timeout(Duration::from_millis(1))
+                {
+                    // Like a parallel image loop at a join, this can pick up queued Rayon work.
+                    rayon::yield_now();
+                }
+            });
         });
-        assert!(name.unwrap().starts_with("spektrafilm-background"));
-        let foreground = scheduler.task(Priority::Interactive);
-        let name = foreground.run(|| std::thread::current().name().map(str::to_owned));
-        assert!(
-            !name
-                .unwrap_or_default()
-                .starts_with("spektrafilm-background")
-        );
+        holding_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let task = export.clone();
+        let worker = thread::spawn(move || {
+            let result = task.run(|| task.cpu().map(drop));
+            done_tx.send(result).unwrap();
+        });
+        waiting(&scheduler.cpu, 1);
+        finish_tx.send(()).unwrap();
+
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            export.cancel();
+        }
+        holder.join().unwrap();
+        worker.join().unwrap();
+        result
+            .expect("export deadlocked with the background task")
+            .unwrap();
+    }
+
+    #[test]
+    fn background_tasks_stay_on_the_calling_thread() {
+        let scheduler = Scheduler::default();
+        let caller = thread::current().id();
+        let task = scheduler.task(Priority::Export);
+        assert_eq!(task.run(|| thread::current().id()), caller);
     }
 }

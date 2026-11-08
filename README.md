@@ -52,6 +52,9 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 
 #### 2026-11-08
 
+- **Photo exports** no longer hang waiting for a CPU slot when catalog
+  thumbnails or photo preloads run at the same time. Foreground and
+  background image processing now share Rayon's worker pool.
 - **Clipped RAW highlights** in rawler's RGB Bayer path are now handled before
   demosaicing. The cap fades in when all four white-balanced samples in a
   Bayer cell approach a shared ceiling, reducing magenta in blown highlights
