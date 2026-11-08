@@ -91,7 +91,7 @@ impl Spec {
         let mut raw = self.edit.raw.clone();
         raw.lightroom_geometry = raw.lightroom_geometry.map(|g| g.orientation_only());
         serde_json::json!({
-            "version":1,"build":self.build,"source":self.path,"stamp":frame.stamp,
+            "version":2,"build":self.build,"source":self.path,"stamp":frame.stamp,
             "size":frame.size,"film":self.edit.film,"paper":self.edit.paper,
             "params":params,"raw":raw,"rotation":self.edit.rotation,"crop":crop,
             "profiles":preview_pipeline_cache_key(&self.data,&self.edit.film,&self.edit.paper,&params),
@@ -122,7 +122,13 @@ pub(super) fn shrink(preview: &PreviewTextureData) -> image::RgbaImage {
         preview.rgba.as_slice(),
     )
     .expect("valid preview dimensions");
-    image::imageops::thumbnail(&image, THUMBNAIL_PX, THUMBNAIL_PX)
+    let (width, height) = image.dimensions();
+    let scale = (THUMBNAIL_PX as f32 / width.max(height) as f32).min(1.);
+    image::imageops::thumbnail(
+        &image,
+        (width as f32 * scale).round().max(1.) as u32,
+        (height as f32 * scale).round().max(1.) as u32,
+    )
 }
 
 struct Probe {
@@ -1160,6 +1166,22 @@ impl DiskCache {
 mod tests {
     use super::*;
     use spektrafilm_io::lightroom::{Geometry, Photo};
+
+    #[test]
+    fn shrink_preserves_preview_proportions_without_enlarging_small_images() {
+        for (size, expected) in [
+            ([400, 250], (160, 100)),
+            ([250, 400], (100, 160)),
+            ([400, 1], (160, 1)),
+            ([40, 25], (40, 25)),
+        ] {
+            let preview = PreviewTextureData {
+                size,
+                rgba: vec![255; size[0] * size[1] * 4],
+            };
+            assert_eq!(shrink(&preview).dimensions(), expected);
+        }
+    }
 
     fn fixture(dir: &Path, id: i64) -> Rendered {
         let path = dir.join("original.png");

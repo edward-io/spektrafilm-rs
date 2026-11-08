@@ -6,6 +6,7 @@ mod lens;
 mod lens_api;
 pub mod lens_database;
 pub mod lightroom;
+mod raw_develop;
 mod raw_libraw;
 mod white_balance;
 mod xmp;
@@ -383,7 +384,6 @@ pub(crate) fn identify_icc(profile: &[u8]) -> Option<(&'static str, bool)> {
 }
 
 fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
-    use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
     let mut raw = rawler::decode_file(path).map_err(|e| anyhow::anyhow!("RAW decode: {e:?}"))?;
     if !["camera", "as_shot", "daylight", "tungsten", "custom"]
         .contains(&options.white_balance.as_str())
@@ -411,32 +411,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         };
         planckian_white_balance(&mut raw, temperature)?;
     }
-    let mut dev = RawDevelop::default();
-    dev.steps.retain(|s| !matches!(s, ProcessingStep::SRgb));
-    let developed = dev
-        .develop_intermediate(&raw)
-        .map_err(|e| anyhow::anyhow!("RAW develop: {e:?}"))?;
-    let (w, h, data) = match developed {
-        Intermediate::Monochrome(p) => (
-            p.width,
-            p.height,
-            p.data.into_iter().flat_map(|v| [v; 3]).collect::<Vec<_>>(),
-        ),
-        Intermediate::ThreeColor(p) => (p.width, p.height, p.data.into_flattened()),
-        Intermediate::FourColor(p) => (
-            p.width,
-            p.height,
-            p.data
-                .into_iter()
-                .flat_map(|v| [v[0], v[1], v[2]])
-                .collect(),
-        ),
-    };
-    let mut pixels = ImageBuf::from_data(
-        w as u32,
-        h as u32,
-        data.into_iter().map(|v| from_f64(v as f64)).collect(),
-    );
+    let mut pixels = raw_develop::develop(&raw)?;
     if options.white_balance == "custom" && options.tint != 1. {
         for p in pixels.data.chunks_exact_mut(3) {
             p[1] *= from_f64(options.tint);

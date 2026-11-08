@@ -50,6 +50,16 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 
 ### Unreleased
 
+#### 2026-11-07
+
+- **Photo reel thumbnails** now preserve the edited image's aspect ratio,
+  including after cropping or rotation. Previously stretched thumbnails are
+  regenerated as needed.
+- **RAW highlights** retain their color and gradation when developed with
+  rawler. Spektrafilm preserves scene-linear values above white during camera
+  calibration, preventing abrupt desaturation and pale patches on bright
+  colored objects.
+
 #### 2026-10-26
 
 - **Exposure controls:** added Print auto compensation beside EV compensation,
