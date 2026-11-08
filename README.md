@@ -50,6 +50,13 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 
 ### Unreleased
 
+#### 2026-11-08
+
+- **Clipped RAW highlights** in rawler's RGB Bayer path are now handled before
+  demosaicing. The cap fades in when all four white-balanced samples in a
+  Bayer cell approach a shared ceiling, reducing magenta in blown highlights
+  while preserving bright colors whose weaker channels still have headroom.
+
 #### 2026-11-07
 
 - **Photo reel thumbnails** now preserve the edited image's aspect ratio,

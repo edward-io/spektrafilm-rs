@@ -411,7 +411,7 @@ fn load_raw(path: &Path, options: &RawOptions) -> Result<LoadedImage> {
         };
         planckian_white_balance(&mut raw, temperature)?;
     }
-    let mut pixels = raw_develop::develop(&raw)?;
+    let mut pixels = raw_develop::develop(&mut raw)?;
     if options.white_balance == "custom" && options.tint != 1. {
         for p in pixels.data.chunks_exact_mut(3) {
             p[1] *= from_f64(options.tint);
