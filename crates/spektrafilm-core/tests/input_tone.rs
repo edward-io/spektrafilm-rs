@@ -69,6 +69,50 @@ fn difference(a: &ImageBuf, b: &ImageBuf) -> f64 {
 }
 
 #[test]
+fn chroma_noise_reduction_runs_on_input_and_is_spatial_only() {
+    let old: RuntimeParams =
+        serde_json::from_value(serde_json::json!({"camera": {"auto_exposure":false}})).unwrap();
+    assert_eq!(old.camera.chroma_noise_reduction, 0.);
+    let mut p = params();
+    p.debug.deactivate_spatial_effects = false;
+    p.io.input_color_space = "sRGB".into();
+    p.io.input_cctf_decoding = false;
+    p.taps.collect = Some("rgb_pre".into());
+    let input = ImageBuf::from_data(
+        40,
+        40,
+        (0..1600)
+            .flat_map(|i| {
+                let noise = if (i % 40 + i / 40) % 2 == 0 {
+                    0.027
+                } else {
+                    -0.027
+                };
+                [0.15 + noise, 0.12, 0.10 - noise].map(from_f64)
+            })
+            .collect(),
+    );
+    let pipeline = build("kodak_gold_200", p.clone());
+    let run = |p| {
+        pipeline
+            .clone()
+            .with_params(p)
+            .process(input.clone(), &CpuBackend)
+    };
+
+    assert_eq!(run(p.clone()).data, input.data);
+    p.camera.chroma_noise_reduction = 100.;
+    assert!(difference(&run(p.clone()), &input) > 0.02);
+    p.debug.lut_mode = true;
+    assert_eq!(run(p.clone()).data, input.data);
+    p.debug.lut_mode = false;
+    p.debug.deactivate_spatial_effects = true;
+    assert_eq!(run(p.clone()).data, input.data);
+    p.camera.chroma_noise_reduction = 101.;
+    assert!(p.validate().unwrap_err().contains("chroma noise reduction"));
+}
+
+#[test]
 fn tone_defaults_partial_settings_and_validation() {
     let old: RuntimeParams =
         serde_json::from_value(serde_json::json!({"camera": {"auto_exposure":false}})).unwrap();

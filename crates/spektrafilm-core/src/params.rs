@@ -101,6 +101,8 @@ pub struct CameraParams {
     pub exposure_compensation_ev: f32,
     #[serde(default)]
     pub tone: ToneParams,
+    #[serde(default)]
+    pub chroma_noise_reduction: f32,
     #[serde(default = "default_true")]
     pub auto_exposure: bool,
     #[serde(default = "default_center_weighted")]
@@ -123,6 +125,7 @@ impl Default for CameraParams {
             color_filter: default_none_filter(),
             exposure_compensation_ev: 0.0,
             tone: ToneParams::default(),
+            chroma_noise_reduction: 0.,
             auto_exposure: true,
             auto_exposure_method: "center_weighted".into(),
             lens_blur_um: 0.0,

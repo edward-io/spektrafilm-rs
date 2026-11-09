@@ -50,6 +50,16 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 
 ### Unreleased
 
+#### 2026-11-09
+
+- **Chroma noise reduction:** a 0–100 slider under Input → Detail reduces color
+  speckles and blotches before film simulation while preserving luminance and
+  protecting color edges. It defaults to off and is saved with each photo for
+  previews, edited thumbnails, and exports.
+- **Denoising previews** use more CPU workers and skip the expensive filter
+  passes on tiles that need no cleanup. The editor reuses the filtered preview
+  when the slider moves, so later adjustments only blend the result.
+
 #### 2026-11-08
 
 - **Photo exports** no longer hang waiting for a CPU slot when catalog

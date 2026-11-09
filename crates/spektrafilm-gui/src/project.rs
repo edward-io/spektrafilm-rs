@@ -230,6 +230,7 @@ mod tests {
             std::env::temp_dir().join(format!("spektrafilm-project-{}.json", std::process::id()));
         let mut p = Project::default();
         p.params.camera.exposure_compensation_ev = 1.5;
+        p.params.camera.chroma_noise_reduction = 45.;
         p.params.camera.tone = spektrafilm_core::params::ToneParams {
             highlights: -65.,
             shadows: 80.,
@@ -249,6 +250,7 @@ mod tests {
         p.save(&path).unwrap();
         let loaded = Project::load(&path).unwrap();
         assert_eq!(loaded.params.camera.exposure_compensation_ev, 1.5);
+        assert_eq!(loaded.params.camera.chroma_noise_reduction, 45.);
         assert_eq!(loaded.params.camera.tone.values(), [80., -65., 25., -15.]);
         assert_eq!(loaded.raw.tint, 12.);
         assert!(!loaded.gpu_export);

@@ -572,6 +572,7 @@ pub const CONTROL_EV_COMPENSATION: &str =
 pub const CONTROL_PRINT_AUTO_COMPENSATION: &str = "Automatically adjust print exposure to counteract manual EV compensation, keeping middle gray near the same brightness while film contrast and color can change. Turn off to let manual EV brighten or darken the print. Does not compensate for Auto exposure. Only used when the workflow includes printing.";
 pub const SECTION_TONE: &str =
     "Balance the photograph's tonal ranges after exposure and before film simulation.";
+pub const CONTROL_CHROMA_NOISE_REDUCTION: &str = "Reduce color speckles and blotches before film exposure while preserving brightness detail. Zero turns it off.";
 pub const CONTROL_HIGHLIGHTS: &str = "Darken or brighten highlight detail before film exposure. Negative values restrain bright detail; the brightest tail is controlled by Whites.";
 pub const CONTROL_SHADOWS: &str =
     "Lift or deepen shadow detail before film exposure, keeping middle gray and true black fixed.";

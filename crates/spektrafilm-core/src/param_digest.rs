@@ -11,6 +11,9 @@ impl RuntimeParams {
         {
             return Err("input tone controls must be finite and between -100 and 100".into());
         }
+        if !(0. ..=100.).contains(&self.camera.chroma_noise_reduction) {
+            return Err("chroma noise reduction must be finite and between 0 and 100".into());
+        }
         spektrafilm_math::illuminants::get(&self.enlarger.illuminant)?;
         spektrafilm_math::illuminants::get(&self.film_render.convert.scan_illuminant)?;
         crate::spectral_service::taking_filter(&self.camera.color_filter)?;

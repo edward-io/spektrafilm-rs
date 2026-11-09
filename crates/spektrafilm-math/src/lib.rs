@@ -1,3 +1,4 @@
+pub mod chroma;
 pub mod colorspace;
 pub mod fft_conv;
 pub mod gaussian;

@@ -29,9 +29,9 @@ mod tooltips;
 mod view;
 mod white_balance_ui;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -45,8 +45,10 @@ use spektrafilm_core::profile;
 use spektrafilm_gpu::ComputeBackend;
 use spektrafilm_gpu::scheduler::{self, Priority, Scheduler, Task};
 use spektrafilm_io::crop::Crop;
+use spektrafilm_math::chroma;
 use spektrafilm_math::image::ImageBuf;
 use spektrafilm_math::precision::to_f32;
+use spektrafilm_math::transfer::Transfer;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(40);
 const INTERACTIVE_DEBOUNCE: Duration = Duration::from_millis(16);
@@ -253,6 +255,7 @@ struct App {
     preload_radius: u8,
     catalog: Option<catalog_ui::Browser>,
     preview_input: Vec<(u32, Arc<ImageBuf>)>,
+    preview_denoise: Vec<PreviewDenoise>,
     rendered_preview_limit: u32,
     render_path: String,
     auto_preview: bool,
@@ -505,9 +508,17 @@ struct RenderJob {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct PreviewDenoise {
+    source: Weak<ImageBuf>,
+    color: ([f64; 3], Transfer),
+    full: Arc<ImageBuf>,
+}
+
 struct RenderResult {
     output: ImageBuf,
     input_preview: Arc<ImageBuf>,
+    preview_denoise: Vec<PreviewDenoise>,
     preview_limit: u32,
     path: String,
     preview: PreviewTextureData,
@@ -599,6 +610,7 @@ impl App {
             preload_radius: preload::DEFAULT_RADIUS,
             catalog: None,
             preview_input: Vec::new(),
+            preview_denoise: Vec::new(),
             rendered_preview_limit: 0,
             render_path: "Awaiting render".into(),
             auto_preview: true,
@@ -734,6 +746,7 @@ impl App {
         self.canvas_previous = None;
         self.animation = None;
         self.preview_input.clear();
+        self.preview_denoise.clear();
         self.dirty = false;
         self.pending_dirty = false;
     }
@@ -1071,6 +1084,7 @@ impl App {
                 self.canvas_previous = None;
                 self.animation = None;
                 self.preview_input.clear();
+                self.preview_denoise.clear();
                 self.preview_input.push((2048, input));
                 self.source_display_key = Some(source_key);
                 if let Some(canvas) = &self.canvas {
@@ -1288,6 +1302,7 @@ impl App {
             .find(|(limit, _)| *limit == preview_limit)
             .map(|(_, image)| image.clone())
             .unwrap_or(image);
+        let mut preview_denoise = self.preview_denoise.clone();
         let backend = self.backend.clone();
         let display_transform = self.display.display_transform;
         self.render_requested = false;
@@ -1353,13 +1368,31 @@ impl App {
                     let pipeline_build_ms = t_build.elapsed().as_secs_f32() * 1000.;
                     drop(cpu);
                     worker_task.check().map_err(|e| e.to_string())?;
+                    let t = Instant::now();
+                    let prepared = if let Some(color) = pipeline.input_denoise_color() {
+                        let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
+                        Some(denoise_preview(
+                            &image,
+                            color,
+                            pipeline.params.camera.chroma_noise_reduction / 100.,
+                            &mut preview_denoise,
+                        ))
+                    } else {
+                        None
+                    };
+                    worker_task.check().map_err(|e| e.to_string())?;
                     let cpu_render = if backend.is_gpu() {
                         None
                     } else {
                         Some(worker_task.cpu().map_err(|e| e.to_string())?)
                     };
-                    let t = Instant::now();
-                    let (output, path) = render_preview_image(&pipeline, &image, backend.as_ref());
+                    let (output, path) = if let Some(prepared) = prepared {
+                        let mut render_pipeline = pipeline.clone();
+                        render_pipeline.params.camera.chroma_noise_reduction = 0.;
+                        render_preview_image(&render_pipeline, &prepared, backend.as_ref())
+                    } else {
+                        render_preview_image(&pipeline, &image, backend.as_ref())
+                    };
                     let render_ms = t.elapsed().as_secs_f32() * 1000.0;
                     drop(cpu_render);
                     let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
@@ -1428,6 +1461,7 @@ impl App {
                     Ok(RenderResult {
                         output,
                         input_preview,
+                        preview_denoise,
                         preview_limit,
                         path,
                         preview,
@@ -1775,6 +1809,7 @@ impl App {
                 self.pipeline_cache_key = Some(r.pipeline_cache.0);
                 self.pipeline_cache = Some(r.pipeline_cache.1);
                 self.rendered_preview_limit = r.preview_limit;
+                self.preview_denoise = r.preview_denoise;
                 self.preview_input
                     .retain(|(limit, _)| *limit != r.preview_limit);
                 self.preview_input.push((r.preview_limit, r.input_preview));
@@ -2189,6 +2224,27 @@ impl App {
         const NOT_SCAN: &str = "Not used: this workflow bypasses the scanner.";
 
         self.white_balance_controls(ui);
+
+        Section::new(
+            "Detail",
+            Tab::Input,
+            tooltips::CONTROL_CHROMA_NOISE_REDUCTION,
+        )
+        .pointers(&["/camera/chroma_noise_reduction"])
+        .show(ui, |ui| {
+            if tooltips::labeled(
+                ui,
+                tooltips::slider(&mut self.params.camera.chroma_noise_reduction, 0. ..=100.)
+                    .stock(0.)
+                    .step_by(1.),
+                "Chroma noise reduction",
+                tooltips::CONTROL_CHROMA_NOISE_REDUCTION,
+            )
+            .changed()
+            {
+                self.dirty = true;
+            }
+        });
 
         // ── Exposure ────────────────────────────────────────────────────
         Section::new("Exposure", Tab::Input, tooltips::SECTION_EXPOSURE)
@@ -3936,6 +3992,43 @@ fn pick_default_stock(entries: &[ProfileEntry], preferred: &str) -> String {
             .map(|e| e.stock.clone())
             .unwrap_or_else(|| preferred.to_string())
     }
+}
+
+fn denoise_preview(
+    image: &Arc<ImageBuf>,
+    color: ([f64; 3], Transfer),
+    amount: f32,
+    cache: &mut Vec<PreviewDenoise>,
+) -> Arc<ImageBuf> {
+    // Full-resolution previews can be hundreds of MB. Retain only normal
+    // preview-sized endpoints between edits.
+    if image.pixel_count() > 4 * 1024 * 1024 {
+        return Arc::new(chroma::apply(image, color.0, color.1, amount));
+    }
+    let source = Arc::downgrade(image);
+    cache.retain(|entry| entry.source.strong_count() != 0);
+    let entry = match cache
+        .iter()
+        .position(|entry| entry.source.ptr_eq(&source) && entry.color == color)
+    {
+        Some(i) => cache.remove(i),
+        None => PreviewDenoise {
+            source,
+            color,
+            full: Arc::new(chroma::filter_full(image, color.0, color.1)),
+        },
+    };
+    let result = if amount >= 1. {
+        entry.full.clone()
+    } else {
+        Arc::new(chroma::mix(image, (*entry.full).clone(), color.1, amount))
+    };
+    // Keep the drag and refined versions for the current photo.
+    cache.push(entry);
+    if cache.len() > 2 {
+        cache.remove(0);
+    }
+    result
 }
 
 fn render_preview_image(
@@ -6128,6 +6221,25 @@ mod preview_cache_tests {
     use super::*;
 
     #[test]
+    fn denoise_endpoint_follows_input_and_color_and_ignores_slider_strength() {
+        let input = Arc::new(ImageBuf::new(12, 12));
+        let color = ([0.2126, 0.7152, 0.0722], Transfer::Linear);
+        let mut cache = Vec::new();
+        let full = denoise_preview(&input, color, 1., &mut cache);
+        denoise_preview(&input, color, 0.4, &mut cache);
+        assert!(Arc::ptr_eq(&full, &cache[0].full));
+        let encoded = denoise_preview(&input, (color.0, Transfer::Srgb), 1., &mut cache);
+        assert!(!Arc::ptr_eq(&full, &encoded));
+        let other = Arc::new(ImageBuf::new(12, 12));
+        let other_full = denoise_preview(&other, color, 1., &mut cache);
+        assert!(!Arc::ptr_eq(&full, &other_full));
+        assert_eq!(cache.len(), 2);
+        drop(input);
+        denoise_preview(&other, color, 1., &mut cache);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
     #[ignore = "requires SPEKTRAFILM_BENCH_IMAGE and local originals"]
     fn benchmark_setting_changes() {
         let path = std::env::var_os("SPEKTRAFILM_BENCH_IMAGE").expect("image path");
@@ -6151,7 +6263,8 @@ mod preview_cache_tests {
         assert!(app.image.is_some(), "{}", app.status);
         for limit in [640, 2048] {
             app.preview_max_size = limit;
-            for setting in ["exposure", "print_exposure", "halation"] {
+            app.params.camera.chroma_noise_reduction = 0.;
+            for setting in ["exposure", "print_exposure", "halation", "chroma_nr"] {
                 for step in 0..5 {
                     match setting {
                         "exposure" => app.params.camera.exposure_compensation_ev = step as f32 / 4.,
@@ -6159,6 +6272,7 @@ mod preview_cache_tests {
                             app.params.enlarger.print_exposure = 1. + step as f32 / 4.
                         }
                         "halation" => app.params.film_render.halation.boost_ev = step as f32 / 4.,
+                        "chroma_nr" => app.params.camera.chroma_noise_reduction = 25. * step as f32,
                         _ => unreachable!(),
                     }
                     let start = Instant::now();

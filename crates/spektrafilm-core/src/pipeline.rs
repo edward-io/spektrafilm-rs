@@ -605,11 +605,50 @@ impl Pipeline {
         )
     }
 
+    fn input_denoise_active(&self) -> bool {
+        self.params.camera.chroma_noise_reduction > 0.
+            && !self.params.debug.lut_mode
+            && !self.params.debug.deactivate_spatial_effects
+            && self.params.taps.collect.as_deref() != Some("rgb_in")
+            && self
+                .params
+                .taps
+                .inject
+                .as_deref()
+                .is_none_or(|tap| tap == "rgb_in")
+    }
+
+    /// Color coordinates for an active input denoise pass.
+    pub fn input_denoise_color(&self) -> Option<([f64; 3], spektrafilm_math::transfer::Transfer)> {
+        if !self.input_denoise_active() {
+            return None;
+        }
+        let color = spektrafilm_math::transfer::get(&self.params.io.input_color_space)
+            .expect("validated input color space");
+        let transfer = if self.params.io.input_cctf_decoding {
+            color.transfer
+        } else {
+            spektrafilm_math::transfer::Transfer::Linear
+        };
+        Some((color.to_xyz[1], transfer))
+    }
+
     pub fn process(&self, image: ImageBuf, backend: &dyn ComputeBackend) -> ImageBuf {
         let inject = self.params.taps.inject.as_deref().unwrap_or("rgb_in");
         let collect = self.params.taps.collect.as_deref().unwrap_or("rgb_out");
         if inject == collect {
             return image;
+        }
+        if let Some((luma, transfer)) = self.input_denoise_color() {
+            let cleaned = spektrafilm_math::chroma::apply(
+                &image,
+                luma,
+                transfer,
+                self.params.camera.chroma_noise_reduction / 100.,
+            );
+            let mut pipeline = self.clone();
+            pipeline.params.camera.chroma_noise_reduction = 0.;
+            return pipeline.process(cleaned, backend);
         }
         // Let the resident backend meter a bounded thumbnail and decode/scale
         // the original pixels on the GPU before any full-frame CPU passes.
@@ -860,7 +899,9 @@ impl Pipeline {
         image: &ImageBuf,
         backend: &dyn ComputeBackend,
     ) -> Option<ImageBuf> {
-        if self.params.route() == "input" {
+        // The shared process entry point applies input cleanup before submitting
+        // the cleaned pixels to the resident GPU pipeline.
+        if self.params.route() == "input" || self.input_denoise_active() {
             return None;
         }
         if self.tc_lut.is_none() {
