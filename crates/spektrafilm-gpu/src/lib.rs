@@ -13,6 +13,16 @@ use spektrafilm_math::image::ImageBuf;
 /// Default implementations fall back to CPU. GPU backends override the
 /// spectral methods for massive speedups.
 pub trait ComputeBackend: Send + Sync {
+    /// Full-strength input denoise for bounded editor previews.
+    fn chroma_preview(
+        &self,
+        _image: &ImageBuf,
+        _luma: [f64; 3],
+        _transfer: spektrafilm_math::transfer::Transfer,
+    ) -> Option<ImageBuf> {
+        None
+    }
+
     /// Optional display-only conversion and RGBA packing; saved pixels are untouched.
     fn display_preview(
         &self,

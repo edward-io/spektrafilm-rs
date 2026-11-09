@@ -56,6 +56,10 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
   speckles and blotches before film simulation while preserving luminance and
   protecting color edges. It defaults to off and is saved with each photo for
   previews, edited thumbnails, and exports.
+- **WGPU chroma noise reduction** speeds up the first editor preview and
+  edited thumbnail render. On an M1 Max, first 2048 px previews took
+  0.41–0.50 seconds across four RAWs. Larger previews and systems without a
+  supported GPU use the CPU filter.
 - **Denoising previews** use more CPU workers and skip the expensive filter
   passes on tiles that need no cleanup. The editor reuses the filtered preview
   when the slider moves, so later adjustments only blend the result.

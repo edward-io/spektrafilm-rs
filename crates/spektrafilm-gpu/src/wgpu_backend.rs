@@ -1,3 +1,5 @@
+#[path = "chroma_preview.rs"]
+mod chroma_preview;
 #[cfg(feature = "wgpu-backend")]
 #[path = "color_transfer.rs"]
 mod color_transfer;
@@ -1541,6 +1543,15 @@ impl GpuTurn {
 
 #[cfg(feature = "wgpu-backend")]
 impl ComputeBackend for WgpuBackend {
+    fn chroma_preview(
+        &self,
+        image: &ImageBuf,
+        luma: [f64; 3],
+        transfer: spektrafilm_math::transfer::Transfer,
+    ) -> Option<ImageBuf> {
+        WgpuBackend::chroma_preview(self, image, luma, transfer)
+    }
+
     fn display_preview(
         &self,
         image: &ImageBuf,

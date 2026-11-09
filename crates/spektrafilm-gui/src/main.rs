@@ -1370,13 +1370,17 @@ impl App {
                     worker_task.check().map_err(|e| e.to_string())?;
                     let t = Instant::now();
                     let prepared = if let Some(color) = pipeline.input_denoise_color() {
-                        let _cpu = worker_task.cpu().map_err(|e| e.to_string())?;
-                        Some(denoise_preview(
-                            &image,
-                            color,
-                            pipeline.params.camera.chroma_noise_reduction / 100.,
-                            &mut preview_denoise,
-                        ))
+                        Some(
+                            denoise_preview(
+                                &image,
+                                color,
+                                pipeline.params.camera.chroma_noise_reduction / 100.,
+                                &mut preview_denoise,
+                                backend.as_ref(),
+                                &worker_task,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        )
                     } else {
                         None
                     };
@@ -3999,11 +4003,14 @@ fn denoise_preview(
     color: ([f64; 3], Transfer),
     amount: f32,
     cache: &mut Vec<PreviewDenoise>,
-) -> Arc<ImageBuf> {
+    backend: &dyn ComputeBackend,
+    task: &Task,
+) -> Result<Arc<ImageBuf>, scheduler::Cancelled> {
     // Full-resolution previews can be hundreds of MB. Retain only normal
     // preview-sized endpoints between edits.
     if image.pixel_count() > 4 * 1024 * 1024 {
-        return Arc::new(chroma::apply(image, color.0, color.1, amount));
+        let _cpu = task.cpu()?;
+        return Ok(Arc::new(chroma::apply(image, color.0, color.1, amount)));
     }
     let source = Arc::downgrade(image);
     cache.retain(|entry| entry.source.strong_count() != 0);
@@ -4012,15 +4019,25 @@ fn denoise_preview(
         .position(|entry| entry.source.ptr_eq(&source) && entry.color == color)
     {
         Some(i) => cache.remove(i),
-        None => PreviewDenoise {
-            source,
-            color,
-            full: Arc::new(chroma::filter_full(image, color.0, color.1)),
-        },
+        None => {
+            let full = match backend.chroma_preview(image, color.0, color.1) {
+                Some(full) => full,
+                None => {
+                    let _cpu = task.cpu()?;
+                    chroma::filter_full(image, color.0, color.1)
+                }
+            };
+            PreviewDenoise {
+                source,
+                color,
+                full: Arc::new(full),
+            }
+        }
     };
     let result = if amount >= 1. {
         entry.full.clone()
     } else {
+        let _cpu = task.cpu()?;
         Arc::new(chroma::mix(image, (*entry.full).clone(), color.1, amount))
     };
     // Keep the drag and refined versions for the current photo.
@@ -4028,7 +4045,7 @@ fn denoise_preview(
     if cache.len() > 2 {
         cache.remove(0);
     }
-    result
+    Ok(result)
 }
 
 fn render_preview_image(
@@ -6225,17 +6242,29 @@ mod preview_cache_tests {
         let input = Arc::new(ImageBuf::new(12, 12));
         let color = ([0.2126, 0.7152, 0.0722], Transfer::Linear);
         let mut cache = Vec::new();
-        let full = denoise_preview(&input, color, 1., &mut cache);
-        denoise_preview(&input, color, 0.4, &mut cache);
+        let task = Scheduler::default().task(Priority::Interactive);
+        let denoise = |input: &Arc<ImageBuf>, color, amount, cache: &mut Vec<_>| {
+            denoise_preview(
+                input,
+                color,
+                amount,
+                cache,
+                &spektrafilm_gpu::cpu_backend::CpuBackend,
+                &task,
+            )
+            .unwrap()
+        };
+        let full = denoise(&input, color, 1., &mut cache);
+        denoise(&input, color, 0.4, &mut cache);
         assert!(Arc::ptr_eq(&full, &cache[0].full));
-        let encoded = denoise_preview(&input, (color.0, Transfer::Srgb), 1., &mut cache);
+        let encoded = denoise(&input, (color.0, Transfer::Srgb), 1., &mut cache);
         assert!(!Arc::ptr_eq(&full, &encoded));
         let other = Arc::new(ImageBuf::new(12, 12));
-        let other_full = denoise_preview(&other, color, 1., &mut cache);
+        let other_full = denoise(&other, color, 1., &mut cache);
         assert!(!Arc::ptr_eq(&full, &other_full));
         assert_eq!(cache.len(), 2);
         drop(input);
-        denoise_preview(&other, color, 1., &mut cache);
+        denoise(&other, color, 1., &mut cache);
         assert_eq!(cache.len(), 1);
     }
 

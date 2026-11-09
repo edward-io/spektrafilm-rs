@@ -934,9 +934,24 @@ fn render(
             &spec.edit.paper
         },
     )?;
-    let pipeline =
+    let mut pipeline =
         Pipeline::new_with_spectral(film, paper, params, &spec.data).map_err(anyhow::Error::msg)?;
     drop(cpu);
+    task.check()?;
+    let image = if let Some(color) = pipeline.input_denoise_color() {
+        let prepared = super::denoise_preview(
+            &image,
+            color,
+            pipeline.params.camera.chroma_noise_reduction / 100.,
+            &mut Vec::new(),
+            backend,
+            task,
+        )?;
+        pipeline.params.camera.chroma_noise_reduction = 0.;
+        prepared
+    } else {
+        image
+    };
     task.check()?;
     let cpu = if backend.is_gpu() {
         None
