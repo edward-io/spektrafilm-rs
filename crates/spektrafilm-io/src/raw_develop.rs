@@ -7,11 +7,9 @@ use rawler::{
         develop::{Intermediate, ProcessingStep, RawDevelop},
         matrix::{IDENTITY_MATRIX_3, multiply, normalize, pseudo_inverse},
         raw::clip_negative,
-        sensor::SensorType,
         xyz::{Illuminant, SRGB_TO_XYZ_D65},
     },
     pixarray::Color2D,
-    rawimage::{RawImageData, RawPhotometricInterpretation},
 };
 use rayon::prelude::*;
 use spektrafilm_math::{
@@ -30,8 +28,8 @@ pub(super) fn develop(raw: &mut RawImage) -> Result<ImageBuf> {
         .steps
         .retain(|step| !matches!(step, ProcessingStep::Calibrate | ProcessingStep::SRgb));
     let wb = white_balance_gains(raw);
-    let capped_before_demosaic = cap_bayer_highlights(raw, wb)?;
-    if capped_before_demosaic {
+    let reconstructed_before_demosaic = super::raw_highlights::reconstruct(raw, wb)?;
+    if reconstructed_before_demosaic {
         developer
             .steps
             .retain(|step| *step != ProcessingStep::Rescale);
@@ -48,54 +46,9 @@ pub(super) fn develop(raw: &mut RawImage) -> Result<ImageBuf> {
                 .flat_map(|v| [from_f64(v as f64); 3])
                 .collect(),
         )),
-        Intermediate::ThreeColor(p) => color(p, raw, wb, capped_before_demosaic),
-        Intermediate::FourColor(p) => color(p, raw, wb, capped_before_demosaic),
+        Intermediate::ThreeColor(p) => color(p, raw, wb, reconstructed_before_demosaic),
+        Intermediate::FourColor(p) => color(p, raw, wb, reconstructed_before_demosaic),
     }
-}
-
-fn cap_bayer_highlights(raw: &mut RawImage, wb: [f32; 4]) -> Result<bool> {
-    let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
-        return Ok(false);
-    };
-    if raw.cpp != 1
-        || config.sensor != SensorType::Bayer
-        || !config.cfa.is_rgb()
-        || raw.width < 2
-        || raw.height < 2
-        || !wb[..3].iter().all(|gain| gain.is_finite() && *gain > 0.)
-    {
-        return Ok(false);
-    }
-    let gains = std::array::from_fn::<_, 4, _>(|i| wb[config.cfa.color_at(i / 2, i % 2)]);
-    let white = gains.into_iter().fold(f32::INFINITY, f32::min);
-    let ceilings = gains.map(|gain| white / gain);
-    // Normalize sensor white to 1, as RawDevelop normally does before demosaicing.
-    raw.apply_scaling()
-        .map_err(|e| anyhow::anyhow!("RAW rescale: {e:?}"))?;
-    let RawImageData::Float(samples) = &mut raw.data else {
-        anyhow::bail!("RAW rescale did not produce floating-point samples");
-    };
-    let width = raw.width;
-    samples.par_chunks_exact_mut(width * 2).for_each(|rows| {
-        let (top, bottom) = rows.split_at_mut(width);
-        for (top, bottom) in top.chunks_exact_mut(2).zip(bottom.chunks_exact_mut(2)) {
-            // A strong sample alone can be real color. Use all four sites
-            // in the Bayer cell to decide how much of the cap to apply.
-            let weakest = (top[0] * gains[0])
-                .min(top[1] * gains[1])
-                .min(bottom[0] * gains[2])
-                .min(bottom[1] * gains[3]);
-            if weakest <= 0.9 * white {
-                continue;
-            }
-            let t = ((weakest / white - 0.9) / 0.1).min(1.);
-            let weight = t * t * (3. - 2. * t);
-            for (sample, ceiling) in top.iter_mut().chain(bottom).zip(ceilings) {
-                *sample -= (*sample - ceiling).max(0.) * weight;
-            }
-        }
-    });
-    Ok(true)
 }
 
 fn camera_to_rgb(raw: &RawImage) -> Result<[[f32; 4]; 3]> {
@@ -151,7 +104,7 @@ fn color<const N: usize>(
     pixels: Color2D<f32, N>,
     raw: &RawImage,
     wb: [f32; 4],
-    capped_before_demosaic: bool,
+    reconstructed_before_demosaic: bool,
 ) -> Result<ImageBuf> {
     let matrix = camera_to_rgb(raw)?;
     ensure!(
@@ -176,7 +129,7 @@ fn color<const N: usize>(
                 value
             });
             let rgb = clip_negative(&rgb);
-            let rgb = if capped_before_demosaic {
+            let rgb = if reconstructed_before_demosaic {
                 rgb
             } else {
                 neutralize_highlight(rgb, balanced, neutral_white)
@@ -213,9 +166,8 @@ fn neutralize_highlight<const N: usize>(
 mod tests {
     use super::*;
     use rawler::{
-        CFA,
         imgop::xyz::XYZ_TO_SRGB_D65,
-        rawimage::{BlackLevel, CFAConfig, WhiteLevel},
+        rawimage::{BlackLevel, RawImageData, RawPhotometricInterpretation, WhiteLevel},
     };
     use std::path::Path;
 
@@ -303,51 +255,6 @@ mod tests {
                     "{illuminant:?}, {wb:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn bayer_cap_uses_all_four_sites_and_preserves_color_below_the_knee() {
-        let mut raw = linear_raw(&[[0.]]);
-        raw.width = 7;
-        raw.height = 3;
-        raw.photometric = RawPhotometricInterpretation::Cfa(CFAConfig::new(
-            &CFA::new("BGGR"),
-            &raw.camera.plane_color,
-        ));
-        let values = [
-            1.05, 1.05, 1.05, 0.95, 0.25, 1.05, 1.05, // B G B G B G
-            1.05, 1.05, 1.05, 1.05, 1.05, 1.05, 1.05, // G R G R G R
-            1.05, 1.05, 1.05, 1.05, 1.05, 1.05, 1.05,
-        ];
-        raw.data = RawImageData::Float(values.to_vec());
-        assert!(cap_bayer_highlights(&mut raw, [2., 1., 1.5, f32::NAN]).unwrap());
-        let samples = raw.data.as_f32();
-        let expected = [
-            1. / 1.5,
-            1.,
-            (1.05 + 1. / 1.5) / 2.,
-            0.95,
-            0.25,
-            1.05,
-            1.05,
-            1.,
-            0.5,
-            1.025,
-            0.775,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-            1.05,
-        ];
-        for (sample, expected) in samples.iter().zip(expected) {
-            assert!((sample - expected).abs() < 1e-6, "{sample} != {expected}");
         }
     }
 

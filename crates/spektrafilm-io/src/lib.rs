@@ -7,6 +7,7 @@ mod lens_api;
 pub mod lens_database;
 pub mod lightroom;
 mod raw_develop;
+mod raw_highlights;
 mod raw_libraw;
 mod white_balance;
 mod xmp;

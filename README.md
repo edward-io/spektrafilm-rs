@@ -55,10 +55,10 @@ elsewhere, set `SPEKTRAFILM_DATA_DIR` to the data directory; CLI commands accept
 - **Photo exports** no longer hang waiting for a CPU slot when catalog
   thumbnails or photo preloads run at the same time. Foreground and
   background image processing now share Rayon's worker pool.
-- **Clipped RAW highlights** in rawler's RGB Bayer path are now handled before
-  demosaicing. The cap fades in when all four white-balanced samples in a
-  Bayer cell approach a shared ceiling, reducing magenta in blown highlights
-  while preserving bright colors whose weaker channels still have headroom.
+- **RAW highlight reconstruction** replaces the selective cap for RGB Bayer
+  files developed with rawler. Before demosaicing, surviving sensor channels
+  and nearby unclipped color ratios guide the recovery of clipped channels.
+  Fully clipped highlights fade toward a neutral brightness estimate.
 
 #### 2026-11-07
 
